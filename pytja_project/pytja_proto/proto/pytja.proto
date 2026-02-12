@@ -3,11 +3,9 @@ package pytja;
 
 // Der Service definiert, was der Server kann
 service PytjaService {
-    // Einfacher Ping um zu sehen, ob der Server lebt
     rpc Ping (PingRequest) returns (PingResponse);
-
-    // List Directory (ls)
     rpc ListDirectory (ListRequest) returns (ListResponse);
+    rpc CreateNode (CreateNodeRequest) returns (ActionResponse);
 }
 
 // --- Messages (Datenpakete) ---
@@ -35,7 +33,19 @@ message FileInfo {
     uint32 permissions = 5;
     double created_at = 6;
 }
-
 message ListResponse {
     repeated FileInfo files = 1;
+}
+
+message CreateNodeRequest {
+    string path = 1;
+    bool is_folder = 2;
+    bytes content = 3;
+    string lock_password = 4;
+    string owner = 5;
+}
+
+message ActionResponse {
+    bool success = 1;
+    string message = 2;
 }

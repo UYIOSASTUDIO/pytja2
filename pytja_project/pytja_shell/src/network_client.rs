@@ -1,4 +1,5 @@
 use pytja_proto::{PytjaServiceClient, PingRequest, ListRequest, FileInfo};
+use pytja_proto::{CreateNodeRequest, ActionResponse};
 use colored::*;
 use anyhow::Result;
 
@@ -61,5 +62,27 @@ impl PytjaClient {
 
         let response = client.list_directory(request).await?;
         Ok(response.into_inner().files)
+    }
+
+    pub async fn create_node(&self, path: &str, is_folder: bool, content: Vec<u8>, lock_pass: Option<String>, owner: &str) -> Result<String> {
+        let dst = format!("http://{}", self.url);
+        let mut client = PytjaServiceClient::connect(dst).await?;
+
+        let request = tonic::Request::new(CreateNodeRequest {
+            path: path.to_string(),
+            is_folder,
+            content,
+            lock_password: lock_pass.unwrap_or_default(), // Option -> String
+            owner: owner.to_string(),
+        });
+
+        let response = client.create_node(request).await?.into_inner();
+
+        if response.success {
+            Ok(response.message)
+        } else {
+            // Wir geben den Fehlertext vom Server als Error zurück
+            Err(anyhow::anyhow!(response.message))
+        }
     }
 }

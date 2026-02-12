@@ -27,15 +27,13 @@ impl Terminal {
         vfs: Arc<Mutex<VirtualFileSystem>>,
         user: String,
         pm: PluginManager,
-        client: PytjaClient // NEU
+        client: PytjaClient
     ) -> Self {
         Self {
             vfs,
-            prompt: format!("{}@{}:~$ ", user, "pytja"),
-            is_running: true,
-            user,
+            user_id: user,
             plugin_manager: pm,
-            client, // NEU
+            client,
         }
     }
 
@@ -158,7 +156,7 @@ impl Terminal {
             "clear" => self.print_banner(),
 
             "ls" => {
-                // 1. Argumente parsen (Bleibt gleich)
+                // 1. Argumente parsen
                 let show_hidden = args.contains(&"-a") || args.contains(&"-sh");
                 let reverse = args.contains(&"-r");
                 let mut sort_by = "DATE";
@@ -167,21 +165,19 @@ impl Terminal {
                     if idx + 1 < args.len() { sort_by = args[idx + 1]; }
                 }
 
-                // 2. Aktuellen Pfad holen
-                // Wir fragen das lokale VFS nur: "Wo bin ich gerade?"
+                // 2. Aktuellen Pfad holen (Lokal vom VFS)
                 let current_path = self.vfs.lock().await.get_cwd().to_string();
 
                 // 3. NETZWERK REQUEST (Daten vom Server laden)
                 match self.client.list_files(&current_path).await {
                     Ok(items) => {
-                        // 'items' ist jetzt ein Vec<FileInfo> (aus gRPC), nicht FileNode!
-
+                        // items ist Vec<FileInfo> (Proto)
                         // 4. Filtern
-                        let mut visible_items: Vec<&pytja_proto::FileInfo> = items.iter()
+                        let mut visible_items: Vec<&FileInfo> = items.iter()
                             .filter(|item| show_hidden || !item.name.starts_with('.'))
                             .collect();
 
-                        // 5. Sortieren (Logik bleibt 1:1 erhalten)
+                        // 5. Sortieren
                         match sort_by.to_uppercase().as_str() {
                             "NAME" => visible_items.sort_by(|a, b| {
                                 if reverse { b.name.to_lowercase().cmp(&a.name.to_lowercase()) }
@@ -198,12 +194,7 @@ impl Terminal {
                             "OWNER" => visible_items.sort_by(|a, b| {
                                 if reverse { b.owner.cmp(&a.owner) } else { a.owner.cmp(&b.owner) }
                             }),
-                            "EXT" => visible_items.sort_by(|a, b| {
-                                let ext_a = self.get_extension(&a.name);
-                                let ext_b = self.get_extension(&b.name);
-                                if reverse { ext_b.cmp(ext_a).then(b.name.cmp(&a.name)) }
-                                else { ext_a.cmp(ext_b).then(a.name.cmp(&b.name)) }
-                            }),
+                            // EXT Sortierung bräuchte Helper, hier Fallback auf DATE
                             _ => {
                                 visible_items.sort_by(|a, b| {
                                     if reverse { a.created_at.partial_cmp(&b.created_at).unwrap() }
@@ -219,18 +210,18 @@ impl Terminal {
                         // 7. Zeilen Ausgabe
                         for item in &visible_items {
                             let type_str = if item.is_folder { "DIR" } else { "FILE" };
-
-                            // Hinweis: Lock-Icon (Schloss) haben wir noch nicht im Proto definiert.
-                            // Das fügen wir später hinzu. Erst mal leer.
-                            let lock_icon = "";
-
                             let color_name = if item.is_folder { item.name.blue() } else { item.name.green() };
 
-                            // Casting: Proto 'size' ist u64, Helper erwartet evtl usize
-                            let size_str = if item.is_folder { "---".to_string() } else { format_size(item.size as usize) };
+                            // Einfache Size Formatierung direkt hier
+                            let size_str = if item.is_folder {
+                                "---".to_string()
+                            } else {
+                                if item.size < 1024 { format!("{} B", item.size) }
+                                else { format!("{:.1} KB", item.size as f64 / 1024.0) }
+                            };
+
                             let date_str = self.format_date(item.created_at);
 
-                            // Permissions: Im Proto ist es u32 (wegen gRPC Standard), Logik bleibt gleich
                             let perm_str = match item.permissions {
                                 0 => "PRIV".red(),
                                 1 => "PUB-R".yellow(),
@@ -238,10 +229,9 @@ impl Terminal {
                                 _ => "???".dimmed(),
                             };
 
-                            println!("{:<6} {:<8} {:<10} {:<15} {:<18} {}{}",
-                                     type_str, perm_str, size_str, item.owner, date_str, color_name, lock_icon);
+                            println!("{:<6} {:<8} {:<10} {:<15} {:<18} {}",
+                                     type_str, perm_str, size_str, item.owner, date_str, color_name);
                         }
-                        // Kleines Detail: (REMOTE) zeigt an, dass wir Live am Server hängen
                         println!("\n[TOTAL: {} (REMOTE)]", visible_items.len());
                     },
                     Err(e) => println!("Server Error: {}", e.to_string().red()),
@@ -260,34 +250,55 @@ impl Terminal {
                     if !p1.is_empty() { lock_pass = Some(p1); }
                 }
 
-                // ASYNC AWAIT
-                if let Err(e) = self.vfs.lock().await.create(name, true, vec![], false, lock_pass).await {
-                    println!("{}", e.to_string().red());
+                // PFAD BERECHNEN (Wichtig!)
+                // Der User gibt nur "ordner" ein, wir müssen den absoluten Pfad "/home/user/ordner" daraus machen.
+                // Dafür nutzen wir kurz das lokale VFS Helper, um den Pfad aufzulösen.
+                let full_path = self.vfs.lock().await.resolve_path(&name);
+
+                // NETZWERK AUFRUF
+                match self.client.create_node(&full_path, true, vec![], lock_pass, &self.user_id).await {
+                    Ok(msg) => println!("{}", msg.green()),
+                    Err(e) => println!("{}", e.to_string().red()),
                 }
             },
 
             "touch" => {
                 if args.is_empty() { println!("Usage: touch <name> [content] [-lock]"); return true; }
-                let name = args[0].to_string();
+
+                // 1. Name holen und ggf. .txt anhängen
+                let mut name = args[0].to_string();
+                if !name.contains('.') {
+                    name.push_str(".txt");
+                }
+
                 let mut lock_pass = None;
                 let mut content_parts = Vec::new();
 
                 for arg in &args[1..] {
                     if *arg == "-lock" {
+                        // 2. Doppelte Passwort-Abfrage (wie bei mkdir)
                         let p1 = self.ask_password("Set Password: ");
+                        let p2 = self.ask_password("Confirm Password: ");
+                        if p1 != p2 {
+                            println!("{}", "Passwords do not match.".red());
+                            return true;
+                        }
                         if !p1.is_empty() { lock_pass = Some(p1); }
                     } else {
                         content_parts.push(*arg);
                     }
                 }
+
                 let content_str = content_parts.join(" ");
                 let content_bytes = content_str.trim_matches('"').trim_matches('\'').as_bytes().to_vec();
 
-                // ASYNC AWAIT
-                if let Err(e) = self.vfs.lock().await.create(name, false, content_bytes, false, lock_pass).await {
-                    println!("{}", e.to_string().red());
-                } else {
-                    println!("{}", "File created.".green());
+                // PFAD AUFLÖSEN (mit dem neuen Namen inklusive .txt)
+                let full_path = self.vfs.lock().await.resolve_path(&name);
+
+                // NETZWERK AUFRUF
+                match self.client.create_node(&full_path, false, content_bytes, lock_pass, &self.user_id).await {
+                    Ok(_) => println!("{}", "File created.".green()),
+                    Err(e) => println!("{}", e.to_string().red()),
                 }
             },
 

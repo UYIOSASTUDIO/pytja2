@@ -6,4 +6,11 @@ pub mod pytja {
 // Re-Exports für einfacheren Zugriff
 pub use pytja::pytja_service_server::{PytjaService, PytjaServiceServer};
 pub use pytja::pytja_service_client::PytjaServiceClient;
-pub use pytja::{PingRequest, PingResponse, ListRequest, ListResponse, FileInfo};
+
+// HIER WAR DER FEHLER: Die neuen Messages fehlten in dieser Liste
+pub use pytja::{
+    PingRequest, PingResponse,
+    ListRequest, ListResponse,
+    FileInfo,
+    CreateNodeRequest, ActionResponse // <--- NEU HINZUGEFÜGT
+};

@@ -12,3 +12,4 @@ colored = "2.0"
 # Unsere eigenen Module
 pytja_proto = { path = "../pytja_proto" }
 pytja_core = { path = "../pytja_core" } # Wir brauchen Zugriff auf die DB Logik
+chrono = "0.4.43"
