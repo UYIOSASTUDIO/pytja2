@@ -1,11 +1,11 @@
 [package]
-name = "ghost_shell"
+name = "pytja_shell"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 # Die neue Verbindung zum Core
-ghost_core = { path = "../ghost_core" }
+pytja_core = { path = "../pytja_core" }
 
 extism = "1.0"          # Die Wasm Runtime
 serde = { version = "1.0", features = ["derive"] }

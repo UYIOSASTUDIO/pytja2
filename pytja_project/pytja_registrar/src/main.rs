@@ -1,6 +1,6 @@
 use anyhow::Result;
-use ghost_core::{SqliteRepository, GhostRepository, User};
-use ghost_core::crypto::CryptoService;
+use pytja_core::{SqliteRepository, PytjaRepository, User};
+use pytja_core::crypto::CryptoService;
 use std::io::{self, Write};
 use rpassword::read_password;
 use colored::*;
@@ -71,7 +71,7 @@ async fn create_identity(repo: &SqliteRepository) -> Result<()> {
     let encrypted_key_pem = CryptoService::encrypt_private_key_local(&signing_key, &pass)?;
 
     // 3. Datei speichern ("USB Stick")
-    let key_file_path = format!("{}/{}.ghost", KEY_STORAGE_DIR, name);
+    let key_file_path = format!("{}/{}.pytja", KEY_STORAGE_DIR, name);
     fs::write(&key_file_path, encrypted_key_pem)?;
     println!(" [+] Encrypted Key saved to: {}", key_file_path.cyan());
 

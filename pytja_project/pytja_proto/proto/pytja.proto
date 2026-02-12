@@ -24,7 +24,7 @@ message PingResponse {
 
 message ListRequest {
     string path = 1;
-    string auth_token = 2; // Sicherheit kommt später
+    string auth_token = 2;
 }
 
 message FileInfo {
@@ -32,7 +32,8 @@ message FileInfo {
     bool is_folder = 2;
     uint64 size = 3;
     string owner = 4;
-    string permissions = 5; // "PRIV", "PUB-R" etc.
+    uint32 permissions = 5;
+    double created_at = 6;
 }
 
 message ListResponse {

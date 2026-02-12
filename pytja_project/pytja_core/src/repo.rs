@@ -4,10 +4,12 @@ use rusqlite::{params, OptionalExtension};
 use async_trait::async_trait;
 use tracing::{info, instrument};
 use deadpool_sqlite::{Config, Manager, Pool, Runtime};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 // Das Trait gibt jetzt PytjaError zurück statt generischem Result
 #[async_trait]
-pub trait GhostRepository: Send + Sync {
+pub trait PytjaRepository: Send + Sync {
     fn init(&self) -> Result<(), PytjaError>;
 
     async fn create_user(&self, user: &User) -> Result<(), PytjaError>;
@@ -52,7 +54,7 @@ impl SqliteRepository {
 }
 
 #[async_trait]
-impl GhostRepository for SqliteRepository {
+impl PytjaRepository for SqliteRepository {
     // Init: Synchroner Modus (Robust gegen Tokio Panic)
     #[instrument(skip(self))]
     fn init(&self) -> Result<(), PytjaError> {
@@ -484,4 +486,44 @@ mod tests {
         teardown(&db_path);
     }
 
+}
+
+#[derive(Clone)]
+pub enum DatabaseType {
+    Sqlite,
+    Postgres, // Platzhalter für deine Vision
+    MySQL,    // Platzhalter
+}
+
+// Der Hub-Manager
+pub struct ConnectionManager {
+    mounts: Arc<RwLock<HashMap<String, Arc<dyn PytjaRepository + Send + Sync>>>>,
+}
+
+impl ConnectionManager {
+    pub fn new() -> Self {
+        Self {
+            mounts: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn mount(&self, name: &str, path: &str, _db_type: DatabaseType) -> Result<(), PytjaError> {
+        // Aktuell unterstützen wir nur SQLite, aber die Struktur ist bereit für mehr.
+        let repo = SqliteRepository::new(path);
+
+        let mut mounts = self.mounts.write().unwrap();
+        mounts.insert(name.to_string(), Arc::new(repo));
+
+        Ok(())
+    }
+
+    pub fn get_repo(&self, name: &str) -> Option<Arc<dyn PytjaRepository + Send + Sync>> {
+        let mounts = self.mounts.read().unwrap();
+        mounts.get(name).cloned()
+    }
+
+    pub fn list_mounts(&self) -> Vec<String> {
+        let mounts = self.mounts.read().unwrap();
+        mounts.keys().cloned().collect()
+    }
 }

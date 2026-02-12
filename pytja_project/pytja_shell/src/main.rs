@@ -1,5 +1,5 @@
-use ghost_core::{
-    GhostRepository, SqliteRepository,
+use pytja_core::{
+    PytjaRepository, SqliteRepository,
     crypto::CryptoService, // WICHTIG: Wieder aktiv
 };
 use std::io::{self, Write};
@@ -7,7 +7,7 @@ use colored::*;
 use anyhow::Result;
 use std::path::Path;
 use std::fs; // WICHTIG: Wieder aktiv für Datei-Zugriff
-use ghost_core::telemetry;
+use pytja_core::telemetry;
 mod network_client; // NEU
 use network_client::PytjaClient; // NEU
 
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     // --- HARD SECURITY CHECK ---
 
     // 1. Prüfen ob Key File existiert (Der "USB Stick")
-    let key_file_path = format!("{}/{}.ghost", KEY_DIR, username);
+    let key_file_path = format!("{}/{}.pytja", KEY_DIR, username);
     if !Path::new(&key_file_path).exists() {
         println!("{}", format!("Access Denied: Security Token missing ({}).", key_file_path).red());
         return Ok(());
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
 
     // 4. Plugins laden
     println!("{}", "[*] Initializing Module System...".yellow());
-    let mut plugin_manager = PluginManager::new("../ghost_plugins");
+    let mut plugin_manager = PluginManager::new("../pytja_plugins");
     match plugin_manager.scan_and_load() {
         Ok(msg) => println!(" [+] {}", msg.green()),
         Err(e) => println!(" [!] Plugin Error: {}", e.to_string().red()),
@@ -125,7 +125,9 @@ async fn main() -> Result<()> {
     let vfs = VirtualFileSystem::new(user.username.clone(), DB_PATH);
     let vfs_shared = std::sync::Arc::new(tokio::sync::Mutex::new(vfs));
 
-    let mut term = Terminal::new(vfs_shared, username, plugin_manager);
+    let term_client = PytjaClient::new("127.0.0.1:50051");
+
+    let mut term = Terminal::new(vfs_shared, username, plugin_manager, term_client);
     term.start().await?;
 
     Ok(())

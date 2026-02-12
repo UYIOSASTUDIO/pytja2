@@ -1,4 +1,4 @@
-use crate::repo::{GhostRepository, SqliteRepository};
+use crate::repo::{PytjaRepository, SqliteRepository};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -14,7 +14,7 @@ pub enum DatabaseType {
 pub struct ConnectionManager {
     // Map: "Mount Name" (z.B. "local", "company_db") -> Repository
     // Wir nutzen Arc<Box<...>>, um Polymorphismus zu ermöglichen (verschiedene Treiber gemischt)
-    connections: Arc<RwLock<HashMap<String, Arc<dyn GhostRepository>>>>,
+    connections: Arc<RwLock<HashMap<String, Arc<dyn PytjaRepository>>>>,
 }
 
 impl ConnectionManager {
@@ -26,7 +26,7 @@ impl ConnectionManager {
 
     /// Verbindet eine neue Datenbank und "mountet" sie unter einem Namen
     pub fn mount(&self, name: &str, connection_string: &str, db_type: DatabaseType) -> Result<()> {
-        let repo: Arc<dyn GhostRepository> = match db_type {
+        let repo: Arc<dyn PytjaRepository> = match db_type {
             DatabaseType::Sqlite => {
                 let db = SqliteRepository::new(connection_string);
                 db.init()?; // Initialisieren beim Mounten
@@ -41,7 +41,7 @@ impl ConnectionManager {
     }
 
     /// Holt die richtige Datenbank für einen Zugriff
-    pub fn get_repo(&self, mount_name: &str) -> Result<Arc<dyn GhostRepository>> {
+    pub fn get_repo(&self, mount_name: &str) -> Result<Arc<dyn PytjaRepository>> {
         let map = self.connections.read().map_err(|_| anyhow!("Lock Poisoned"))?;
 
         if let Some(repo) = map.get(mount_name) {

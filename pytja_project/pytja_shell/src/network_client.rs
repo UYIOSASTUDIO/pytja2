@@ -1,5 +1,4 @@
-use pytja_proto::PytjaServiceClient;
-use pytja_proto::PingRequest;
+use pytja_proto::{PytjaServiceClient, PingRequest, ListRequest, FileInfo};
 use colored::*;
 use anyhow::Result;
 
@@ -49,5 +48,18 @@ impl PytjaClient {
                 Ok(false)
             }
         }
+    }
+
+    pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>> {
+        let dst = format!("http://{}", self.url);
+        let mut client = PytjaServiceClient::connect(dst).await?;
+
+        let request = tonic::Request::new(ListRequest {
+            path: path.to_string(),
+            auth_token: "TODO_SECURE_TOKEN".to_string(),
+        });
+
+        let response = client.list_directory(request).await?;
+        Ok(response.into_inner().files)
     }
 }

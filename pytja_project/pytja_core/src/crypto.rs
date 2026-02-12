@@ -8,7 +8,7 @@ use sha2::Sha256;
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
-const SALT: &[u8] = b"ghost_protocol_salt_v2";
+const SALT: &[u8] = b"pytja_protocol_salt_v2";
 const ITERATIONS: u32 = 600_000;
 
 pub struct CryptoService;

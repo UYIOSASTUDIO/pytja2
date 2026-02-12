@@ -1,11 +1,11 @@
 [package]
-name = "ghost_registrar"
+name = "pytja_registrar"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 # Wir binden unsere eigene Library ein
-ghost_core = { path = "../ghost_core" }
+pytja_core = { path = "../pytja_core" }
 
 # Externe Tools für Input und Validierung
 anyhow = "1.0"

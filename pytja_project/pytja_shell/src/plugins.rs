@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex; // Tokio Mutex!
 use crate::vfs::VirtualFileSystem;
 use serde_json::Value;
-use ghost_core::GhostRepository;
+use pytja_core::PytjaRepository;
 
 pub struct PluginManager {
     loaded_plugins: HashMap<String, Vec<u8>>,

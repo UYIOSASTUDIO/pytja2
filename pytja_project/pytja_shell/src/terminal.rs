@@ -5,23 +5,38 @@ use colored::*;
 use std::io::{self, Write};
 use std::process;
 use std::str;
-use ghost_core::{FileNode, GhostRepository}; // Wichtig: FileNode und Trait
+use pytja_core::{FileNode, PytjaRepository}; // Wichtig: FileNode und Trait
 use rpassword;
 use chrono::{DateTime, Local};
 use std::path::Path;
 use tokio::sync::Mutex; // NEU: Async Mutex
 use std::sync::Arc;
 use anyhow::Result;
+use crate::network_client::PytjaClient;
+use pytja_proto::FileInfo;
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
     user_id: String,
     plugin_manager: PluginManager,
+    client: PytjaClient,
 }
 
 impl Terminal {
-    pub fn new(vfs: Arc<Mutex<VirtualFileSystem>>, user_id: String, plugin_manager: PluginManager) -> Self {
-        Self { vfs, user_id, plugin_manager }
+    pub fn new(
+        vfs: Arc<Mutex<VirtualFileSystem>>,
+        user: String,
+        pm: PluginManager,
+        client: PytjaClient // NEU
+    ) -> Self {
+        Self {
+            vfs,
+            prompt: format!("{}@{}:~$ ", user, "pytja"),
+            is_running: true,
+            user,
+            plugin_manager: pm,
+            client, // NEU
+        }
     }
 
     pub async fn start(&mut self) -> anyhow::Result<()> {
@@ -118,7 +133,7 @@ impl Terminal {
                 process::exit(0);
             },
             "help" => {
-                println!("\n{}", "GHOST SHELL MANUAL V2.0".white().bold());
+                println!("\n{}", "PYTJA SHELL MANUAL V2.0".white().bold());
                 println!("{}", "=".repeat(60));
                 println!("\n{}", "[ FILE OPERATIONS ]".cyan());
                 println!("{:<10} : {:<30}", "ls", "List [-a] [-s DATE/SIZE/NAME/EXT] [-r]");
@@ -143,7 +158,7 @@ impl Terminal {
             "clear" => self.print_banner(),
 
             "ls" => {
-                // 1. Argumente parsen (Dein Code)
+                // 1. Argumente parsen (Bleibt gleich)
                 let show_hidden = args.contains(&"-a") || args.contains(&"-sh");
                 let reverse = args.contains(&"-r");
                 let mut sort_by = "DATE";
@@ -152,15 +167,21 @@ impl Terminal {
                     if idx + 1 < args.len() { sort_by = args[idx + 1]; }
                 }
 
-                // 2. Daten laden (Dein Code)
-                match self.vfs.lock().await.list_current().await {
+                // 2. Aktuellen Pfad holen
+                // Wir fragen das lokale VFS nur: "Wo bin ich gerade?"
+                let current_path = self.vfs.lock().await.get_cwd().to_string();
+
+                // 3. NETZWERK REQUEST (Daten vom Server laden)
+                match self.client.list_files(&current_path).await {
                     Ok(items) => {
-                        // 3. Filtern (Dein Code)
-                        let mut visible_items: Vec<&FileNode> = items.iter()
+                        // 'items' ist jetzt ein Vec<FileInfo> (aus gRPC), nicht FileNode!
+
+                        // 4. Filtern
+                        let mut visible_items: Vec<&pytja_proto::FileInfo> = items.iter()
                             .filter(|item| show_hidden || !item.name.starts_with('.'))
                             .collect();
 
-                        // 4. Sortieren (Dein Code - komplett erhalten)
+                        // 5. Sortieren (Logik bleibt 1:1 erhalten)
                         match sort_by.to_uppercase().as_str() {
                             "NAME" => visible_items.sort_by(|a, b| {
                                 if reverse { b.name.to_lowercase().cmp(&a.name.to_lowercase()) }
@@ -183,7 +204,6 @@ impl Terminal {
                                 if reverse { ext_b.cmp(ext_a).then(b.name.cmp(&a.name)) }
                                 else { ext_a.cmp(ext_b).then(a.name.cmp(&b.name)) }
                             }),
-                            // PERMS Sortierung wäre cool für später, lassen wir erst mal weg
                             _ => {
                                 visible_items.sort_by(|a, b| {
                                     if reverse { a.created_at.partial_cmp(&b.created_at).unwrap() }
@@ -192,39 +212,39 @@ impl Terminal {
                             }
                         }
 
-                        // 5. Header Ausgabe (NEU: Mit PERM Spalte)
-                        // Wir machen die Linie etwas länger (75 statt 65)
+                        // 6. Header Ausgabe
                         println!("{:<6} {:<8} {:<10} {:<15} {:<18} NAME", "TYPE", "PERM", "SIZE", "OWNER", "DATE");
                         println!("{}", "-".repeat(75));
 
-                        // 6. Zeilen Ausgabe
+                        // 7. Zeilen Ausgabe
                         for item in &visible_items {
                             let type_str = if item.is_folder { "DIR" } else { "FILE" };
-                            let lock_icon = if item.lock_pass.is_some() { "🔒" } else { "" };
 
-                            // Deine Farb-Logik
+                            // Hinweis: Lock-Icon (Schloss) haben wir noch nicht im Proto definiert.
+                            // Das fügen wir später hinzu. Erst mal leer.
+                            let lock_icon = "";
+
                             let color_name = if item.is_folder { item.name.blue() } else { item.name.green() };
 
-                            // Deine Format-Helper
-                            let size_str = if item.is_folder { "---".to_string() } else { format_size(item.size) };
+                            // Casting: Proto 'size' ist u64, Helper erwartet evtl usize
+                            let size_str = if item.is_folder { "---".to_string() } else { format_size(item.size as usize) };
                             let date_str = self.format_date(item.created_at);
 
-                            // --- NEU: Permission Visualisierung ---
+                            // Permissions: Im Proto ist es u32 (wegen gRPC Standard), Logik bleibt gleich
                             let perm_str = match item.permissions {
-                                0 => "PRIV".red(),          // Private
-                                1 => "PUB-R".yellow(),      // Public Read
-                                2 => "PUB-W".green(),       // Public Write
+                                0 => "PRIV".red(),
+                                1 => "PUB-R".yellow(),
+                                2 => "PUB-W".green(),
                                 _ => "???".dimmed(),
                             };
-                            // --------------------------------------
 
-                            // Ausgabe mit neuer Spalte
                             println!("{:<6} {:<8} {:<10} {:<15} {:<18} {}{}",
                                      type_str, perm_str, size_str, item.owner, date_str, color_name, lock_icon);
                         }
-                        println!("\n[TOTAL: {}]", visible_items.len());
+                        // Kleines Detail: (REMOTE) zeigt an, dass wir Live am Server hängen
+                        println!("\n[TOTAL: {} (REMOTE)]", visible_items.len());
                     },
-                    Err(e) => println!("{}", e.to_string().red()), // Hier nutzt du jetzt automatisch PytjaError String
+                    Err(e) => println!("Server Error: {}", e.to_string().red()),
                 }
             },
 
@@ -384,19 +404,19 @@ impl Terminal {
             },
 
             "download" => {
-                if args.len() < 2 { println!("Usage: download <ghost_file> <pc_path>"); return true; }
-                let ghost_file = args[0];
+                if args.len() < 2 { println!("Usage: download <pytja_file> <pc_path>"); return true; }
+                let pytja_file = args[0];
                 let host_path = args[1..].join(" ");
                 let clean_host = host_path.trim_matches('"').trim_matches('\'');
 
-                let vfs_path = self.vfs.lock().await.resolve_path(ghost_file);
+                let vfs_path = self.vfs.lock().await.resolve_path(pytja_file);
                 if let Ok(Some(node)) = self.vfs.lock().await.db().get_node(&vfs_path).await {
                     if !self.check_lock(&node) { return true; }
                 }
 
                 println!("{}", "Decrypting and exporting...".blue());
                 // ASYNC AWAIT
-                match self.vfs.lock().await.export_to_host(ghost_file, clean_host).await {
+                match self.vfs.lock().await.export_to_host(pytja_file, clean_host).await {
                     Ok(msg) => println!("{}", msg.green()),
                     Err(e) => println!("{}", e.to_string().red()),
                 }

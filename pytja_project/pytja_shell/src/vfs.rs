@@ -1,5 +1,5 @@
-use ghost_core::{
-    GhostRepository, ConnectionManager, DatabaseType, FileNode, PytjaError
+use pytja_core::{
+    PytjaRepository, ConnectionManager, DatabaseType, FileNode, PytjaError
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,7 +46,7 @@ impl VirtualFileSystem {
         &self.current_path
     }
 
-    pub fn db(&self) -> Arc<dyn GhostRepository> {
+    pub fn db(&self) -> Arc<dyn PytjaRepository> {
         self.connection_manager.get_repo(&self.active_mount)
             .expect("CRITICAL: Active mount lost connection.")
     }

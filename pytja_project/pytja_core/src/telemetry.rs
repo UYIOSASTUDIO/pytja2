@@ -33,7 +33,7 @@ pub fn init_telemetry(log_dir: &str, file_name: &str) -> WorkerGuard {
     // Wir filtern auf "INFO" Level. Alles darunter (DEBUG, TRACE) wird ignoriert,
     // es sei denn, wir ändern die Config.
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info,ghost_core=debug")) // Core debuggen wir genauer
+        .with(tracing_subscriber::EnvFilter::new("info,pytja_core=debug")) // Core debuggen wir genauer
         .with(file_layer)
         .init();
 
