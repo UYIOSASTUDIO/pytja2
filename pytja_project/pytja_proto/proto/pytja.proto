@@ -1,0 +1,40 @@
+syntax = "proto3";
+package pytja;
+
+// Der Service definiert, was der Server kann
+service PytjaService {
+    // Einfacher Ping um zu sehen, ob der Server lebt
+    rpc Ping (PingRequest) returns (PingResponse);
+
+    // List Directory (ls)
+    rpc ListDirectory (ListRequest) returns (ListResponse);
+}
+
+// --- Messages (Datenpakete) ---
+
+message PingRequest {
+    string message = 1;
+}
+
+message PingResponse {
+    string message = 1;
+    string server_version = 2;
+    bool is_ready = 3;
+}
+
+message ListRequest {
+    string path = 1;
+    string auth_token = 2; // Sicherheit kommt später
+}
+
+message FileInfo {
+    string name = 1;
+    bool is_folder = 2;
+    uint64 size = 3;
+    string owner = 4;
+    string permissions = 5; // "PRIV", "PUB-R" etc.
+}
+
+message ListResponse {
+    repeated FileInfo files = 1;
+}

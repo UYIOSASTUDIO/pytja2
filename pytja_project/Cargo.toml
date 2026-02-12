@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "ghost_core",
+    "ghost_shell",
+    "ghost_registrar",
+    "pytja_proto",
+    "pytja_server",
+]

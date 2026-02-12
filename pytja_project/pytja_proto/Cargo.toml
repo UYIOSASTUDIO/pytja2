@@ -1,0 +1,11 @@
+[package]
+name = "pytja_proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = "0.10"       # gRPC Implementierung
+prost = "0.12"       # Protobuf Serializer
+
+[build-dependencies]
+tonic-build = "0.10" # Kompiliert .proto zu Rust Code

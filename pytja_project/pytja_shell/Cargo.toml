@@ -1,0 +1,40 @@
+[package]
+name = "ghost_shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Die neue Verbindung zum Core
+ghost_core = { path = "../ghost_core" }
+
+extism = "1.0"          # Die Wasm Runtime
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Die alten Abhängigkeiten (damit dein kopierter Code funktioniert)
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+bcrypt = "0.15"
+base64 = "0.21"
+rustyline = "13.0"
+crossterm = "0.27"
+colored = "2.0"
+rpassword = "7.0"
+chrono = "0.4"
+thiserror = "1.0"
+anyhow = "1.0"
+zip = "0.6"
+tempfile = "3.8"
+glob = "0.3"
+tokio = { version = "1.0", features = ["full"] }
+indicatif = "0.17"
+tracing = "0.1"
+hex = "0.4"
+tonic = "0.10"       # Der Client
+prost = "0.12"       # Das Datenformat
+pytja_proto = { path = "../pytja_proto" } # Unser Vertrag
+http = "0.2"         # Wichtig für URL Parsing

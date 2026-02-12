@@ -1,0 +1,19 @@
+[package]
+name = "ghost_registrar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Wir binden unsere eigene Library ein
+ghost_core = { path = "../ghost_core" }
+
+# Externe Tools für Input und Validierung
+anyhow = "1.0"
+colored = "2.0"
+rpassword = "7.0"
+regex = "1.5"
+chrono = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1.0", features = ["full"] }
+uuid = { version = "1.0", features = ["v4"] }
+hex = "0.4"
