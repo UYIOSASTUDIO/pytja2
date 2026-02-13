@@ -25,7 +25,16 @@ pub struct FileNode {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,  // Username
-    pub role: String, // Rolle
-    pub exp: usize,   // Ablaufdatum (Timestamp)
+    pub sub: String,       // Username
+    pub role_level: i32,   // ÄNDERUNG: Zahl statt String (z.B. 100 = Admin)
+    pub exp: usize,        // Expiration
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
 }

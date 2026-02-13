@@ -1,13 +1,13 @@
-use crate::models::{User, FileNode};
-use crate::error::PytjaError; // NEU: Unser eigener Fehler-Typ
+use crate::models::{User, FileNode, AuditLogEntry};
+use crate::error::PytjaError;
 use rusqlite::{params, OptionalExtension};
 use async_trait::async_trait;
 use tracing::{info, instrument};
 use deadpool_sqlite::{Config, Manager, Pool, Runtime};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::fs;
 
-// Das Trait gibt jetzt PytjaError zurück statt generischem Result
 #[async_trait]
 pub trait PytjaRepository: Send + Sync {
     fn init(&self) -> Result<(), PytjaError>;
@@ -29,6 +29,9 @@ pub trait PytjaRepository: Send + Sync {
     async fn get_all_files_content(&self) -> Result<Vec<(String, Vec<u8>)>, PytjaError>;
     async fn log_action(&self, actor: &str, action: &str, target: &str) -> Result<(), PytjaError>;
     async fn update_permissions(&self, path: &str, permissions: u8) -> Result<(), PytjaError>;
+    async fn get_all_users(&self) -> Result<Vec<User>, PytjaError>;
+    async fn get_audit_logs(&self, limit: usize) -> Result<Vec<AuditLogEntry>, PytjaError>;
+    async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError>;
 }
 
 #[derive(Clone)]
@@ -44,7 +47,7 @@ impl SqliteRepository {
         let pool = Pool::builder(manager)
             .max_size(16)
             .build()
-            .expect("Failed to create database pool"); // Panic beim Start ist hier ok (Config-Fehler)
+            .expect("Failed to create database pool");
 
         Self {
             pool,
@@ -55,25 +58,14 @@ impl SqliteRepository {
 
 #[async_trait]
 impl PytjaRepository for SqliteRepository {
-    // Init: Synchroner Modus (Robust gegen Tokio Panic)
     #[instrument(skip(self))]
     fn init(&self) -> Result<(), PytjaError> {
         let conn = rusqlite::Connection::open(&self.path)
             .map_err(|e| PytjaError::DatabaseConnection(e.to_string()))?;
 
-        // --- PERFORMANCE TUNING (NEU) ---
-        // 1. WAL Mode: Erlaubt gleichzeitiges Lesen und Schreiben (Game Changer!)
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| PytjaError::DatabaseQuery(e))?;
-
-        // 2. Synchronous Normal: Schnelleres Schreiben, immer noch sicher genug für uns
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| PytjaError::DatabaseQuery(e))?;
-
-        // 3. Foreign Keys: Datenintegrität erzwingen
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| PytjaError::DatabaseQuery(e))?;
-        // --------------------------------
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS users (
@@ -112,52 +104,35 @@ impl PytjaRepository for SqliteRepository {
             [],
         )?;
 
-        // Beschleunigt 'ls' und Pfad-Suche massiv
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_path ON file_system(path)",
-            []
-        )?;
-
-        // Beschleunigt Quota-Checks und 'find' nach Owner
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_owner ON file_system(owner)",
-            []
-        )?;
-
-        // Beschleunigt Login (User-Suche)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
-            []
-        )?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON file_system(path)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_files_owner ON file_system(owner)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)", [])?;
 
         info!("Pytja Database initialized successfully (Sync Mode)");
-        Ok(Ok::<(), rusqlite::Error>(())?)
+        Ok(())
     }
-
-    // --- ASYNC METHODEN (Sauberer Code dank PytjaError) ---
 
     #[instrument(skip(self))]
     async fn find_nodes(&self, pattern: &str) -> Result<Vec<String>, PytjaError> {
         let pattern = pattern.to_string();
-        // 1. Pool Error wird automatisch zu PytjaError::PoolError
         let conn = self.pool.get().await?;
 
-        // 2. Interact Error wird automatisch zu PytjaError::System
-        conn.interact(move |conn| {
+        // Expliziter Typ für Closure Parameter!
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare("SELECT path FROM file_system WHERE name LIKE ?")?;
             let rows = stmt.query_map(params![pattern], |row| row.get(0))?;
 
             let mut paths = Vec::new();
             for r in rows { paths.push(r?); }
             Ok(paths)
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
     async fn get_all_files_content(&self) -> Result<Vec<(String, Vec<u8>)>, PytjaError> {
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare("SELECT path, content FROM file_system WHERE is_folder = 0")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -166,7 +141,7 @@ impl PytjaRepository for SqliteRepository {
             let mut results = Vec::new();
             for r in rows { results.push(r?); }
             Ok(results)
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -176,29 +151,31 @@ impl PytjaRepository for SqliteRepository {
         let target = target.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO audit_logs (timestamp, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
                 params![now, actor, action, target],
             )?;
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self, user), fields(username = %user.username))]
     async fn create_user(&self, user: &User) -> Result<(), PytjaError> {
-        let user = user.clone();
         let conn = self.pool.get().await?;
+        let u = user.clone();
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             conn.execute(
-                "INSERT INTO users (username, public_key, description, role_level, is_active, created_at)
+                "INSERT INTO users (username, public_key, role_level, created_at, description, is_active)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![user.username, user.public_key, user.description, user.role_level, user.is_active, user.created_at],
+                rusqlite::params![
+                    u.username, u.public_key, u.role_level, u.created_at, u.description, u.is_active
+                ],
             )?;
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -206,7 +183,7 @@ impl PytjaRepository for SqliteRepository {
         let username = username.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare("SELECT username, public_key, description, role_level, is_active, created_at FROM users WHERE username = ?")?;
             let user = stmt.query_row(params![username], |row| {
                 Ok(User {
@@ -219,7 +196,7 @@ impl PytjaRepository for SqliteRepository {
                 })
             }).optional()?;
             Ok(user)
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -227,14 +204,14 @@ impl PytjaRepository for SqliteRepository {
         let username = username.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let count: i32 = conn.query_row(
                 "SELECT COUNT(*) FROM users WHERE username = ?",
                 params![username],
                 |row| row.get(0),
             )?;
             Ok(count > 0)
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self, node), fields(path = %node.path))]
@@ -242,18 +219,18 @@ impl PytjaRepository for SqliteRepository {
         let node = node.clone();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "INSERT OR REPLACE INTO file_system (path, name, owner, is_folder, content, lock_pass, permissions, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", // Ein Parameter mehr!
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     node.path, node.name, node.owner, node.is_folder,
-                    node.content, node.lock_pass, node.permissions, // NEU
+                    node.content, node.lock_pass, node.permissions,
                     node.created_at
                 ],
             )?;
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -261,8 +238,7 @@ impl PytjaRepository for SqliteRepository {
         let path = path.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
-            // Permissions mit abfragen!
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let mut stmt = conn.prepare("SELECT path, name, owner, is_folder, content, lock_pass, permissions, created_at FROM file_system WHERE path = ?")?;
             let node = stmt.query_row(params![path], |row| {
                 Ok(FileNode {
@@ -278,7 +254,7 @@ impl PytjaRepository for SqliteRepository {
                 })
             }).optional()?;
             Ok(node)
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -286,7 +262,7 @@ impl PytjaRepository for SqliteRepository {
         let current_path = path.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let query_path = if current_path == "/" { "".to_string() } else { current_path.clone() };
 
             let mut stmt = conn.prepare(
@@ -315,7 +291,7 @@ impl PytjaRepository for SqliteRepository {
             let mut nodes = Vec::new();
             for r in rows { nodes.push(r?); }
             Ok(nodes)
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -323,14 +299,14 @@ impl PytjaRepository for SqliteRepository {
         let path = path.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let like_pattern = format!("{}/%", path);
             conn.execute(
                 "DELETE FROM file_system WHERE path = ? OR path LIKE ?",
                 params![path, like_pattern]
             )?;
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -338,14 +314,14 @@ impl PytjaRepository for SqliteRepository {
         let owner = owner.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             let size: Option<usize> = conn.query_row(
                 "SELECT SUM(LENGTH(content)) FROM file_system WHERE owner = ?",
                 params![owner],
                 |row| row.get(0)
             ).optional()?;
             Ok(size.unwrap_or(0))
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -354,7 +330,7 @@ impl PytjaRepository for SqliteRepository {
         let new_path = new_path.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "UPDATE file_system
                  SET path = ?2 || SUBSTR(path, LENGTH(?1) + 1)
@@ -362,7 +338,7 @@ impl PytjaRepository for SqliteRepository {
                 params![old_path, new_path]
             )?;
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
@@ -370,7 +346,7 @@ impl PytjaRepository for SqliteRepository {
         let path = path.to_string();
         let conn = self.pool.get().await?;
 
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             if let Some(l) = lock {
                 conn.execute("UPDATE file_system SET lock_pass = ? WHERE path = ?", params![l, path])?;
             }
@@ -378,26 +354,85 @@ impl PytjaRepository for SqliteRepository {
                 conn.execute("UPDATE file_system SET owner = ? WHERE path = ?", params![o, path])?;
             }
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 
     #[instrument(skip(self))]
     async fn update_permissions(&self, path: &str, permissions: u8) -> Result<(), PytjaError> {
         let path = path.to_string();
-        // 1. Connection holen
         let conn = self.pool.get().await?;
 
-        // 2. Update ausführen
-        conn.interact(move |conn| {
+        conn.interact(move |conn: &mut rusqlite::Connection| {
             conn.execute(
                 "UPDATE file_system SET permissions = ? WHERE path = ?",
                 params![permissions, path]
             )?;
             Ok(())
-        }).await?
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
+    }
+
+    #[instrument(skip(self))]
+    async fn get_all_users(&self) -> Result<Vec<User>, PytjaError> {
+        let conn = self.pool.get().await?;
+
+        conn.interact(move |conn| {
+            let mut stmt = conn.prepare("SELECT username, public_key, description, role_level, is_active, created_at FROM users")?;
+
+            let rows = stmt.query_map([], |row| {
+                Ok(User {
+                    username: row.get(0)?,
+                    public_key: row.get(1)?,
+                    description: row.get(2)?,
+                    role_level: row.get(3)?,
+                    is_active: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?;
+
+            let mut users = Vec::new();
+            for r in rows { users.push(r?); }
+            Ok(users)
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
+    }
+
+    #[instrument(skip(self))]
+    async fn get_audit_logs(&self, limit: usize) -> Result<Vec<AuditLogEntry>, PytjaError> {
+        let conn = self.pool.get().await?;
+
+        conn.interact(move |conn| {
+            // Wir sortieren absteigend (neueste zuerst)
+            let mut stmt = conn.prepare("SELECT id, timestamp, actor, action, target FROM audit_logs ORDER BY id DESC LIMIT ?")?;
+
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(AuditLogEntry {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    target: row.get(4)?,
+                })
+            })?;
+
+            let mut logs = Vec::new();
+            for r in rows { logs.push(r?); }
+            Ok(logs)
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
+    }
+
+    #[instrument(skip(self))]
+    async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError> {
+        let username = username.to_string();
+        let conn = self.pool.get().await?;
+
+        conn.interact(move |conn| {
+            conn.execute(
+                "UPDATE users SET is_active = ?1, role_level = ?2 WHERE username = ?3",
+                params![is_active, role_level, username],
+            )?;
+            Ok(())
+        }).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -500,6 +535,13 @@ pub struct ConnectionManager {
     mounts: Arc<RwLock<HashMap<String, Arc<dyn PytjaRepository + Send + Sync>>>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct MountConfig {
+    name: String,
+    path: String,
+    db_type: String, // Das Feld hat beim Initialisieren gefehlt
+}
+
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
@@ -507,14 +549,67 @@ impl ConnectionManager {
         }
     }
 
+    // DIESE METHODE HAT GEFEHLT ODER WAR NICHT PUBLIC:
+    pub fn load_config(&self, config_path: &str) {
+        if let Ok(content) = fs::read_to_string(config_path) {
+            if let Ok(configs) = serde_json::from_str::<Vec<MountConfig>>(&content) {
+                println!("Loading {} mounts from config...", configs.len());
+                for cfg in configs {
+                    // Wir ignorieren Fehler beim Laden (z.B. wenn DB gelöscht wurde)
+                    let _ = self.mount_internal(&cfg.name, &cfg.path, false);
+                }
+            }
+        }
+    }
+
     pub fn mount(&self, name: &str, path: &str, _db_type: DatabaseType) -> Result<(), PytjaError> {
-        // Aktuell unterstützen wir nur SQLite, aber die Struktur ist bereit für mehr.
+        self.mount_internal(name, path, true)
+    }
+
+    fn mount_internal(&self, name: &str, path: &str, save: bool) -> Result<(), PytjaError> {
         let repo = SqliteRepository::new(path);
+        repo.init()?;
 
-        let mut mounts = self.mounts.write().unwrap();
-        mounts.insert(name.to_string(), Arc::new(repo));
+        {
+            let mut mounts = self.mounts.write().unwrap();
+            mounts.insert(name.to_string(), Arc::new(repo));
+        }
 
+        if save {
+            let config_path = "mounts.json";
+            let mut configs: Vec<MountConfig> = Vec::new();
+
+            if let Ok(content) = fs::read_to_string(config_path) {
+                if let Ok(old) = serde_json::from_str::<Vec<MountConfig>>(&content) {
+                    configs = old;
+                }
+            }
+
+            if let Some(existing) = configs.iter_mut().find(|c| c.name == name) {
+                existing.path = path.to_string();
+                existing.db_type = "sqlite".to_string();
+            } else {
+                configs.push(MountConfig {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    db_type: "sqlite".to_string(),
+                });
+            }
+
+            if let Ok(json) = serde_json::to_string_pretty(&configs) {
+                let _ = fs::write(config_path, json);
+            }
+        }
         Ok(())
+    }
+
+    pub fn unmount(&self, name: &str) -> Result<(), PytjaError> {
+        let mut mounts = self.mounts.write().unwrap();
+        if mounts.remove(name).is_some() {
+            Ok(())
+        } else {
+            Err(PytjaError::NotFound(format!("Database '{}' not mounted", name)))
+        }
     }
 
     pub fn get_repo(&self, name: &str) -> Option<Arc<dyn PytjaRepository + Send + Sync>> {
@@ -522,8 +617,16 @@ impl ConnectionManager {
         mounts.get(name).cloned()
     }
 
+    pub fn list_mounts_details(&self) -> Vec<(String, String)> {
+        let mounts = self.mounts.read().unwrap();
+        mounts.keys().map(|k| (k.clone(), "Mounted".to_string())).collect()
+    }
+
     pub fn list_mounts(&self) -> Vec<String> {
         let mounts = self.mounts.read().unwrap();
         mounts.keys().cloned().collect()
     }
+
+    #[allow(dead_code)]
+    fn save_config(&self) {}
 }

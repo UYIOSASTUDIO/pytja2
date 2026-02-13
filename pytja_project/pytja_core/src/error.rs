@@ -1,4 +1,5 @@
 use thiserror::Error;
+use deadpool_sqlite::{InteractError, PoolError};
 
 #[derive(Error, Debug)]
 pub enum PytjaError {
@@ -6,6 +7,7 @@ pub enum PytjaError {
     #[error("Database connection failed: {0}")]
     DatabaseConnection(String),
 
+    // WICHTIG: Das hier erlaubt ? bei rusqlite Fehlern
     #[error("Database query failed: {0}")]
     DatabaseQuery(#[from] rusqlite::Error),
 
@@ -34,18 +36,25 @@ pub enum PytjaError {
 
     #[error("Internal System Error: {0}")]
     System(String),
+
+    // Alias für deine Aufrufe
+    #[error("Database connection failed: {0}")]
+    ConnectionError(String),
+
+    #[error("Database query failed: {0}")]
+    DatabaseError(String),
 }
 
 // Hilfskonvertierung für DeadPool Fehler
-impl From<deadpool_sqlite::PoolError> for PytjaError {
-    fn from(err: deadpool_sqlite::PoolError) -> Self {
+impl From<PoolError> for PytjaError {
+    fn from(err: PoolError) -> Self {
         PytjaError::PoolError(err.to_string())
     }
 }
 
 // Hilfskonvertierung für DeadPool Interact Fehler
-impl From<deadpool_sqlite::InteractError> for PytjaError {
-    fn from(err: deadpool_sqlite::InteractError) -> Self {
+impl From<InteractError> for PytjaError {
+    fn from(err: InteractError) -> Self {
         PytjaError::System(format!("Thread interaction failed: {}", err))
     }
 }
