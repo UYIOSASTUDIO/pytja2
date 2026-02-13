@@ -69,4 +69,11 @@ impl CryptoService {
         let signing_key = SigningKey::from_bytes(&plaintext.try_into().map_err(|_| anyhow!("Invalid Key Length"))?);
         Ok(signing_key)
     }
+
+    pub fn generate_random_challenge() -> String {
+        use rand::RngCore;
+        let mut data = [0u8; 32]; // 32 Bytes Zufall
+        OsRng.fill_bytes(&mut data);
+        hex::encode(data)
+    }
 }

@@ -38,3 +38,8 @@ tonic = "0.10"       # Der Client
 prost = "0.12"       # Das Datenformat
 pytja_proto = { path = "../pytja_proto" } # Unser Vertrag
 http = "0.2"         # Wichtig für URL Parsing
+async-stream = "0.3.6"
+uuid = "1.20.0"
+futures-util = "0.3.31"
+tokio-stream = "0.1.18"
+jsonwebtoken = "10.3.0"

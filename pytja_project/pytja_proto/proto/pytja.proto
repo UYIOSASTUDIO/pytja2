@@ -6,6 +6,23 @@ service PytjaService {
     rpc Ping (PingRequest) returns (PingResponse);
     rpc ListDirectory (ListRequest) returns (ListResponse);
     rpc CreateNode (CreateNodeRequest) returns (ActionResponse);
+    rpc ReadFile (ReadFileRequest) returns (ReadFileResponse);
+    rpc DeleteNode (DeleteNodeRequest) returns (ActionResponse);
+    rpc MoveNode (MoveNodeRequest) returns (ActionResponse);
+    rpc CopyNode (CopyNodeRequest) returns (ActionResponse);
+    rpc ChangeMode (ChangeModeRequest) returns (ActionResponse);
+    rpc ChownNode (ChownRequest) returns (ActionResponse);
+    rpc LockNode (LockRequest) returns (ActionResponse); // Für lock UND unlock
+    rpc GetUsage (UsageRequest) returns (UsageResponse); // du / quota
+    rpc FindNode (FindRequest) returns (FindResponse);
+    rpc GrepNode (GrepRequest) returns (GrepResponse);
+    rpc StatNode (StatRequest) returns (StatResponse); // Für cd (Prüfen ob Ordner existiert)
+    rpc GetTree (TreeRequest) returns (TreeResponse);
+    rpc UploadFile (stream UploadRequest) returns (ActionResponse);
+    rpc DownloadFile (DownloadRequest) returns (stream FileChunk);
+    rpc ExecScript (ExecRequest) returns (stream ExecResponse);
+    rpc GetChallenge (ChallengeRequest) returns (ChallengeResponse); // Schritt 1
+    rpc Login (LoginRequest) returns (LoginResponse); // Schritt 2
 }
 
 // --- Messages (Datenpakete) ---
@@ -48,4 +65,147 @@ message CreateNodeRequest {
 message ActionResponse {
     bool success = 1;
     string message = 2;
+}
+
+message ReadFileRequest {
+    string path = 1;
+    string password = 2; // Falls die Datei gelockt ist
+}
+
+message ReadFileResponse {
+    bool success = 1;
+    bytes content = 2;
+    string message = 3; // Fehlermeldung falls access denied
+}
+
+message DeleteNodeRequest {
+    string path = 1;
+}
+
+message MoveNodeRequest {
+    string source_path = 1;
+    string dest_path = 2;
+}
+
+message CopyNodeRequest {
+    string source_path = 1;
+    string dest_path = 2;
+    string owner = 3; // Der neue Owner der Kopie
+}
+
+message ChangeModeRequest {
+    string path = 1;
+    uint32 permissions = 2; // 0, 1, 2
+}
+
+message ChownRequest {
+    string path = 1;
+    string new_owner = 2;
+}
+
+message LockRequest {
+    string path = 1;
+    string password = 2; // Leer = Unlock
+}
+
+message UsageRequest {
+    string owner = 1;
+}
+
+message UsageResponse {
+    uint64 bytes = 1;
+}
+
+message FindRequest {
+    string pattern = 1; // z.B. "*.txt"
+}
+
+message FindResponse {
+    repeated string paths = 1;
+}
+
+message GrepRequest {
+    string pattern = 1; // Das Wort, das wir suchen
+}
+
+message GrepResponse {
+    repeated string matches = 1; // Liste der Dateien, die das Wort enthalten
+}
+
+message StatRequest {
+    string path = 1;
+}
+
+message StatResponse {
+    bool exists = 1;
+    bool is_folder = 2;
+    bool is_locked = 3; // Damit cd nach Passwort fragen kann
+}
+
+message TreeRequest {
+    string root_path = 1; // Wo soll der Baum starten? (meistens "/")
+}
+
+message TreeResponse {
+    string tree_output = 1; // Der Server sendet den fertigen Text-Baum
+}
+
+// --- STREAMING MESSAGES ---
+
+message UploadRequest {
+    // oneof spart Platz: Entweder Metadaten ODER Daten-Chunk
+    oneof data {
+        FileMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message FileMetadata {
+    string path = 1;
+    string lock_password = 2;
+    string owner = 3;
+    bool is_folder = 4; // Falls wir rekursiv hochladen (erstmal false)
+}
+
+message DownloadRequest {
+    string path = 1;
+    string password = 2;
+}
+
+message FileChunk {
+    bytes content = 1; // Ein Teil der Datei
+}
+
+message ExecRequest {
+    string script_path = 1;
+    repeated string args = 2;
+}
+
+message ExecResponse {
+    string output_line = 1; // Eine Zeile Output (stdout/stderr)
+}
+
+// 1. Client fragt: "Gib mir eine Aufgabe!"
+message ChallengeRequest {
+    string username = 1;
+}
+
+// 2. Server antwortet: "Hier ist dein Zufallswert."
+message ChallengeResponse {
+    string challenge = 1; // Hex String (32 bytes random)
+    bool user_exists = 2;
+}
+
+// 3. Client antwortet: "Hier ist meine Unterschrift für den Zufallswert."
+message LoginRequest {
+    string username = 1;
+    string challenge = 2; // Die Aufgabe, die wir bekommen haben
+    string signature = 3; // Die Lösung (Signatur der Challenge)
+}
+
+// 4. Server antwortet: "Korrekt. Hier ist dein Session-Token."
+message LoginResponse {
+    bool success = 1;
+    string token = 2; // Das JWT Token
+    string message = 3;
 }

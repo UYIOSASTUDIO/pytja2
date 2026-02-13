@@ -22,3 +22,10 @@ pub struct FileNode {
     pub permissions: u8,
     pub created_at: f64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: String,  // Username
+    pub role: String, // Rolle
+    pub exp: usize,   // Ablaufdatum (Timestamp)
+}
