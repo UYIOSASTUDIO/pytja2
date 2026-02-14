@@ -1,113 +1,131 @@
-use pytja_core::{
-    PytjaRepository, SqliteRepository,
-    crypto::CryptoService, // WICHTIG: Wieder aktiv
-};
-use std::io::{self, Write};
-use colored::*;
 use anyhow::Result;
-use std::path::Path;
-use std::fs; // WICHTIG: Wieder aktiv für Datei-Zugriff
-use pytja_core::telemetry;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-mod network_client; // NEU
-use network_client::PytjaClient; // NEU
+use pytja_core::{
+    // SqliteRepository HIER ENTFERNT, da es nicht mehr existiert
+    crypto::CryptoService,
+    models::User
+};
 
+// Module laden
 mod terminal;
 mod vfs;
 mod plugins;
-use plugins::PluginManager;
+mod network_client;
+mod identity;
 
-use terminal::Terminal;
-use vfs::VirtualFileSystem;
+use crate::terminal::Terminal;
+use crate::vfs::VirtualFileSystem;
+use crate::plugins::PluginManager;
+use crate::network_client::NetworkClient;
 
-mod identity; // NEU
-use identity::IdentityManager;
+use std::sync::{Arc, Mutex};
+use colored::*;
+use rpassword::read_password;
+use std::io::{self, Write};
+use std::fs;
+use std::path::Path;
 
-// KONSTANTEN
-const DB_PATH: &str = "pytja.db";
-const KEY_DIR: &str = "usb_drive"; // WICHTIG: Wieder da!
+const DB_PATH: &str = "pytja_local_cache.db";
+const IDENTITY_DIR: &str = "usb_drive"; // Simulierter USB Stick Pfad
 
 #[tokio::main]
 async fn main() -> Result<()> {
-
-    let _guard = telemetry::init_telemetry("./logs", "pytja_shell.log");
-
+    // 1. UI Header
     print!("\x1B[2J\x1B[1;1H"); // Clear Screen
-    println!("{}", "INITIALIZING SECURE LINK V3.0 (Enterprise)".green().bold());
+    println!("{}", "PYTJA SHELL v2.0 (Enterprise Client)".green().bold());
+    println!("========================================");
 
-    // 2. IDENTITÄT LADEN (Statt lokaler DB)
-    // Wir nutzen den IdentityManager, um den Key von der Platte zu laden
-    let identity_mgr = IdentityManager::new();
-
-    let signing_key = if identity_mgr.has_identity() {
-        match identity_mgr.load_identity() {
-            Ok(k) => k,
-            Err(e) => {
-                println!("{}", e.to_string().red());
-                return Ok(()); // Abbruch bei falschem Passwort
-            }
-        }
-    } else {
-        match identity_mgr.create_new_identity() {
-            Ok(k) => k,
-            Err(e) => {
-                println!("{}", e.to_string().red());
-                return Ok(());
-            }
-        }
-    };
-
-    // Public Key berechnen (Das ist unsere ID)
-    let verifying_key = signing_key.verifying_key();
-    let pub_key_hex = CryptoService::pubkey_to_hex(&verifying_key);
-
-    println!("Identity loaded. Key-ID: {}", pub_key_hex.chars().take(8).collect::<String>().dimmed());
-
-    // 3. Username Abfrage
-    // (Der Server braucht den Namen, um den gespeicherten PubKey zu finden)
-    print!("👤 Enter Agent Codename: ");
-    io::stdout().flush()?;
+    // 2. Identity Load (Simulation eines Hardware-Keys)
+    let files = fs::read_dir(IDENTITY_DIR);
+    let mut key_file: Option<String> = None;
     let mut username = String::new();
-    io::stdin().read_line(&mut username)?;
-    let username = username.trim().to_string();
 
-    // 4. NETZWERK CLIENT STARTEN
-    // Wir geben dem Client jetzt unseren Schlüssel mit!
-    let mut client = PytjaClient::new("127.0.0.1:50051", signing_key, username.clone());
+    if let Ok(entries) = files {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "pytja" {
+                        key_file = Some(path.to_string_lossy().to_string());
+                        username = path.file_stem().unwrap().to_string_lossy().to_string();
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
-    // 5. SECURE HANDSHAKE (Der Login beim Server)
-    if !client.perform_handshake().await? {
-        println!("{}", "CRITICAL: Authentication failed. Server rejected identity.".red().bold());
+    if key_file.is_none() {
+        println!("{}", "NO IDENTITY FOUND!".red().bold());
+        println!("Please insert your USB Key (put .pytja file in 'usb_drive' folder).");
         return Ok(());
     }
 
-    println!("");
+    let key_path = key_file.unwrap();
+    println!("Identity detected: {} ({})", username.cyan().bold(), key_path);
 
-    // 6. Plugins laden (Deine bestehende Logik)
-    println!("{}", "[*] Initializing Module System...".yellow());
-    // Pfad evtl. anpassen, je nachdem wo du startest
-    let mut plugin_manager = PluginManager::new("../pytja_plugins");
-    match plugin_manager.scan_and_load() {
-        Ok(msg) => println!(" [+] {}", msg.green()),
-        Err(e) => println!(" [!] Plugin Error: {}", e.to_string().red()),
+    // 3. Password Prompt (Entschlüsselung)
+    print!("Enter Identity Password: ");
+    io::stdout().flush()?;
+    let password = read_password()?;
+
+    let encrypted_pem = fs::read_to_string(&key_path)?;
+
+    // Versuche den Key zu entschlüsseln
+    let signing_key = match CryptoService::decrypt_private_key_local(&encrypted_pem, &password) {
+        Ok(k) => k,
+        Err(_) => {
+            println!("{}", "ACCESS DENIED. WRONG PASSWORD.".red().bold());
+            return Ok(());
+        }
+    };
+
+    println!("{}", "Identity Unlocked. Connecting to Neural Link...".green());
+
+    // 4. Server Handshake & Login
+    let mut client = NetworkClient::new("http://127.0.0.1:50051".to_string()).await?;
+
+    // Challenge anfordern
+    let challenge = client.get_challenge(&username).await?;
+
+    // Challenge signieren
+    let signature = CryptoService::sign_message(&signing_key, challenge.as_bytes());
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    // Login senden
+    let login_resp = client.login(&username, &challenge, &signature_hex).await?;
+
+    if login_resp.success {
+        println!("{} Session Token acquired.", "LOGIN SUCCESSFUL.".green().bold());
+        client.set_token(&login_resp.token);
+    } else {
+        println!("Login Failed: {}", login_resp.message.red());
+        return Ok(());
     }
 
-    // 7. System Starten
-    // Das VFS ist jetzt nur noch für Caching/Temp da, nicht mehr für Auth
+    // 5. Plugin System Init
+    println!("Loading WASM Plugins...");
+    let mut plugin_manager = PluginManager::new();
+    if Path::new("./plugins").exists() {
+        if let Err(e) = plugin_manager.load_plugins("./plugins") {
+            println!("Plugin Warning: {}", e);
+        }
+    } else {
+        fs::create_dir_all("./plugins")?;
+    }
+    println!("Plugins loaded: {}", plugin_manager.list_functions().len());
+
+    // 6. Virtual File System (Local Cache)
+    // FIX: Async Initialization wegen DriverManager
     let vfs = VirtualFileSystem::new(username.clone(), DB_PATH).await;
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
+    // 7. Terminal Start
+    println!("Starting Terminal Interface...\n");
     let mut term = Terminal::new(vfs_shared, username, plugin_manager, client);
+
+    // Hauptschleife starten
     term.start().await?;
 
+    println!("Session terminated.");
     Ok(())
-}
-
-fn read_input(prompt: &str) -> String {
-    print!("{}", prompt);
-    io::stdout().flush().unwrap();
-    let mut buffer = String::new();
-    io::stdin().read_line(&mut buffer).unwrap();
-    buffer.trim().to_string()
 }

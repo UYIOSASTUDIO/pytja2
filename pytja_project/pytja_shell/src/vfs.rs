@@ -28,9 +28,10 @@ impl VirtualFileSystem {
     pub async fn new(user_id: String, db_path: &str) -> Self {
         let manager = DriverManager::new();
 
-        // Async Mount
-        manager.mount("primary", db_path, DatabaseType::Sqlite).await
-            .expect("CRITICAL: Failed to mount primary database.");
+        // Versuche zu mounten, aber stürze nicht ab wenn es fehlschlägt (Shell soll robust sein)
+        if let Err(e) = manager.mount("primary", db_path, DatabaseType::Sqlite).await {
+            eprintln!("Warning: Failed to mount local DB: {}", e);
+        }
 
         Self {
             connection_manager: manager,
@@ -44,9 +45,8 @@ impl VirtualFileSystem {
         &self.current_path
     }
 
-    pub fn db(&self) -> Arc<dyn PytjaRepository> {
+    pub fn db(&self) -> Option<Arc<dyn PytjaRepository>> {
         self.connection_manager.get_repo(&self.active_mount)
-            .expect("CRITICAL: Active mount lost connection.")
     }
 
     pub fn resolve_path(&self, name: &str) -> String {
@@ -91,6 +91,10 @@ impl VirtualFileSystem {
             return Err(PytjaError::AlreadyExists(full_path));
         }
 
+        if let Err(e) = self.check_quota_availability(content.len()).await {
+            return Err(e.to_string());
+        }
+
         let node = FileNode {
             path: full_path.clone(),
             name: name.clone(),
@@ -101,6 +105,7 @@ impl VirtualFileSystem {
             lock_pass,
             permissions: 0,
             created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64(),
+            blob_id: None,
         };
 
         self.db().save_node(&node).await?;
@@ -430,6 +435,7 @@ impl VirtualFileSystem {
                         lock_pass: current_pass.clone(),
                         permissions: 0,
                         created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                        blob_id: None,
                     };
                     let _ = self.db().save_node(&node).await; // Ignore Exists Error here
 
@@ -447,6 +453,7 @@ impl VirtualFileSystem {
                             lock_pass: current_pass,
                             permissions: 0,
                             created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                            blob_id: None,
                         };
                         let _ = self.db().save_node(&node).await;
                     }
