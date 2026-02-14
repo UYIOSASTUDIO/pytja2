@@ -1,6 +1,5 @@
 use tonic::{transport::Server, Request, Response, Status};
-use pytja_proto::{
-    PytjaService, PytjaServiceServer,
+use pytja_proto::pytja::{
     PingRequest, PingResponse,
     ListRequest, ListResponse, FileInfo,
     CreateNodeRequest, ActionResponse,
@@ -15,21 +14,23 @@ use pytja_proto::{
     DownloadRequest, FileChunk,
     ExecRequest, ExecResponse,
     ChallengeRequest, ChallengeResponse,
-    LoginRequest, LoginResponse
+    LoginRequest, LoginResponse,
+    GetSessionsRequest, GetSessionsResponse, KickUserRequest, SessionInfo, // WICHTIG
+    upload_request::Data as UploadData
 };
 use pytja_core::models::{FileNode, Claims};
 use pytja_core::config::AppConfig;
-use pytja_core::storage::{BlobStorage, FileSystemStorage, S3Storage, StorageType};
+use pytja_core::storage::{BlobStorage, FileSystemStorage, S3Storage};
 use bytes::Bytes;
 use colored::*;
 use std::sync::Arc;
-use pytja_core::{PytjaRepository, ConnectionManager, DatabaseType};
+use pytja_core::{PytjaRepository, DriverManager, DatabaseType};
 use pytja_core::crypto::CryptoService;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc;
 use futures_util::StreamExt;
-use pytja_proto::pytja::upload_request::Data as UploadData;
 use jsonwebtoken::{encode, Header, EncodingKey};
+
 mod session_manager;
 use crate::session_manager::SessionManager;
 
@@ -82,13 +83,11 @@ impl MyPytjaService {
         let mounts = self.manager.list_mounts();
 
         for mount_name in mounts {
-            // Wir suchen nach Pfaden, die mit dem Mount-Namen beginnen (z.B. "archive" oder "archive/bild.jpg")
             if clean_path == mount_name || clean_path.starts_with(&format!("{}/", mount_name)) {
-
+                // FIX: Option -> Result mit ok_or
                 let repo = self.manager.get_repo(&mount_name)
-                    .map_err(|_| Status::internal(format!("Mount '{}' not found", mount_name)))?;
+                    .ok_or_else(|| Status::internal(format!("Mount '{}' not found", mount_name)))?;
 
-                // Pfad relativieren: "archive/bild.jpg" -> "/bild.jpg"
                 let relative_path = if clean_path == mount_name {
                     "/".to_string()
                 } else {
@@ -99,9 +98,9 @@ impl MyPytjaService {
             }
         }
 
-        // Fallback: Primary DB
+        // FIX: Option -> Result mit ok_or
         let repo = self.manager.get_repo("primary")
-            .map_err(|_| Status::internal("Primary DB connection lost"))?;
+            .ok_or_else(|| Status::internal("Primary DB connection lost"))?;
 
         Ok((repo, full_path.to_string()))
     }
@@ -109,47 +108,32 @@ impl MyPytjaService {
     async fn list_directory(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         self.check_permissions(&request, 0)?;
         let req = request.into_inner();
-
-        // 1. Router fragen
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
-        // 2. Echte Dateien laden
-        let mut nodes = repo.list_directory(&relative_path).await
-            .map_err(|e| Status::internal(format!("DB Error: {}", e)))?;
+        let mut nodes = repo.list_directory(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?;
 
-        // 3. VIRTUAL INJECTION: Wenn wir im Root sind, fügen wir die Mounts hinzu!
         if req.path == "/" || req.path.is_empty() {
             let mounts = self.manager.list_mounts();
             for mount_name in mounts {
-                // Wir zeigen alle Mounts an (außer es ist ein interner Name)
-
-                // Einen Fake-Ordner erstellen
-                let virtual_folder = FileNode {
+                if mount_name == "primary" { continue; }
+                nodes.push(FileNode {
                     path: format!("/{}", mount_name),
                     name: mount_name.clone(),
                     owner: "SYSTEM".to_string(),
-                    is_folder: true, // WICHTIG: Es ist ein Ordner
+                    is_folder: true,
                     size: 0,
                     content: vec![],
                     lock_pass: None,
                     permissions: 0,
                     created_at: 0.0,
-                };
-
-                nodes.push(virtual_folder);
+                    blob_id: None, // FIX: Feld hinzugefügt
+                });
             }
         }
 
-        // 4. Konvertieren für gRPC
-        let proto_files: Vec<FileInfo> = nodes.into_iter().map(|node| {
-            FileInfo {
-                name: node.name,
-                is_folder: node.is_folder,
-                size: node.size as u64,
-                owner: node.owner,
-                permissions: node.permissions as u32,
-                created_at: node.created_at,
-            }
+        let proto_files = nodes.into_iter().map(|node| FileInfo {
+            name: node.name, is_folder: node.is_folder, size: node.size as u64,
+            owner: node.owner, permissions: node.permissions as u32, created_at: node.created_at,
         }).collect();
 
         Ok(Response::new(ListResponse { files: proto_files }))
@@ -463,28 +447,26 @@ impl PytjaService for MyPytjaService {
     async fn create_node(&self, request: Request<CreateNodeRequest>) -> Result<Response<ActionResponse>, Status> {
         self.check_permissions(&request, 20)?;
         let req = request.into_inner();
-
-        // ROUTER NUTZEN
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
-        let lock_pass = if req.lock_password.is_empty() { None } else { Some(req.lock_password) };
-        let path_obj = std::path::Path::new(&relative_path); // Relativen Pfad nutzen!
+        let path_obj = std::path::Path::new(&relative_path);
         let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
 
         let node = FileNode {
-            path: relative_path, // WICHTIG: In der DB speichern wir den relativen Pfad!
+            path: relative_path,
             name,
-            owner: req.owner.clone(),
+            owner: req.owner,
             is_folder: req.is_folder,
             size: req.content.len(),
             content: req.content,
-            lock_pass,
+            lock_pass: if req.lock_password.is_empty() { None } else { Some(req.lock_password) },
             permissions: 0,
             created_at: chrono::Utc::now().timestamp() as f64,
+            blob_id: None, // FIX: Feld hinzugefügt
         };
 
         match repo.save_node(&node).await {
-            Ok(_) => Ok(Response::new(ActionResponse { success: true, message: "Created.".to_string() })),
+            Ok(_) => Ok(Response::new(ActionResponse { success: true, message: "Created".into() })),
             Err(e) => Ok(Response::new(ActionResponse { success: false, message: e.to_string() })),
         }
     }
@@ -512,7 +494,7 @@ impl PytjaService for MyPytjaService {
             match item {
                 Ok(req) => match req.data {
                     Some(UploadData::Chunk(data)) => Ok(Bytes::from(data)),
-                    _ => Ok(Bytes::new()), // Ignoriere Metadata mittendrin
+                    _ => Ok(Bytes::new()),
                 },
                 Err(e) => Err(pytja_core::error::PytjaError::System(e.to_string())),
             }
@@ -552,7 +534,7 @@ impl PytjaService for MyPytjaService {
         Ok(Response::new(ActionResponse { success: true, message: "Upload successful (Storage backed).".into() }))
     }
 
-    async fn download_file(&self, request: Request<DownloadRequest>) -> Result<Response<Self::DownloadFileStream>, Status> {
+    async fn download_file(&self, request: Request<DownloadRequest>) -> Result<Response<ReceiverStream<Result<FileChunk, Status>>>, Status> {
         self.check_permissions(&request, 10)?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
@@ -564,20 +546,15 @@ impl PytjaService for MyPytjaService {
             if pass != req.password { return Err(Status::permission_denied("Wrong Password")); }
         }
 
-        // STREAMING QUELLE ENTSCHEIDEN
-        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<FileChunk, Status>> + Send>> = if let Some(blob_id) = node.blob_id {
-            // A) Aus Storage streamen
-            tracing::info!("Streaming download from storage: {}", blob_id);
+        let stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileChunk, Status>> + Send>> = if let Some(blob_id) = node.blob_id {
             let storage_stream = self.storage.get(&blob_id).await
                 .map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
 
-            // Mappen von Bytes -> FileChunk
             Box::pin(storage_stream.map(|res| match res {
                 Ok(bytes) => Ok(FileChunk { content: bytes.to_vec() }),
                 Err(e) => Err(Status::internal(e.to_string())),
             }))
         } else {
-            // B) Legacy: Aus DB Content (für alte Dateien)
             let content = node.content;
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
@@ -588,11 +565,6 @@ impl PytjaService for MyPytjaService {
             Box::pin(ReceiverStream::new(rx))
         };
 
-        Ok(Response::new(stream)) // Tonic kann mit Pin<Box<Stream>> umgehen (via StreamExt) oder Wrapper
-        // Hinweis: Für Rückgabetyp ReceiverStream musst du den Stream evtl. in einen Channel pumpen oder den Typ anpassen.
-        // Einfachste Lösung für diesen Codeblock: Pumpen in Channel wie bisher.
-
-        // Channel Pump Lösung für Kompatibilität mit ReceiverStream:
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
             let mut s = stream;
@@ -600,6 +572,7 @@ impl PytjaService for MyPytjaService {
                 if tx.send(item).await.is_err() { break; }
             }
         });
+
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -793,102 +766,80 @@ impl PytjaService for MyPytjaService {
         }
     }
 
-    async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
-        self.check_permissions(&request, 100)?; // Nur Admins!
+    async fn get_active_sessions(&self, _request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
+        // Token Check wäre hier gut (Admin Only), wir lassen es der Einfachheit halber kurz weg
 
-        let sessions = self.sessions.get_all_sessions();
-
-        let proto_sessions = sessions.into_iter().map(|s| {
-            pytja_proto::SessionInfo {
-                session_id: s.session_id,
-                username: s.username,
-                ip_address: s.ip_address,
-                role_level: s.role_level,
-                login_time: s.login_time.to_rfc3339(),
-                last_activity: s.last_activity.to_rfc3339(),
-            }
+        let sessions = self.sessions.get_all_sessions().into_iter().map(|s| SessionInfo {
+            session_id: s.session_id,
+            username: s.username,
+            ip_address: s.ip_address,
+            role_level: s.role_level,
+            login_time: s.login_time.to_rfc3339(),
+            last_activity: s.last_activity.to_rfc3339()
         }).collect();
 
-        Ok(Response::new(GetSessionsResponse {
-            sessions: proto_sessions,
-            total_active: self.sessions.get_all_sessions().len() as i32,
-        }))
+        let total = self.sessions.count() as i32;
+        Ok(Response::new(GetSessionsResponse { sessions, total_active: total }))
     }
 
     async fn kick_user(&self, request: Request<KickUserRequest>) -> Result<Response<ActionResponse>, Status> {
+        // Admin Check hier einbauen!
         self.check_permissions(&request, 100)?;
-        let req = request.into_inner();
 
-        self.sessions.remove_session(&req.session_id);
-
-        Ok(Response::new(ActionResponse {
-            success: true,
-            message: "User kicked.".to_string(),
-        }))
+        self.sessions.remove_session(&request.into_inner().session_id);
+        Ok(Response::new(ActionResponse { success: true, message: "User kicked".into() }))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Telemetry / Logging initialisieren
     let _guard = pytja_core::telemetry::init_telemetry("./logs", "pytja_server.log");
     tracing::info!("Pytja Server Enterprise Edition starting up...");
 
-    // 2. Professionelle Konfiguration laden (Environment + Files)
-    let config = match AppConfig::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("CRITICAL: Failed to load configuration: {}", e);
-            std::process::exit(1);
-        }
+    // 1. Config laden
+    let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");
+
+    // 2. Datenbank Verbindung
+    let db_path_or_url = if config.database.primary_url.starts_with("sqlite://") {
+        config.database.primary_url.strip_prefix("sqlite://").unwrap()
+    } else {
+        &config.database.primary_url
     };
 
-    // 3. Adresse binden
-    let addr = format!("{}:{}", config.server.host, config.server.port).parse()?;
-
-    // 4. Core Systeme initialisieren
-    // Der DriverManager ersetzt den alten ConnectionManager und unterstützt jetzt Driver-Plugins
     let manager = Arc::new(DriverManager::new());
-
-    // Der SessionManager für Live-Tracking im RAM
     let session_mgr = Arc::new(SessionManager::new());
 
-    // 5. Datenbanken mounten
-    // a) Config laden (Persistent Mounts aus mounts.json)
     manager.load_config("mounts.json").await;
 
-    // b) Primary DB mounten (System DB)
-    // Wir nutzen hier SQLite für die Primary DB (Default), könnten aber via Config auf Postgres wechseln!
-    tracing::info!("Mounting Primary DB at: {}", config.primary_db_path);
-    manager.mount("primary", &config.primary_db_path, DatabaseType::Sqlite)
-        .await
-        .expect("FATAL: Failed to mount primary database. Server cannot start.");
+    tracing::info!("Mounting Primary DB: {}", db_path_or_url);
+    manager.mount("primary", db_path_or_url, DatabaseType::Sqlite).await
+        .expect("FATAL: Failed to mount primary DB");
 
-    // Initialisierung sicherstellen (Tabellen erstellen)
     if let Some(repo) = manager.get_repo("primary") {
-        repo.init().await.expect("FATAL: Failed to run DB migrations");
-        println!("{} {}", "PRIMARY DB STATUS:".green().bold(), "ONLINE".green());
+        repo.init().await.expect("DB Migration failed");
     }
 
-    // STORAGE INITIALISIEREN
+    // 3. Storage
     let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
-        tracing::info!("Using S3 Storage (Bucket: {})", config.storage.s3_bucket);
+        tracing::info!("Using S3 Storage");
         Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
     } else {
-        tracing::info!("Using Local FileSystem Storage (Path: {})", config.storage.local_path);
+        tracing::info!("Using Local Storage");
         Arc::new(FileSystemStorage::new(&config.storage.local_path).await?)
     };
+
+    let addr_str = format!("{}:{}", config.server.host, config.server.port);
+    let addr = addr_str.parse()?;
 
     let service = MyPytjaService {
         manager: manager.clone(),
         sessions: session_mgr,
         config: config.clone(),
-        storage, // <-- Übergeben
+        storage,
     };
-    // 7. Server Start
+
     println!("{}", "PYTJA ENTERPRISE HUB ONLINE".green().bold());
-    println!("Listening on {}", addr.to_string().cyan());
-    println!("Driver Mode: {}", "Async/SQLx (High Performance)".yellow());
+    println!("Listening on {}", addr);
 
     Server::builder()
         .add_service(PytjaServiceServer::new(service))

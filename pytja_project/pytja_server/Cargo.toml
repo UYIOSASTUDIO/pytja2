@@ -12,12 +12,16 @@ colored = "2.0"
 
 # Unsere eigenen Module
 pytja_proto = { path = "../pytja_proto" }
-pytja_core = { path = "../pytja_core" } # Wir brauchen Zugriff auf die DB Logik
-chrono = "0.4.43"
-uuid = { version = "1.20.0", features = ["v4"] }
-futures-util = "0.3.31"
-tokio-stream = "0.1.18"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
-serde_json = "1.0.149"
-tracing = "0.1.44"
-dashmap = "6.1.0"
+pytja_core = { path = "../pytja_core" }
+
+# Utilities
+chrono = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+jsonwebtoken = "9.2" # Oder deine Version
+serde = { version = "1.0", features = ["derive"] } # <-- FEHLTE
+serde_json = "1.0"
+tracing = "0.1"
+dashmap = "5.5" # Oder 6.0
+bytes = "1.5" # <-- FEHLTE
