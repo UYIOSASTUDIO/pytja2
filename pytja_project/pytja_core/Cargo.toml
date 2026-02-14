@@ -33,6 +33,16 @@ anyhow = "1.0"
 config = "0.13"
 dotenv = "0.15"
 
+# Für Object Storage
+object_store = "0.9" # Generisches Interface (genial für Abstraktion)
+aws-config = "1.1"
+aws-sdk-s3 = "1.14" # Der offizielle AWS S3 Client
+bytes = "1.5"       # Effizientes Byte-Handling
+futures = "0.3"
+
+tokio-util = { version = "0.7", features = ["io"] }
+
+
 [dev-dependencies]
 uuid = { version = "1.0", features = ["v4"] }
 tokio = { version = "1.0", features = ["full", "macros"] } # Damit wir #[tokio::test] nutzen können

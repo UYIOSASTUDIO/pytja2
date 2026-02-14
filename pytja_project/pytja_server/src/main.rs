@@ -19,6 +19,8 @@ use pytja_proto::{
 };
 use pytja_core::models::{FileNode, Claims};
 use pytja_core::config::AppConfig;
+use pytja_core::storage::{BlobStorage, FileSystemStorage, S3Storage, StorageType};
+use bytes::Bytes;
 use colored::*;
 use std::sync::Arc;
 use pytja_core::{PytjaRepository, ConnectionManager, DatabaseType};
@@ -34,8 +36,10 @@ use crate::session_manager::SessionManager;
 const JWT_SECRET: &[u8] = b"pytja_super_secret_key_change_me_in_prod";
 
 pub struct MyPytjaService {
-    manager: Arc<ConnectionManager>,
+    manager: Arc<DriverManager>,
     sessions: Arc<SessionManager>,
+    config: AppConfig,
+    storage: Arc<dyn BlobStorage>, // <-- NEU
 }
 
 impl MyPytjaService {
@@ -407,38 +411,6 @@ impl PytjaService for MyPytjaService {
         }
     }
 
-    async fn download_file(&self, request: Request<DownloadRequest>) -> Result<Response<Self::DownloadFileStream>, Status> {
-        self.check_permissions(&request, 10)?;
-        let req = request.into_inner();
-
-        // ROUTER NUTZEN!
-        let (repo, relative_path) = self.resolve_repo(&req.path)?;
-
-        let node = match repo.get_node(&relative_path).await {
-            Ok(Some(n)) => n,
-            Ok(None) => return Err(Status::not_found("File not found")),
-            Err(e) => return Err(Status::internal(e.to_string())),
-        };
-
-        if let Some(pass) = node.lock_pass {
-            if pass != req.password {
-                return Err(Status::permission_denied("Wrong Password"));
-            }
-        }
-
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let chunk_size = 1024 * 64;
-            let content = node.content;
-            for chunk in content.chunks(chunk_size) {
-                let response = FileChunk { content: chunk.to_vec() };
-                if tx.send(Ok(response)).await.is_err() { break; }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
     async fn find_node(&self, request: Request<FindRequest>) -> Result<Response<FindResponse>, Status> {
         self.check_permissions(&request, 10)?;
 
@@ -519,58 +491,116 @@ impl PytjaService for MyPytjaService {
 
     async fn upload_file(&self, request: Request<tonic::Streaming<UploadRequest>>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(&request, 20)?;
-        tracing::info!("UPLOAD request initiated by user: '{}'", claims.sub);
-
         let mut stream = request.into_inner();
 
-        // Wir brauchen den Manager hier noch nicht zwingend, erst beim Speichern
+        // 1. Metadata holen (Erste Nachricht)
+        let first_msg = stream.message().await.map_err(|e| Status::internal(e.to_string()))?;
+        let metadata = match first_msg {
+            Some(req) => match req.data {
+                Some(UploadData::Metadata(m)) => m,
+                _ => return Err(Status::invalid_argument("Metadata must be sent first")),
+            },
+            None => return Err(Status::invalid_argument("Empty stream")),
+        };
 
-        let mut metadata: Option<FileMetadata> = None;
-        let mut full_content: Vec<u8> = Vec::new();
+        // 2. Router fragen
+        let (repo, relative_path) = self.resolve_repo(&metadata.path)?;
 
-        while let Some(req_result) = stream.next().await {
-            let req = req_result.map_err(|e| Status::internal(e.to_string()))?;
-            match req.data {
-                Some(UploadData::Metadata(meta)) => { metadata = Some(meta); },
-                Some(UploadData::Chunk(data)) => { full_content.extend(data); },
-                None => {}
+        // 3. STREAMING PIPE: gRPC -> Storage
+        // Wir wandeln den gRPC Stream in einen ByteStream um
+        let byte_stream = stream.map(|item| {
+            match item {
+                Ok(req) => match req.data {
+                    Some(UploadData::Chunk(data)) => Ok(Bytes::from(data)),
+                    _ => Ok(Bytes::new()), // Ignoriere Metadata mittendrin
+                },
+                Err(e) => Err(pytja_core::error::PytjaError::System(e.to_string())),
             }
+        });
+
+        let pinned_stream = Box::pin(byte_stream);
+
+        // 4. In Storage schreiben (Zero-Copy!)
+        tracing::info!("Streaming upload to storage: {}", metadata.path);
+        let blob_id = self.storage.put(&metadata.path, pinned_stream).await
+            .map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
+
+        // 5. Metadaten in DB speichern (mit blob_id, ohne content)
+        let path_obj = std::path::Path::new(&relative_path);
+        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
+
+        let node = FileNode {
+            path: relative_path,
+            name,
+            owner: metadata.owner,
+            is_folder: false,
+            content: vec![], // LEER! Daten sind im Storage.
+            blob_id: Some(blob_id), // REFERENZ!
+            size: 0, // Könnte man vom Storage zurückbekommen
+            lock_pass: if metadata.lock_password.is_empty() { None } else { Some(metadata.lock_password) },
+            permissions: 0,
+            created_at: chrono::Utc::now().timestamp() as f64,
+        };
+
+        repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        // Log
+        if let Ok(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "UPLOAD", &metadata.path).await;
         }
 
-        if let Some(meta) = metadata {
-            // FIX: Logging und Router müssen HIER rein, wo 'meta' existiert!
+        Ok(Response::new(ActionResponse { success: true, message: "Upload successful (Storage backed).".into() }))
+    }
 
-            // 1. Router fragen
-            let (repo, relative_path) = self.resolve_repo(&meta.path)?;
+    async fn download_file(&self, request: Request<DownloadRequest>) -> Result<Response<Self::DownloadFileStream>, Status> {
+        self.check_permissions(&request, 10)?;
+        let req = request.into_inner();
+        let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
-            // 2. Logging (Primary) - FIX: if let Ok
-            if let Ok(primary) = self.manager.get_repo("primary") {
-                let _ = primary.log_action(&claims.sub, "UPLOAD", &meta.path).await;
-            }
+        let node = repo.get_node(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?
+            .ok_or(Status::not_found("File not found"))?;
 
-            let path_obj = std::path::Path::new(&relative_path);
-            let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
-            let lock_pass = if meta.lock_password.is_empty() { None } else { Some(meta.lock_password) };
+        if let Some(pass) = node.lock_pass {
+            if pass != req.password { return Err(Status::permission_denied("Wrong Password")); }
+        }
 
-            let node = FileNode {
-                path: relative_path,
-                name,
-                owner: meta.owner,
-                is_folder: false,
-                size: full_content.len(),
-                content: full_content,
-                lock_pass,
-                permissions: 0,
-                created_at: chrono::Utc::now().timestamp() as f64,
-            };
+        // STREAMING QUELLE ENTSCHEIDEN
+        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<FileChunk, Status>> + Send>> = if let Some(blob_id) = node.blob_id {
+            // A) Aus Storage streamen
+            tracing::info!("Streaming download from storage: {}", blob_id);
+            let storage_stream = self.storage.get(&blob_id).await
+                .map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
 
-            match repo.save_node(&node).await {
-                Ok(_) => Ok(Response::new(ActionResponse { success: true, message: "Upload complete.".to_string() })),
-                Err(e) => Ok(Response::new(ActionResponse { success: false, message: e.to_string() })),
-            }
+            // Mappen von Bytes -> FileChunk
+            Box::pin(storage_stream.map(|res| match res {
+                Ok(bytes) => Ok(FileChunk { content: bytes.to_vec() }),
+                Err(e) => Err(Status::internal(e.to_string())),
+            }))
         } else {
-            Ok(Response::new(ActionResponse { success: false, message: "No metadata received".to_string() }))
-        }
+            // B) Legacy: Aus DB Content (für alte Dateien)
+            let content = node.content;
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                for chunk in content.chunks(64 * 1024) {
+                    let _ = tx.send(Ok(FileChunk { content: chunk.to_vec() })).await;
+                }
+            });
+            Box::pin(ReceiverStream::new(rx))
+        };
+
+        Ok(Response::new(stream)) // Tonic kann mit Pin<Box<Stream>> umgehen (via StreamExt) oder Wrapper
+        // Hinweis: Für Rückgabetyp ReceiverStream musst du den Stream evtl. in einen Channel pumpen oder den Typ anpassen.
+        // Einfachste Lösung für diesen Codeblock: Pumpen in Channel wie bisher.
+
+        // Channel Pump Lösung für Kompatibilität mit ReceiverStream:
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut s = stream;
+            while let Some(item) = s.next().await {
+                if tx.send(item).await.is_err() { break; }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn copy_node(&self, request: Request<CopyNodeRequest>) -> Result<Response<ActionResponse>, Status> {
@@ -840,13 +870,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} {}", "PRIMARY DB STATUS:".green().bold(), "ONLINE".green());
     }
 
-    // 6. Service erstellen
+    // STORAGE INITIALISIEREN
+    let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
+        tracing::info!("Using S3 Storage (Bucket: {})", config.storage.s3_bucket);
+        Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
+    } else {
+        tracing::info!("Using Local FileSystem Storage (Path: {})", config.storage.local_path);
+        Arc::new(FileSystemStorage::new(&config.storage.local_path).await?)
+    };
+
     let service = MyPytjaService {
         manager: manager.clone(),
         sessions: session_mgr,
         config: config.clone(),
+        storage, // <-- Übergeben
     };
-
     // 7. Server Start
     println!("{}", "PYTJA ENTERPRISE HUB ONLINE".green().bold());
     println!("Listening on {}", addr.to_string().cyan());

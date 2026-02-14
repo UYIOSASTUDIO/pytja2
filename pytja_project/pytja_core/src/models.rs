@@ -16,8 +16,14 @@ pub struct FileNode {
     pub name: String,
     pub owner: String,
     pub is_folder: bool,
-    pub size: usize,
+
+    // Legacy Content (für kleine Files oder Configs)
     pub content: Vec<u8>,
+
+    // ENTERPRISE: Referenz auf den Blob im Storage
+    pub blob_id: Option<String>,
+
+    pub size: usize,
     pub lock_pass: Option<String>,
     pub permissions: u8,
     pub created_at: f64,
