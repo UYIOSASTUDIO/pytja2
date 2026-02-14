@@ -1,13 +1,13 @@
 use anyhow::Result;
-use pytja_core::{SqliteRepository, PytjaRepository, User};
+use pytja_core::{DriverManager, DatabaseType, PytjaRepository, User}; // Neue Imports
 use pytja_core::crypto::CryptoService;
 use std::io::{self, Write};
 use rpassword::read_password;
 use colored::*;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
-// Wir simulieren den USB-Stick in diesem Ordner im Projekt-Root
 const KEY_STORAGE_DIR: &str = "usb_drive";
 
 #[tokio::main]
@@ -17,23 +17,32 @@ async fn main() -> Result<()> {
 
     let db_path = "pytja.db";
 
-    // Ordner für Keys erstellen, falls nicht vorhanden
     if !Path::new(KEY_STORAGE_DIR).exists() {
         fs::create_dir(KEY_STORAGE_DIR)?;
         println!("Created Key Storage Vault at './{}'", KEY_STORAGE_DIR);
     }
 
-    let repo = SqliteRepository::new(db_path);
-    repo.init()?;
+    // NEU: DriverManager nutzen statt direktes Repo
+    let manager = DriverManager::new();
 
-    if let Err(e) = create_identity(&repo).await {
+    // Async Mount!
+    manager.mount("primary", db_path, DatabaseType::Sqlite).await
+        .map_err(|e| anyhow::anyhow!("Failed to mount DB: {}", e))?;
+
+    let repo = manager.get_repo("primary").expect("DB failed to load");
+
+    // Async Init!
+    repo.init().await.map_err(|e| anyhow::anyhow!("DB Init failed: {}", e))?;
+
+    if let Err(e) = create_identity(repo).await {
         println!("\n{}: {}", "ERROR".red().bold(), e);
     }
 
     Ok(())
 }
 
-async fn create_identity(repo: &SqliteRepository) -> Result<()> {
+// Signatur geändert: Nimmt Arc<dyn PytjaRepository>
+async fn create_identity(repo: Arc<dyn PytjaRepository>) -> Result<()> {
     print!("Choose Username: ");
     io::stdout().flush()?;
     let mut name = String::new();
@@ -42,6 +51,7 @@ async fn create_identity(repo: &SqliteRepository) -> Result<()> {
 
     if name.is_empty() { return Ok(()); }
 
+    // Async Call!
     if repo.user_exists(&name).await? {
         println!("{}", "User already exists.".yellow());
         return Ok(());
@@ -62,33 +72,28 @@ async fn create_identity(repo: &SqliteRepository) -> Result<()> {
 
     println!("\n{}", "[*] Generating Ed25519 Keypair...".yellow());
 
-    // 1. Raw Keys generieren
     let signing_key = CryptoService::generate_keypair();
 
-    // 2. Private Key verschlüsseln
-    // WICHTIG: Wir übergeben hier 'signing_key' direkt (nicht als String/Hex)
     println!("{}", "[*] Encrypting Private Key vault...".yellow());
     let encrypted_key_pem = CryptoService::encrypt_private_key_local(&signing_key, &pass)?;
 
-    // 3. Datei speichern ("USB Stick")
     let key_file_path = format!("{}/{}.pytja", KEY_STORAGE_DIR, name);
     fs::write(&key_file_path, encrypted_key_pem)?;
     println!(" [+] Encrypted Key saved to: {}", key_file_path.cyan());
 
-    // 4. Public Key für die Datenbank vorbereiten (als Hex String)
     let verifying_key = signing_key.verifying_key();
-    let public_key_hex = hex::encode(verifying_key.to_bytes());
+    let public_key_hex = CryptoService::pubkey_to_hex(&verifying_key);
 
-    // 5. User Objekt erstellen
     let user = User {
         username: name.clone(),
-        public_key: public_key_hex, // Hier kommt der String rein
+        public_key: public_key_hex,
         description: Some("Admin Operator".to_string()),
         role_level: 100,
         is_active: true,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
+    // Async Call!
     repo.create_user(&user).await?;
 
     println!("\n{}", "SUCCESS!".green().bold());

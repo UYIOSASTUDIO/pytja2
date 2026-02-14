@@ -11,8 +11,6 @@ extism = "1.0"          # Die Wasm Runtime
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Die alten Abhängigkeiten (damit dein kopierter Code funktioniert)
-rusqlite = { version = "0.32", features = ["bundled"] }
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"

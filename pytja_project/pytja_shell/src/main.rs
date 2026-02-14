@@ -95,10 +95,9 @@ async fn main() -> Result<()> {
 
     // 7. System Starten
     // Das VFS ist jetzt nur noch für Caching/Temp da, nicht mehr für Auth
-    let vfs = VirtualFileSystem::new(username.clone(), DB_PATH);
+    let vfs = VirtualFileSystem::new(username.clone(), DB_PATH).await;
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
-    // Terminal übergeben wir den authentifizierten Client
     let mut term = Terminal::new(vfs_shared, username, plugin_manager, client);
     term.start().await?;
 

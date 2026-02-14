@@ -1,5 +1,5 @@
 use pytja_core::{
-    PytjaRepository, ConnectionManager, DatabaseType, FileNode, PytjaError
+    PytjaRepository, DriverManager, DatabaseType, FileNode, PytjaError // DriverManager statt ConnectionManager
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,30 +8,28 @@ use std::fs;
 use colored::*;
 use std::sync::Arc;
 
-const DEFAULT_QUOTA: usize = 100 * 1024 * 1024; // 100 MB
+const DEFAULT_QUOTA: usize = 100 * 1024 * 1024;
 const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     ".txt", ".md", ".log", ".json", ".xml", ".yaml", ".csv", ".conf", ".ini",
     ".py", ".js", ".html", ".css", ".c", ".cpp", ".h", ".java", ".go", ".rs", ".php", ".sh", ".rb", ".sql"
 ];
 
 pub struct VirtualFileSystem {
-    pub connection_manager: ConnectionManager,
+    pub connection_manager: DriverManager, // Typ geändert
     pub active_mount: String,
     pub user_id: String,
     pub current_path: String,
 }
 
-pub enum AccessType {
-    Read,
-    Write,
-    Execute, // Für später
-}
+pub enum AccessType { Read, Write, Execute }
 
 impl VirtualFileSystem {
-    pub fn new(user_id: String, db_path: &str) -> Self {
-        let manager = ConnectionManager::new();
-        // Hier nutzen wir unwrap(), da ein Init-Fehler fatal ist (Panic ok)
-        manager.mount("primary", db_path, DatabaseType::Sqlite)
+    // WICHTIG: new() ist jetzt async, weil mount() async ist!
+    pub async fn new(user_id: String, db_path: &str) -> Self {
+        let manager = DriverManager::new();
+
+        // Async Mount
+        manager.mount("primary", db_path, DatabaseType::Sqlite).await
             .expect("CRITICAL: Failed to mount primary database.");
 
         Self {

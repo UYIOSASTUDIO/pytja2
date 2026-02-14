@@ -6,6 +6,8 @@ use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use uuid::Uuid;
+use tracing::info;
+use tokio_util::io::ReaderStream;
 
 pub struct S3Storage {
     client: Client,
@@ -14,14 +16,10 @@ pub struct S3Storage {
 
 impl S3Storage {
     pub async fn new(bucket: &str, _region: &str) -> Self {
-        // Lädt Credentials automatisch aus Environment (AWS_ACCESS_KEY_ID etc.)
-        let config = aws_config::load_from_env().await;
+        // FIX: Neue AWS Config Syntax (BehaviorVersion::latest)
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
-
-        Self {
-            client,
-            bucket: bucket.to_string(),
-        }
+        Self { client, bucket: bucket.to_string() }
     }
 }
 
@@ -30,14 +28,9 @@ impl BlobStorage for S3Storage {
     async fn put(&self, _name: &str, stream: ByteStream) -> Result<String, PytjaError> {
         let blob_id = Uuid::new_v4().to_string();
 
-        // AWS SDK erwartet ein eigenes Body Format. Wir müssen unseren Stream konvertieren.
-        // Hinweis: S3 PutObject braucht oft die Länge im Voraus oder Multipart Upload.
-        // Für dieses Beispiel laden wir den Stream in den Speicher (Buffer),
-        // für echte Big-Data wäre "Multipart Upload" der nächste Schritt.
-
-        // Simpler Ansatz (Memory Buffer):
-        let body_bytes = stream.try_collect::<Vec<Bytes>>().await?
-            .concat(); // Das ist noch nicht 100% Streaming, aber S3 SDK ist tricky.
+        let body_bytes = stream.try_collect::<Vec<Bytes>>().await
+            .map_err(|e| PytjaError::System(format!("Stream error: {}", e)))?
+            .concat();
 
         let body = S3ByteStream::from(body_bytes);
 
@@ -49,6 +42,7 @@ impl BlobStorage for S3Storage {
             .await
             .map_err(|e| PytjaError::System(format!("S3 Upload Error: {}", e)))?;
 
+        info!("Stored blob {} on S3", blob_id);
         Ok(blob_id)
     }
 
@@ -60,9 +54,9 @@ impl BlobStorage for S3Storage {
             .await
             .map_err(|e| PytjaError::NotFound(format!("S3 Download Error: {}", e)))?;
 
-        // Der S3 Stream muss in unseren generischen Stream gewandelt werden
-        let stream = resp.body
-            .map_err(|e| PytjaError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
+        let reader = resp.body.into_async_read();
+        let stream = ReaderStream::new(reader)
+            .map_err(|e| PytjaError::IoError(e));
 
         Ok(Box::pin(stream))
     }
@@ -73,7 +67,7 @@ impl BlobStorage for S3Storage {
             .key(key)
             .send()
             .await
-            .map_err(|e| PytjaError::System(format!("S3 Delete Error: {}", e)))?;
+            .map_err(|e| PytjaError::System(e.to_string()))?;
         Ok(())
     }
 }

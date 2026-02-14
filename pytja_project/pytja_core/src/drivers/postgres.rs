@@ -171,6 +171,7 @@ impl PytjaRepository for PostgresDriver {
             .bind(&node.owner)
             .bind(node.is_folder)
             .bind(&node.content)
+            .bind(&node.blob_id)
             .bind(&node.lock_pass)
             .bind(node.permissions as i32) // Cast u8 -> i32 für Postgres
             .bind(node.created_at)
@@ -190,6 +191,7 @@ impl PytjaRepository for PostgresDriver {
                 owner: row.try_get("owner").unwrap_or_default(),
                 is_folder: row.try_get("is_folder").unwrap_or(false),
                 content: row.try_get("content").unwrap_or_default(),
+                blob_id: row.try_get("blob_id").ok(),
                 size: 0, // Größe wird dynamisch berechnet oder bei Bedarf geladen
                 lock_pass: row.try_get("lock_pass").ok(),
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
@@ -221,6 +223,7 @@ impl PytjaRepository for PostgresDriver {
                 owner: row.try_get("owner").unwrap_or_default(),
                 is_folder: row.try_get("is_folder").unwrap_or(false),
                 content: vec![],
+                blob_id: row.try_get("blob_id").ok(),
                 size: row.try_get::<i32, _>("size").unwrap_or(0) as usize,
                 lock_pass: row.try_get("lock_pass").ok(),
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
