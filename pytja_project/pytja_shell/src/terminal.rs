@@ -306,25 +306,57 @@ impl Terminal {
                 if args.is_empty() { return true; }
                 let target = args[0];
 
-                // Wir locken den Mutex für die Operationen
-                let mut vfs = self.vfs.lock().await;
-                let full_path = vfs.resolve_path(target);
+                // 1. Wohin will der User? (Lokal berechnen)
+                let full_path = self.vfs.lock().await.resolve_path(target);
 
-                // DB Zugriff Async
-                let needs_pass = match vfs.db().get_node(&full_path).await {
-                    Ok(Some(node)) => node.lock_pass,
-                    _ => None,
-                };
+                // 2. Server fragen: Existiert das?
+                match self.client.stat_node(&full_path).await {
+                    Ok((exists, is_folder, is_locked)) => {
+                        if !exists {
+                            println!("{}", "Directory not found.".red());
+                        } else if !is_folder {
+                            println!("{}", "Not a directory.".red());
+                        } else {
+                            // 3. Passwort Abfrage
+                            let mut pass_attempt = None;
+                            if is_locked {
+                                let input = self.ask_password(&format!("🔒 Enter Password for {}: ", target));
+                                pass_attempt = Some(input);
+                            }
 
-                let mut pass_attempt = None;
-                if needs_pass.is_some() {
-                    let input = self.ask_password(&format!("🔒 Enter Password for {}: ", target));
-                    pass_attempt = Some(input);
-                }
+                            // 4. VFS Status ändern
+                            let mut vfs = self.vfs.lock().await;
 
-                // Change Dir Async
-                if let Err(e) = vfs.change_dir(target, pass_attempt).await {
-                    println!("{}", e.to_string().red());
+                            // Versuche den Wechsel regulär
+                            match vfs.change_dir(target, pass_attempt).await {
+                                Ok(_) => {}, // Alles gut
+                                Err(e) => {
+                                    // FIX: Wenn der Server "OK" gesagt hat, aber das lokale VFS "Not Found" schreit,
+                                    // dann ist es wahrscheinlich ein virtueller Mount (z.B. /archive).
+                                    // Wir erzwingen den Wechsel manuell!
+                                    let err_msg = e.to_string();
+                                    if err_msg.contains("not found") || err_msg.contains("Resource not found") {
+                                        // Wir vertrauen dem Server!
+                                        // Pfad manuell setzen
+                                        if target == ".." {
+                                            // Handle ".." manuell falls nötig, aber change_dir sollte ".."
+                                            // eigentlich ohne DB-Check behandeln.
+                                            // Falls vfs.change_dir bei ".." fehlschlägt, ist was anderes kaputt.
+                                            // Wir gehen hier davon aus, dass es ein Forward-Jump in einen Mount ist.
+                                        } else {
+                                            // Den neuen Pfad setzen (wir umgehen den DB Check)
+                                            let new_path = vfs.resolve_path(target);
+                                            vfs.current_path = new_path;
+                                        }
+                                    } else {
+                                        // Echter Fehler (z.B. Access Denied)
+                                        println!("{}", err_msg.red());
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => println!("Server Error: {}", e.to_string().red()),
                 }
             },
 

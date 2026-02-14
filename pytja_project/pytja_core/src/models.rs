@@ -28,6 +28,7 @@ pub struct Claims {
     pub sub: String,       // Username
     pub role_level: i32,   // ÄNDERUNG: Zahl statt String (z.B. 100 = Admin)
     pub exp: usize,        // Expiration
+    pub sid: Option<String>,
 }
 
 #[derive(Debug, Clone)]

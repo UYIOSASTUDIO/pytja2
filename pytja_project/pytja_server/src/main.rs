@@ -27,11 +27,14 @@ use tokio::sync::mpsc;
 use futures_util::StreamExt;
 use pytja_proto::pytja::upload_request::Data as UploadData;
 use jsonwebtoken::{encode, Header, EncodingKey};
+mod session_manager;
+use crate::session_manager::SessionManager;
 
 const JWT_SECRET: &[u8] = b"pytja_super_secret_key_change_me_in_prod";
 
 pub struct MyPytjaService {
     manager: Arc<ConnectionManager>,
+    sessions: Arc<SessionManager>,
 }
 
 impl MyPytjaService {
@@ -50,6 +53,14 @@ impl MyPytjaService {
             &jsonwebtoken::DecodingKey::from_secret(JWT_SECRET),
             &jsonwebtoken::Validation::default(),
         ).map_err(|_| Status::unauthenticated("Invalid Token or Signature"))?;
+
+        if let Some(sid) = &token_data.claims.sid {
+            if !self.sessions.is_valid(sid) {
+                return Err(Status::unauthenticated("Session expired or terminated by Admin"));
+            }
+            // Activity Update (für "Last Seen")
+            self.sessions.update_activity(sid);
+        }
 
         if token_data.claims.role_level < min_level {
             return Err(Status::permission_denied(format!(
@@ -213,10 +224,14 @@ impl PytjaService for MyPytjaService {
             .expect("valid timestamp")
             .timestamp() as usize;
 
+        let remote_addr = "127.0.0.1"; // to do: Aus Request Metadata holen
+        let session_id = self.sessions.register_session(&user.username, user.role_level, remote_addr);
+
         let claims = Claims {
             sub: user.username.clone(),
-            role_level: user.role_level, // WICHTIG: Das echte Level!
+            role_level: user.role_level,
             exp: expiration,
+            sid: Some(session_id), // <-- Hier speichern wir die ID
         };
 
         let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(JWT_SECRET)) {
@@ -746,6 +761,40 @@ impl PytjaService for MyPytjaService {
             Err(e) => Ok(Response::new(ActionResponse { success: false, message: e.to_string() })),
         }
     }
+
+    async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
+        self.check_permissions(&request, 100)?; // Nur Admins!
+
+        let sessions = self.sessions.get_all_sessions();
+
+        let proto_sessions = sessions.into_iter().map(|s| {
+            pytja_proto::SessionInfo {
+                session_id: s.session_id,
+                username: s.username,
+                ip_address: s.ip_address,
+                role_level: s.role_level,
+                login_time: s.login_time.to_rfc3339(),
+                last_activity: s.last_activity.to_rfc3339(),
+            }
+        }).collect();
+
+        Ok(Response::new(GetSessionsResponse {
+            sessions: proto_sessions,
+            total_active: self.sessions.get_all_sessions().len() as i32,
+        }))
+    }
+
+    async fn kick_user(&self, request: Request<KickUserRequest>) -> Result<Response<ActionResponse>, Status> {
+        self.check_permissions(&request, 100)?;
+        let req = request.into_inner();
+
+        self.sessions.remove_session(&req.session_id);
+
+        Ok(Response::new(ActionResponse {
+            success: true,
+            message: "User kicked.".to_string(),
+        }))
+    }
 }
 
 #[tokio::main]
@@ -757,6 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:50051".parse()?;
 
     let manager = Arc::new(ConnectionManager::new());
+    let session_mgr = Arc::new(SessionManager::new());
 
     // FIX: Variable definieren!
     let db_path = "pytja.db";
@@ -774,6 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = MyPytjaService {
         manager: manager.clone(),
+        sessions: session_mgr,
     };
 
     println!("{}", "PYTJA ENTERPRISE HUB ONLINE".green().bold());

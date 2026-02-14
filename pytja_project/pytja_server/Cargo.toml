@@ -20,3 +20,4 @@ tokio-stream = "0.1.18"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 serde_json = "1.0.149"
 tracing = "0.1.44"
+dashmap = "6.1.0"

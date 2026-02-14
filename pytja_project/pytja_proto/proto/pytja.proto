@@ -22,7 +22,9 @@ service PytjaService {
     rpc DownloadFile (DownloadRequest) returns (stream FileChunk);
     rpc ExecScript (ExecRequest) returns (stream ExecResponse);
     rpc GetChallenge (ChallengeRequest) returns (ChallengeResponse); // Schritt 1
-    rpc Login (LoginRequest) returns (LoginResponse); // Schritt 2
+    rpc Login (LoginRequest) returns (LoginResponse); // Schritt
+    rpc GetActiveSessions (GetSessionsRequest) returns (GetSessionsResponse);
+    rpc KickUser (KickUserRequest) returns (ActionResponse);
 }
 
 // --- Messages (Datenpakete) ---
@@ -208,4 +210,27 @@ message LoginResponse {
     bool success = 1;
     string token = 2; // Das JWT Token
     string message = 3;
+}
+
+message SessionInfo {
+    string session_id = 1;
+    string username = 2;
+    string ip_address = 3;
+    string login_time = 4; // ISO 8601
+    int32 role_level = 5;
+    string last_activity = 6; // Timestamp der letzten Aktion
+}
+
+message GetSessionsRequest {
+    // Leer lassen für alle, oder filtern
+}
+
+message GetSessionsResponse {
+    repeated SessionInfo sessions = 1;
+    int32 total_active = 2;
+}
+
+message KickUserRequest {
+    string session_id = 1;
+    string reason = 2;
 }
