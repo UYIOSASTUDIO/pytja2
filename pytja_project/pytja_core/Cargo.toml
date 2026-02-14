@@ -5,37 +5,33 @@ edition = "2021"
 
 [dependencies]
 # Fehlerbehandlung
-thiserror = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+
+# ENTERPRISE DATABASE DRIVER (SQLx)
+# Unterstützt SQLite (embedded) und Postgres (Server) gleichzeitig!
+sqlx = { version = "0.7", features = [
+    "runtime-tokio",
+    "tls-native-tls",
+    "sqlite",
+    "postgres",
+    "macros",
+    "chrono",
+    "uuid"
+] }
+
+# Serialisierung
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+async-trait = "0.1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
 
-# Datenstrukturen & Zeit
-serde = { version = "1.0", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
-
-# Datenbank (Aktuell SQLite, später austauschbar)
-rusqlite = { version = "0.32", features = ["bundled"] }
-
-# Krypto (PKI & Encryption)
-ed25519-dalek = { version = "2.1", features = ["rand_core"] } # Signaturen
-rand = "0.8"
-aes-gcm = "0.10"       # Um den Private Key lokal zu verschlüsseln
-pbkdf2 = "0.12"        # Passwort -> Key Ableitung
-hmac = "0.12"
-sha2 = "0.10"
-base64 = "0.22"
-hex = "0.4"
-
-tokio = { version = "1.0", features = ["full"] }
-async-trait = "0.1"
-
-# LOGGING & TRACING SUITE
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry", "std"] }
-tracing-appender = "0.2" # Für das Schreiben in Dateien ohne Blockieren
-time = "0.3" # Für Zeitstempel in Logs
-deadpool-sqlite = "0.9"
-serde_json = "1.0.149"
-uuid = { version = "1.0", features = ["v4"] }
+config = "0.13"
+dotenv = "0.15"
 
 [dev-dependencies]
 uuid = { version = "1.0", features = ["v4"] }

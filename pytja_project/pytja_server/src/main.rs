@@ -18,6 +18,7 @@ use pytja_proto::{
     LoginRequest, LoginResponse
 };
 use pytja_core::models::{FileNode, Claims};
+use pytja_core::config::AppConfig;
 use colored::*;
 use std::sync::Arc;
 use pytja_core::{PytjaRepository, ConnectionManager, DatabaseType};
@@ -799,36 +800,57 @@ impl PytjaService for MyPytjaService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Telemetry
+    // 1. Telemetry / Logging initialisieren
     let _guard = pytja_core::telemetry::init_telemetry("./logs", "pytja_server.log");
-    tracing::info!("Pytja Server starting up...");
+    tracing::info!("Pytja Server Enterprise Edition starting up...");
 
-    let addr = "127.0.0.1:50051".parse()?;
+    // 2. Professionelle Konfiguration laden (Environment + Files)
+    let config = match AppConfig::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("CRITICAL: Failed to load configuration: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    let manager = Arc::new(ConnectionManager::new());
+    // 3. Adresse binden
+    let addr = format!("{}:{}", config.server.host, config.server.port).parse()?;
+
+    // 4. Core Systeme initialisieren
+    // Der DriverManager ersetzt den alten ConnectionManager und unterstützt jetzt Driver-Plugins
+    let manager = Arc::new(DriverManager::new());
+
+    // Der SessionManager für Live-Tracking im RAM
     let session_mgr = Arc::new(SessionManager::new());
 
-    // FIX: Variable definieren!
-    let db_path = "pytja.db";
+    // 5. Datenbanken mounten
+    // a) Config laden (Persistent Mounts aus mounts.json)
+    manager.load_config("mounts.json").await;
 
-    // Primary mounten
-    manager.mount("primary", db_path, DatabaseType::Sqlite).expect("Failed to mount primary DB");
+    // b) Primary DB mounten (System DB)
+    // Wir nutzen hier SQLite für die Primary DB (Default), könnten aber via Config auf Postgres wechseln!
+    tracing::info!("Mounting Primary DB at: {}", config.primary_db_path);
+    manager.mount("primary", &config.primary_db_path, DatabaseType::Sqlite)
+        .await
+        .expect("FATAL: Failed to mount primary database. Server cannot start.");
 
-    // Config laden (Funktioniert nur, wenn Schritt 1 erledigt ist!)
-    manager.load_config("mounts.json");
-
-    if let Ok(repo) = manager.get_repo("primary") {
-        repo.init().expect("Failed to initialize primary DB tables");
-        println!("Mounted 'primary' at {}", db_path.cyan());
+    // Initialisierung sicherstellen (Tabellen erstellen)
+    if let Some(repo) = manager.get_repo("primary") {
+        repo.init().await.expect("FATAL: Failed to run DB migrations");
+        println!("{} {}", "PRIMARY DB STATUS:".green().bold(), "ONLINE".green());
     }
 
+    // 6. Service erstellen
     let service = MyPytjaService {
         manager: manager.clone(),
         sessions: session_mgr,
+        config: config.clone(),
     };
 
+    // 7. Server Start
     println!("{}", "PYTJA ENTERPRISE HUB ONLINE".green().bold());
-    println!("Listening on {}", addr);
+    println!("Listening on {}", addr.to_string().cyan());
+    println!("Driver Mode: {}", "Async/SQLx (High Performance)".yellow());
 
     Server::builder()
         .add_service(PytjaServiceServer::new(service))
