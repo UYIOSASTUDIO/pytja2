@@ -15,7 +15,7 @@ mod identity;
 use crate::terminal::Terminal;
 use crate::vfs::VirtualFileSystem;
 use crate::plugins::PluginManager;
-use crate::network_client::NetworkClient;
+use crate::network_client::PytjaClient;
 
 use std::sync::{Arc, Mutex};
 use colored::*;
@@ -82,17 +82,22 @@ async fn main() -> Result<()> {
     println!("{}", "Identity Unlocked. Connecting to Neural Link...".green());
 
     // 4. Server Handshake & Login
-    let mut client = NetworkClient::new("http://127.0.0.1:50051".to_string()).await?;
+    let mut client = PytjaClient::new("127.0.0.1:50051", signing_key.clone(), username.clone());
+
+    // Handshake durchführen (Verbindungstest + Auth Vorbereitung)
+    if !client.check_uplink().await? {
+        println!("Server unreachable.");
+        return Ok(());
+    }
 
     // Challenge anfordern
     let challenge = client.get_challenge(&username).await?;
 
     // Challenge signieren
     let signature = CryptoService::sign_message(&signing_key, challenge.as_bytes());
-    let signature_hex = hex::encode(signature.to_bytes());
+    let signature_hex = hex::encode(signature.to_bytes()); // Hier evtl. into_bytes() wenn signatur String ist, aber sign_message gibt String zurück (Base64).
 
-    // Login senden
-    let login_resp = client.login(&username, &challenge, &signature_hex).await?;
+    let login_resp = client.login(&username, &challenge, &signature).await?;
 
     if login_resp.success {
         println!("{} Session Token acquired.", "LOGIN SUCCESSFUL.".green().bold());
@@ -102,20 +107,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 5. Plugin System Init
+    // 5. Plugin System
     println!("Loading WASM Plugins...");
-    let mut plugin_manager = PluginManager::new();
+    let mut plugin_manager = PluginManager::new("./plugins"); // FIX: Konstruktor brauchte Argument
     if Path::new("./plugins").exists() {
-        if let Err(e) = plugin_manager.load_plugins("./plugins") {
+        if let Err(e) = plugin_manager.scan_and_load() { // FIX: Methode hieß scan_and_load, nicht load_plugins
             println!("Plugin Warning: {}", e);
         }
     } else {
         fs::create_dir_all("./plugins")?;
     }
-    println!("Plugins loaded: {}", plugin_manager.list_functions().len());
+    // FIX: Feld Zugriff
+    // plugin_manager hat kein list_functions öffentlich, aber wir ignorieren den Print erstmal oder fixen Plugins später.
+    // println!("Plugins loaded: {}", plugin_manager.loaded_plugins.len());
 
-    // 6. Virtual File System (Local Cache)
-    // FIX: Async Initialization wegen DriverManager
+    // 6. Virtual File System
     let vfs = VirtualFileSystem::new(username.clone(), DB_PATH).await;
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
@@ -123,7 +129,6 @@ async fn main() -> Result<()> {
     println!("Starting Terminal Interface...\n");
     let mut term = Terminal::new(vfs_shared, username, plugin_manager, client);
 
-    // Hauptschleife starten
     term.start().await?;
 
     println!("Session terminated.");

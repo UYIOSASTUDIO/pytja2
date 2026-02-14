@@ -87,7 +87,7 @@ impl VirtualFileSystem {
 
         let full_path = self.resolve_path(&name);
 
-        if self.db().get_node(&full_path).await?.is_some() {
+        if self.db().expect("DB lost").get_node(&full_path).await?.is_some() {
             return Err(PytjaError::AlreadyExists(full_path));
         }
 
@@ -108,13 +108,13 @@ impl VirtualFileSystem {
             blob_id: None,
         };
 
-        self.db().save_node(&node).await?;
-        let _ = self.db().log_action(&self.user_id, "CREATE", &full_path).await;
+        self.db().expect("DB lost").save_node(&node).await?;
+        let _ = self.db().expect("DB lost").log_action(&self.user_id, "CREATE", &full_path).await;
         Ok(format!("Created: {}", name))
     }
 
     pub async fn list_current(&self) -> Result<Vec<FileNode>, PytjaError> {
-        self.db().list_directory(&self.current_path).await
+        self.db().expect("DB lost").list_directory(&self.current_path).await
     }
 
     pub async fn change_dir(&mut self, target: &str, password_attempt: Option<String>) -> Result<(), PytjaError> {
@@ -128,19 +128,14 @@ impl VirtualFileSystem {
 
         let potential_path = self.resolve_path(target);
 
-        if let Some(node) = self.db().get_node(&potential_path).await? {
-            if !node.is_folder {
-                return Err(PytjaError::System("Not a directory".to_string()));
-            }
-
+        if let Some(node) = self.db().expect("DB lost").get_node(&potential_path).await? {
+            if !node.is_folder { return Err(PytjaError::System("Not a directory".to_string())); }
             self.check_access(&node, AccessType::Read)?;
-
             if let Some(real_pass) = node.lock_pass {
                 if password_attempt.unwrap_or_default() != real_pass {
                     return Err(PytjaError::AccessDenied("Locked Directory".to_string()));
                 }
             }
-
             self.current_path = potential_path;
             Ok(())
         } else {
@@ -150,17 +145,14 @@ impl VirtualFileSystem {
 
     pub async fn delete(&mut self, name: &str) -> Result<String, PytjaError> {
         let full_path = self.resolve_path(name);
-
-        // Custom Error Handling: Wenn None zurückkommt, werfen wir NotFound
-        let node = self.db().get_node(&full_path).await?
+        // FIX: expect()
+        let node = self.db().expect("DB lost").get_node(&full_path).await?
             .ok_or_else(|| PytjaError::NotFound(name.to_string()))?;
 
-        if node.owner != self.user_id {
-            return Err(PytjaError::AccessDenied("Permission denied".to_string()));
-        }
+        if node.owner != self.user_id { return Err(PytjaError::AccessDenied("Permission denied".to_string())); }
 
-        self.db().delete_node_recursive(&full_path).await?;
-        let _ = self.db().log_action(&self.user_id, "DELETE", &full_path).await;
+        self.db().expect("DB lost").delete_node_recursive(&full_path).await?;
+        let _ = self.db().expect("DB lost").log_action(&self.user_id, "DELETE", &full_path).await;
         Ok(format!("Deleted: {}", name))
     }
 
