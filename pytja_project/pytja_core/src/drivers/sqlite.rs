@@ -1,5 +1,5 @@
 use crate::repo::PytjaRepository;
-use crate::models::{User, FileNode, AuditLogEntry};
+use crate::models::{User, FileNode, AuditLogEntry, Role};
 use crate::error::PytjaError;
 use async_trait::async_trait;
 use sqlx::{SqlitePool, Row};

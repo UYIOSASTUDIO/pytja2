@@ -8,13 +8,12 @@ pub struct ActiveSession {
     pub session_id: String,
     pub username: String,
     pub ip_address: String,
-    pub role_level: i32,
+    pub role: String, // FIX: String statt i32
     pub login_time: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
 }
 
 pub struct SessionManager {
-    // DashMap ist perfekt für parallelen Zugriff (besser als RwLock<HashMap>)
     sessions: Arc<DashMap<String, ActiveSession>>,
 }
 
@@ -25,7 +24,8 @@ impl SessionManager {
         }
     }
 
-    pub fn register_session(&self, username: &str, role_level: i32, ip: &str) -> String {
+    // FIX: Signatur angepasst (role: &str)
+    pub fn register_session(&self, username: &str, role: &str, ip: &str) -> String {
         let session_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
 
@@ -33,13 +33,13 @@ impl SessionManager {
             session_id: session_id.clone(),
             username: username.to_string(),
             ip_address: ip.to_string(),
-            role_level,
+            role: role.to_string(),
             login_time: now,
             last_activity: now,
         };
 
         self.sessions.insert(session_id.clone(), session);
-        tracing::info!("New session started: {} ({})", username, session_id);
+        tracing::info!("New session started: {} ({}) [{}]", username, session_id, role);
         session_id
     }
 
@@ -59,7 +59,6 @@ impl SessionManager {
         self.sessions.iter().map(|entry| entry.value().clone()).collect()
     }
 
-    // Prüft, ob eine Session noch gültig ist (für Kicks)
     pub fn is_valid(&self, session_id: &str) -> bool {
         self.sessions.contains_key(session_id)
     }

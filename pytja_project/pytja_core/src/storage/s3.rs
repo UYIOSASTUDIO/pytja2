@@ -5,7 +5,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
-use futures::{StreamExt};
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 use tracing::{info, warn, debug};
 use tokio_util::io::ReaderStream;
@@ -150,9 +150,7 @@ impl BlobStorage for S3Storage {
             .map_err(|e| PytjaError::NotFound(format!("S3 Download Error: {}", e)))?;
 
         let reader = resp.body.into_async_read();
-        let stream = ReaderStream::new(reader)
-            .map_err(|e| PytjaError::IoError(e));
-
+        let stream = ReaderStream::new(reader).map_err(|e| PytjaError::IoError(e));
         Ok(Box::pin(stream))
     }
 

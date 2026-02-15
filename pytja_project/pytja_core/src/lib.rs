@@ -11,7 +11,6 @@ pub mod storage; // <-- Modul muss da sein
 pub use repo::PytjaRepository;
 pub use drivers::{DriverManager, DatabaseType};
 pub use error::PytjaError;
-pub use models::*;
+pub use models::{User, FileNode, AuditLogEntry, Role};
 pub use config::AppConfig;
-// Hier nutzen wir die Re-Exports aus storage/mod.rs
 pub use storage::{BlobStorage, FileSystemStorage, S3Storage, StorageType};
