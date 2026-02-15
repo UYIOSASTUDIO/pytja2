@@ -1,19 +1,16 @@
 use pytja_proto::{PytjaServiceClient, PingRequest, ListRequest, FileInfo};
-use pytja_proto::{CreateNodeRequest,
-                  ReadFileRequest, DeleteNodeRequest, MoveNodeRequest,
-                  CopyNodeRequest, ChangeModeRequest,
-                  ChownRequest, LockRequest, UsageRequest,
-                  FindRequest, GrepRequest,
-                  StatRequest, TreeRequest,
-                  UploadRequest, FileMetadata, DownloadRequest, ExecRequest,
-                  ChallengeRequest, LoginRequest
+use pytja_proto::pytja::{
+    CreateNodeRequest, ReadFileRequest, DeleteNodeRequest, MoveNodeRequest,
+    CopyNodeRequest, ChangeModeRequest, ChownRequest, LockRequest, UsageRequest,
+    FindRequest, GrepRequest, StatRequest, TreeRequest, UploadRequest,
+    DownloadRequest, ExecRequest, ChallengeRequest, LoginRequest,
+    upload_request::Data, FileMetadata // Wichtig für Upload
 };
 use colored::*;
-use anyhow::Result;
-use pytja_proto::pytja::upload_request::Data;
+use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use ed25519_dalek::SigningKey;
-use pytja_core::crypto::CryptoService;
+use pytja_core::crypto::CryptoService; // Falls signing benötigt wird, sonst optional hier
 use std::str::FromStr;
 
 pub struct PytjaClient {
@@ -33,14 +30,22 @@ impl PytjaClient {
         }
     }
 
-    // Helper: Verbindet "nackt" (für Handshake)
+    /// Setzt das Session Token manuell (wird von main.rs nach Login aufgerufen)
+    pub fn set_token(&mut self, token: &str) {
+        self.token = Some(token.to_string());
+    }
+
     async fn raw_connect(&self) -> Result<PytjaServiceClient<tonic::transport::Channel>> {
-        let dst = format!("http://{}", self.url);
+        // Sicherstellen, dass http:// davor steht
+        let dst = if self.url.starts_with("http") {
+            self.url.clone()
+        } else {
+            format!("http://{}", self.url)
+        };
         let client = PytjaServiceClient::connect(dst).await?;
         Ok(client)
     }
 
-    // Helper: Erstellt einen authentifizierten Request
     fn auth_req<T>(&self, msg: T) -> tonic::Request<T> {
         let mut req = tonic::Request::new(msg);
         if let Some(token) = &self.token {
@@ -52,48 +57,33 @@ impl PytjaClient {
         req
     }
 
-    pub async fn perform_handshake(&mut self) -> Result<bool> {
-        println!("{}", "[*] Initiating Secure Handshake (Ed25519)...".yellow());
+    // --- AUTH METHODS (Public für main.rs) ---
+
+    pub async fn get_challenge(&self, username: &str) -> Result<String> {
         let mut client = self.raw_connect().await?;
-
-        // 1. Challenge
-        let challenge_req = ChallengeRequest { username: self.username.clone() };
-        let challenge_resp = client.get_challenge(challenge_req).await?.into_inner();
-
-        if !challenge_resp.user_exists {
-            println!("{}", " [!] Access Denied: User unknown to server.".red());
-            return Ok(false);
+        let req = ChallengeRequest { username: username.to_string() };
+        let resp = client.get_challenge(req).await?.into_inner();
+        if !resp.user_exists {
+            return Err(anyhow!("User not found on server"));
         }
-
-        let challenge_hex = challenge_resp.challenge;
-        println!("     Challenge: {}", challenge_hex.chars().take(8).collect::<String>().dimmed());
-
-        // 2. Signieren
-        let signature_b64 = CryptoService::sign_message(&self.signing_key, challenge_hex.as_bytes());
-
-        // 3. Login
-        let login_req = LoginRequest {
-            username: self.username.clone(),
-            challenge: challenge_hex,
-            signature: signature_b64,
-        };
-
-        let login_resp = client.login(login_req).await?.into_inner();
-
-        if login_resp.success {
-            println!("{}", " [+] Handshake Successful.".green().bold());
-            self.token = Some(login_resp.token);
-            Ok(true)
-        } else {
-            println!(" [!] Login Failed: {}", login_resp.message.red());
-            Ok(false)
-        }
+        Ok(resp.challenge)
     }
 
-    // --- FILE OPERATIONS (Nutzen jetzt raw_connect() + auth_req()) ---
+    pub async fn login(&self, username: &str, challenge: &str, signature: &str) -> Result<pytja_proto::pytja::LoginResponse> {
+        let mut client = self.raw_connect().await?;
+        let req = LoginRequest {
+            username: username.to_string(),
+            challenge: challenge.to_string(),
+            signature: signature.to_string(),
+        };
+        let resp = client.login(req).await?.into_inner();
+        Ok(resp)
+    }
+
+    // --- FILE OPERATIONS ---
 
     pub async fn check_uplink(&self) -> Result<bool> {
-        let mut client = self.raw_connect().await?; // Ping braucht kein Auth
+        let mut client = self.raw_connect().await?;
         let req = tonic::Request::new(PingRequest { message: "Ping".into() });
         match client.ping(req).await {
             Ok(r) => {
@@ -117,56 +107,56 @@ impl PytjaClient {
             path: path.to_string(), is_folder, content, lock_password: lock_pass.unwrap_or_default(), owner: owner.to_string(),
         });
         let resp = client.create_node(request).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn read_file(&self, path: &str, password: Option<String>) -> Result<(Vec<u8>, String)> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(ReadFileRequest { path: path.to_string(), password: password.unwrap_or_default() });
         let resp = client.read_file(req).await?.into_inner();
-        if resp.success { Ok((resp.content, resp.message)) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok((resp.content, resp.message)) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn delete_node(&self, path: &str) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(DeleteNodeRequest { path: path.to_string() });
         let resp = client.delete_node(req).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn move_node(&self, src: &str, dst: &str) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(MoveNodeRequest { source_path: src.to_string(), dest_path: dst.to_string() });
         let resp = client.move_node(req).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn copy_node(&self, src: &str, dst: &str, owner: &str) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(CopyNodeRequest { source_path: src.to_string(), dest_path: dst.to_string(), owner: owner.to_string() });
         let resp = client.copy_node(req).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn change_mode(&self, path: &str, perms: u32) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(ChangeModeRequest { path: path.to_string(), permissions: perms });
         let resp = client.change_mode(req).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn chown_node(&self, path: &str, owner: &str) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(ChownRequest { path: path.to_string(), new_owner: owner.to_string() });
         let resp = client.chown_node(req).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn lock_node(&self, path: &str, password: Option<String>) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let req = self.auth_req(LockRequest { path: path.to_string(), password: password.unwrap_or_default() });
         let resp = client.lock_node(req).await?.into_inner();
-        if resp.success { Ok(resp.message) } else { Err(anyhow::anyhow!(resp.message)) }
+        if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn get_usage(&self, owner: &str) -> Result<u64> {
@@ -204,7 +194,7 @@ impl PytjaClient {
         Ok(resp.tree_output)
     }
 
-    // UPLOAD (Streaming: Request Building ist hier komplexer, da Stream)
+    // UPLOAD (Streaming)
     pub async fn upload_file(&self, local_path: &str, remote_path: &str, lock: Option<String>, owner: &str) -> Result<String> {
         let mut client = self.raw_connect().await?;
         let content = std::fs::read(local_path)?;
@@ -222,12 +212,9 @@ impl PytjaClient {
             }
         };
 
-        // Authentifizierter Request für den Stream?
-        // Tonic erlaubt Metadata auch bei Streams via `Request::new(stream)`.
         let request = self.auth_req(outbound);
-
         let response = client.upload_file(request).await?.into_inner();
-        if response.success { Ok(response.message) } else { Err(anyhow::anyhow!(response.message)) }
+        if response.success { Ok(response.message) } else { Err(anyhow!(response.message)) }
     }
 
     // DOWNLOAD

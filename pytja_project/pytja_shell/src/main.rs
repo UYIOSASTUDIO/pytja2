@@ -1,11 +1,14 @@
 use anyhow::Result;
-use pytja_core::{
-    // SqliteRepository HIER ENTFERNT, da es nicht mehr existiert
-    crypto::CryptoService,
-    models::User
-};
+use pytja_core::crypto::CryptoService;
+use std::sync::Arc;
+use tokio::sync::Mutex; // WICHTIG: Tokio Mutex für async/await Support!
+use colored::*;
+use rpassword::read_password;
+use std::io::{self, Write};
+use std::fs;
+use std::path::Path;
 
-// Module laden
+// Module einbinden
 mod terminal;
 mod vfs;
 mod plugins;
@@ -17,15 +20,8 @@ use crate::vfs::VirtualFileSystem;
 use crate::plugins::PluginManager;
 use crate::network_client::PytjaClient;
 
-use std::sync::{Arc, Mutex};
-use colored::*;
-use rpassword::read_password;
-use std::io::{self, Write};
-use std::fs;
-use std::path::Path;
-
 const DB_PATH: &str = "pytja_local_cache.db";
-const IDENTITY_DIR: &str = "usb_drive"; // Simulierter USB Stick Pfad
+const IDENTITY_DIR: &str = "usb_drive";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,11 +31,11 @@ async fn main() -> Result<()> {
     println!("========================================");
 
     // 2. Identity Load (Simulation eines Hardware-Keys)
-    let files = fs::read_dir(IDENTITY_DIR);
+    // Wir suchen nach einer .pytja Datei im 'usb_drive' Ordner
     let mut key_file: Option<String> = None;
     let mut username = String::new();
 
-    if let Ok(entries) = files {
+    if let Ok(entries) = fs::read_dir(IDENTITY_DIR) {
         for entry in entries {
             if let Ok(entry) = entry {
                 let path = entry.path();
@@ -63,7 +59,7 @@ async fn main() -> Result<()> {
     let key_path = key_file.unwrap();
     println!("Identity detected: {} ({})", username.cyan().bold(), key_path);
 
-    // 3. Password Prompt (Entschlüsselung)
+    // 3. Password Prompt (Entschlüsselung des Private Keys)
     print!("Enter Identity Password: ");
     io::stdout().flush()?;
     let password = read_password()?;
@@ -82,21 +78,22 @@ async fn main() -> Result<()> {
     println!("{}", "Identity Unlocked. Connecting to Neural Link...".green());
 
     // 4. Server Handshake & Login
+    // Verbindung aufbauen
     let mut client = PytjaClient::new("127.0.0.1:50051", signing_key.clone(), username.clone());
 
-    // Handshake durchführen (Verbindungstest + Auth Vorbereitung)
+    // Uplink Check (Ping)
     if !client.check_uplink().await? {
-        println!("Server unreachable.");
+        println!("Server unreachable or offline.");
         return Ok(());
     }
 
-    // Challenge anfordern
+    // Challenge-Response Authentifizierung
     let challenge = client.get_challenge(&username).await?;
 
-    // Challenge signieren
+    // Signieren (Core liefert Base64 String zurück)
     let signature = CryptoService::sign_message(&signing_key, challenge.as_bytes());
-    let signature_hex = hex::encode(signature.to_bytes()); // Hier evtl. into_bytes() wenn signatur String ist, aber sign_message gibt String zurück (Base64).
 
+    // Login Request senden
     let login_resp = client.login(&username, &challenge, &signature).await?;
 
     if login_resp.success {
@@ -107,28 +104,31 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 5. Plugin System
+    // 5. Plugin System Init
     println!("Loading WASM Plugins...");
-    let mut plugin_manager = PluginManager::new("./plugins"); // FIX: Konstruktor brauchte Argument
+    let mut plugin_manager = PluginManager::new("./plugins");
+
     if Path::new("./plugins").exists() {
-        if let Err(e) = plugin_manager.scan_and_load() { // FIX: Methode hieß scan_and_load, nicht load_plugins
+        if let Err(e) = plugin_manager.load_plugins("./plugins") {
             println!("Plugin Warning: {}", e);
         }
     } else {
-        fs::create_dir_all("./plugins")?;
+        let _ = fs::create_dir_all("./plugins");
     }
-    // FIX: Feld Zugriff
-    // plugin_manager hat kein list_functions öffentlich, aber wir ignorieren den Print erstmal oder fixen Plugins später.
-    // println!("Plugins loaded: {}", plugin_manager.loaded_plugins.len());
+    println!("Plugins loaded: {}", plugin_manager.list_functions().len());
 
-    // 6. Virtual File System
+    // 6. Virtual File System (Local Cache)
+    // Initialisierung ist async wegen DB-Verbindung
     let vfs = VirtualFileSystem::new(username.clone(), DB_PATH).await;
+
+    // WICHTIG: Wir nutzen Arc<tokio::sync::Mutex<...>> für Thread-Safety im Async-Kontext
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
     // 7. Terminal Start
     println!("Starting Terminal Interface...\n");
     let mut term = Terminal::new(vfs_shared, username, plugin_manager, client);
 
+    // Hauptschleife starten (REPL)
     term.start().await?;
 
     println!("Session terminated.");
