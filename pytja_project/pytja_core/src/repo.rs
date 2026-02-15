@@ -1,4 +1,4 @@
-use crate::models::{User, FileNode, AuditLogEntry};
+use crate::models::{User, FileNode, AuditLogEntry, Role};
 use crate::error::PytjaError;
 use async_trait::async_trait;
 
@@ -12,7 +12,7 @@ pub trait PytjaRepository: Send + Sync {
     async fn get_user(&self, username: &str) -> Result<Option<User>, PytjaError>;
     async fn user_exists(&self, username: &str) -> Result<bool, PytjaError>;
     async fn get_all_users(&self) -> Result<Vec<User>, PytjaError>;
-    async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError>;
+    async fn update_user_status(&self, username: &str, is_active: bool, role: &str) -> Result<(), PytjaError>;
 
     // --- RBAC ---
     async fn create_role(&self, role: &Role) -> Result<(), PytjaError>;

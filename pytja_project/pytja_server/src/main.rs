@@ -55,8 +55,7 @@ pub struct MyPytjaService {
 }
 
 impl MyPytjaService {
-    // FIX: Neuer Permission Check (RBAC)
-    // required_perm: z.B. Some("core:fs:write") oder None (nur Login check)
+    // RBAC Permission Check
     fn check_permissions<T>(&self, req: &Request<T>, required_perm: Option<&str>) -> Result<Claims, Status> {
         let token = match req.metadata().get("authorization") {
             Some(t) => t.to_str().map_err(|_| Status::unauthenticated("Invalid Token format"))?,
@@ -71,7 +70,6 @@ impl MyPytjaService {
             &jsonwebtoken::Validation::default(),
         ).map_err(|_| Status::unauthenticated("Invalid Token or Signature"))?;
 
-        // Session Check
         if let Some(sid) = &token_data.claims.sid {
             if !self.sessions.is_valid(sid) {
                 return Err(Status::unauthenticated("Session expired"));
@@ -79,10 +77,9 @@ impl MyPytjaService {
             self.sessions.update_activity(sid);
         }
 
-        // RBAC Check
         if let Some(perm) = required_perm {
             let has_perm = token_data.claims.permissions.contains(perm)
-                || token_data.claims.permissions.contains("*"); // Admin Wildcard
+                || token_data.claims.permissions.contains("*");
 
             if !has_perm {
                 return Err(Status::permission_denied(format!(
@@ -158,7 +155,12 @@ impl PytjaService for MyPytjaService {
         };
 
         let challenge_bytes = req.challenge.as_bytes();
-        let is_valid = match CryptoService::verify_signature(&user.public_key, challenge_bytes, &req.signature) {
+
+        // FIX: Public Key Konvertierung (Vec<u8> -> &str)
+        let pub_key_str = std::str::from_utf8(&user.public_key)
+            .map_err(|_| Status::internal("Corrupt Public Key in DB"))?;
+
+        let is_valid = match CryptoService::verify_signature(pub_key_str, challenge_bytes, &req.signature) {
             Ok(valid) => valid,
             Err(_) => false
         };
@@ -167,7 +169,6 @@ impl PytjaService for MyPytjaService {
             return Ok(Response::new(LoginResponse { success: false, token: "".into(), message: "Invalid Signature".into() }));
         }
 
-        // Permissions laden
         let role = repo.get_role(&user.role).await.map_err(|e| Status::internal(e.to_string()))?
             .unwrap_or(Role { name: "guest".into(), permissions: vec![] });
 
@@ -175,7 +176,6 @@ impl PytjaService for MyPytjaService {
         for p in role.permissions { perms_set.insert(p); }
 
         let expiration = chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(60)).unwrap().timestamp() as usize;
-        // FIX: Session mit Role-String
         let session_id = self.sessions.register_session(&user.username, &user.role, "127.0.0.1");
 
         let claims = Claims {
@@ -192,16 +192,15 @@ impl PytjaService for MyPytjaService {
         Ok(Response::new(LoginResponse { success: true, token, message: "Login successful".into() }))
     }
 
-    // --- DATEI OPERATIONEN (Mit Permission Checks) ---
+    // --- DATEI OPERATIONEN ---
 
     async fn list_directory(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read"))?; // Check Permission
+        self.check_permissions(&request, Some("core:fs:read"))?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
         let mut nodes = repo.list_directory(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?;
 
-        // Virtual Mounts injection
         if req.path == "/" || req.path.is_empty() {
             let mounts = self.manager.list_mounts();
             for mount_name in mounts {
@@ -235,7 +234,6 @@ impl PytjaService for MyPytjaService {
             None => return Err(Status::invalid_argument("Empty stream")),
         };
 
-        // Quota Check
         let limit: usize = env::var("PYTJA_QUOTA_LIMIT").unwrap_or_else(|_| DEFAULT_QUOTA_LIMIT.to_string()).parse().unwrap_or(DEFAULT_QUOTA_LIMIT);
         let current_usage = self.get_user_quota_usage(&claims.sub).await;
         if current_usage >= limit { return Err(Status::resource_exhausted("Quota exceeded")); }
@@ -320,16 +318,223 @@ impl PytjaService for MyPytjaService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    // --- ADMIN RPCS (NEU IMPLEMENTIERT) ---
+    async fn create_node(&self, request: Request<CreateNodeRequest>) -> Result<Response<ActionResponse>, Status> {
+        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
-    async fn create_role(&self, request: Request<CreateRoleRequest>) -> Result<Response<AdminActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:roles"))?; // Needs Admin Perm
+        let path_obj = std::path::Path::new(&relative_path);
+        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
+
+        let node = FileNode {
+            path: relative_path.clone(), name, owner: req.owner, is_folder: req.is_folder,
+            size: req.content.len(), content: req.content,
+            lock_pass: if req.lock_password.is_empty() { None } else { Some(req.lock_password) },
+            permissions: 0, created_at: chrono::Utc::now().timestamp() as f64, blob_id: None,
+        };
+
+        repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "CREATE", &req.path).await;
+        }
+
+        Ok(Response::new(ActionResponse { success: true, message: "Created successfully".into() }))
+    }
+
+    async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:read"))?;
+        let req = request.into_inner();
+        let (repo, relative_path) = self.resolve_repo(&req.path)?;
+
+        let node = repo.get_node(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?
+            .ok_or(Status::not_found("File not found"))?;
+
+        if let Some(pass) = node.lock_pass {
+            if pass != req.password { return Err(Status::permission_denied("File is locked")); }
+        }
+
+        if node.blob_id.is_some() {
+            return Err(Status::failed_precondition("File stored as blob. Use download."));
+        }
+
+        Ok(Response::new(ReadFileResponse { success: true, message: "Read success".into(), content: node.content }))
+    }
+
+    async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
+        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, relative_path) = self.resolve_repo(&req.path)?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "DELETE", &req.path).await;
+        }
+
+        repo.delete_node_recursive(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ActionResponse { success: true, message: "Deleted".into() }))
+    }
+
+    async fn move_node(&self, request: Request<MoveNodeRequest>) -> Result<Response<ActionResponse>, Status> {
+        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, src_rel) = self.resolve_repo(&req.source_path)?;
+        let (_, dst_rel) = self.resolve_repo(&req.dest_path)?;
+
+        repo.move_path(&src_rel, &dst_rel).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "MOVE", &format!("{}->{}", req.source_path, req.dest_path)).await;
+        }
+        Ok(Response::new(ActionResponse { success: true, message: "Moved".into() }))
+    }
+
+    async fn copy_node(&self, request: Request<CopyNodeRequest>) -> Result<Response<ActionResponse>, Status> {
+        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, src_rel) = self.resolve_repo(&req.source_path)?;
+        let (_, dst_rel) = self.resolve_repo(&req.dest_path)?;
+
+        let src_node = repo.get_node(&src_rel).await.map_err(|e| Status::internal(e.to_string()))?
+            .ok_or(Status::not_found("Source file not found"))?;
+
+        if src_node.is_folder { return Err(Status::unimplemented("Recursive copy not supported")); }
+
+        let path_obj = std::path::Path::new(&dst_rel);
+        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
+
+        let new_node = FileNode {
+            path: dst_rel, name, owner: claims.sub.clone(), is_folder: false,
+            content: src_node.content, blob_id: src_node.blob_id, size: src_node.size,
+            lock_pass: None, permissions: 0, created_at: chrono::Utc::now().timestamp() as f64,
+        };
+
+        repo.save_node(&new_node).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "COPY", &format!("{}->{}", req.source_path, req.dest_path)).await;
+        }
+        Ok(Response::new(ActionResponse { success: true, message: "Copied".into() }))
+    }
+
+    async fn change_mode(&self, request: Request<ChangeModeRequest>) -> Result<Response<ActionResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, rel_path) = self.resolve_repo(&req.path)?;
+
+        repo.update_permissions(&rel_path, req.permissions as u8).await.map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ActionResponse { success: true, message: "Permissions updated".into() }))
+    }
+
+    async fn chown_node(&self, request: Request<ChownRequest>) -> Result<Response<ActionResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, rel_path) = self.resolve_repo(&req.path)?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            if !primary.user_exists(&req.new_owner).await.unwrap_or(false) {
+                return Err(Status::not_found("New owner user does not exist"));
+            }
+        }
+
+        repo.update_metadata(&rel_path, None, Some(req.new_owner)).await.map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ActionResponse { success: true, message: "Ownership transferred".into() }))
+    }
+
+    async fn lock_node(&self, request: Request<LockRequest>) -> Result<Response<ActionResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:write"))?;
+        let req = request.into_inner();
+        let (repo, rel_path) = self.resolve_repo(&req.path)?;
+
+        let lock_val = if req.password.is_empty() { None } else { Some(req.password) };
+        repo.update_metadata(&rel_path, lock_val, None).await.map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ActionResponse { success: true, message: "Lock updated".into() }))
+    }
+
+    async fn get_usage(&self, request: Request<UsageRequest>) -> Result<Response<UsageResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:read"))?;
+        let req = request.into_inner();
+        let usage = self.get_user_quota_usage(&req.owner).await;
+        Ok(Response::new(UsageResponse { bytes: usage as u64 }))
+    }
+
+    async fn find_node(&self, request: Request<FindRequest>) -> Result<Response<FindResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:read"))?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
+        let paths = repo.find_nodes(&format!("%{}%", req.pattern)).await.map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(FindResponse { paths }))
+    }
 
-        let role = Role { name: req.name, permissions: vec![] };
-        repo.create_role(&role).await.map_err(|e| Status::internal(e.to_string()))?;
+    async fn grep_node(&self, request: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:read"))?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
+        let files = repo.get_all_files_content().await.map_err(|e| Status::internal(e.to_string()))?;
+        let mut matches = Vec::new();
+        for (path, content) in files {
+            if let Ok(text) = std::str::from_utf8(&content) {
+                if text.contains(&req.pattern) { matches.push(path); }
+            }
+        }
+        Ok(Response::new(GrepResponse { matches }))
+    }
 
+    async fn get_tree(&self, request: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> {
+        self.check_permissions(&request, Some("core:fs:read"))?;
+        let req = request.into_inner();
+        let (repo, rel_path) = self.resolve_repo(&req.root_path)?;
+        let all_nodes = repo.list_directory(&rel_path).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut output = String::new();
+        for node in all_nodes {
+            let marker = if node.is_folder { "[DIR]" } else { "[FILE]" };
+            output.push_str(&format!("{} {}\n", marker, node.path));
+        }
+        Ok(Response::new(TreeResponse { tree_output: output }))
+    }
+
+    async fn stat_node(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        self.check_permissions(&request, None)?;
+        let req = request.into_inner();
+        let clean = req.path.trim_start_matches('/');
+        for m in self.manager.list_mounts() {
+            if clean == m { return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false })); }
+        }
+        let (repo, rel_path) = self.resolve_repo(&req.path)?;
+        if rel_path == "/" { return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false })); }
+
+        match repo.get_node(&rel_path).await {
+            Ok(Some(n)) => Ok(Response::new(StatResponse { exists: true, is_folder: n.is_folder, is_locked: n.lock_pass.is_some() })),
+            Ok(None) => Ok(Response::new(StatResponse { exists: false, is_folder: false, is_locked: false })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+
+    async fn exec_script(&self, request: Request<ExecRequest>) -> Result<Response<Self::ExecScriptStream>, Status> {
+        let claims = self.check_permissions(&request, Some("core:exec"))?;
+        let req = request.into_inner();
+        let (_repo, _relative_path) = self.resolve_repo(&req.script_path)?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "EXEC", &req.script_path).await;
+        }
+
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(ExecResponse { output_line: "Remote Execution initiated...".into() })).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let _ = tx.send(Ok(ExecResponse { output_line: "Result: [Function executed]".into() })).await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    // --- ADMIN RPCS ---
+
+    async fn create_role(&self, request: Request<CreateRoleRequest>) -> Result<Response<AdminActionResponse>, Status> {
+        self.check_permissions(&request, Some("core:admin:roles"))?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
+        repo.create_role(&Role { name: req.name, permissions: vec![] }).await.map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(AdminActionResponse { success: true, message: "Role created".into() }))
     }
 
@@ -355,445 +560,26 @@ impl PytjaService for MyPytjaService {
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
 
         if !repo.user_exists(&req.username).await.unwrap_or(false) { return Err(Status::not_found("User not found")); }
-
-        // is_active behalten wir bei (müssten wir eigentlich erst laden, hier nehmen wir true an oder laden User)
         let user = repo.get_user(&req.username).await.unwrap().unwrap();
         repo.update_user_status(&req.username, user.is_active, &req.role_name).await.map_err(|e| Status::internal(e.to_string()))?;
-
         Ok(Response::new(AdminActionResponse { success: true, message: "Role assigned".into() }))
     }
 
     async fn list_roles(&self, request: Request<ListRolesRequest>) -> Result<Response<ListRolesResponse>, Status> {
         self.check_permissions(&request, Some("core:admin:read"))?;
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
-
         let roles = repo.list_roles().await.map_err(|e| Status::internal(e.to_string()))?;
         let infos = roles.into_iter().map(|r| RoleInfo { name: r.name, permissions: r.permissions }).collect();
-
         Ok(Response::new(ListRolesResponse { roles: infos }))
     }
 
-    async fn create_node(&self, request: Request<CreateNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, 20)?;
-        let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path)?;
-
-        let path_obj = std::path::Path::new(&relative_path);
-        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
-
-        let node = FileNode {
-            path: relative_path,
-            name,
-            owner: req.owner,
-            is_folder: req.is_folder,
-            size: req.content.len(),
-            content: req.content,
-            lock_pass: if req.lock_password.is_empty() { None } else { Some(req.lock_password) },
-            permissions: 0,
-            created_at: chrono::Utc::now().timestamp() as f64,
-            blob_id: None,
-        };
-
-        match repo.save_node(&node).await {
-            Ok(_) => Ok(Response::new(ActionResponse { success: true, message: "Created".into() })),
-            Err(e) => Ok(Response::new(ActionResponse { success: false, message: e.to_string() })),
-        }
-    }
-
-    async fn stat_node(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        self.check_permissions(&request, 0)?;
-        let req = request.into_inner();
-
-        let clean = req.path.trim_start_matches('/');
-        for m in self.manager.list_mounts() {
-            if clean == m {
-                return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false }));
-            }
-        }
-
-        let (repo, rel_path) = self.resolve_repo(&req.path)?;
-        if rel_path == "/" { return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false })); }
-
-        match repo.get_node(&rel_path).await {
-            Ok(Some(n)) => Ok(Response::new(StatResponse { exists: true, is_folder: n.is_folder, is_locked: n.lock_pass.is_some() })),
-            Ok(None) => Ok(Response::new(StatResponse { exists: false, is_folder: false, is_locked: false })),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
-    }
-
     async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
-        self.check_permissions(&request, 100)?;
+        self.check_permissions(&request, Some("core:admin:read"))?;
 
+        // FIX: Typ Explizit angeben
         let sessions: Vec<SessionInfo> = self.sessions.get_all_sessions().into_iter().map(|s| SessionInfo {
-            session_id: s.session_id, username: s.username, ip_address: s.ip_address, role_level: s.role_level, login_time: s.login_time.to_rfc3339(), last_activity: s.last_activity.to_rfc3339()
+            session_id: s.session_id, username: s.username, ip_address: s.ip_address, role_level: 0, login_time: s.login_time.to_rfc3339(), last_activity: s.last_activity.to_rfc3339()
         }).collect();
-
-        let total = sessions.len() as i32;
-        Ok(Response::new(GetSessionsResponse { sessions, total_active: total }))
-    }
-
-    async fn kick_user(&self, request: Request<KickUserRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, 100)?;
-        self.sessions.remove_session(&request.into_inner().session_id);
-        Ok(Response::new(ActionResponse { success: true, message: "Kicked".into() }))
-    }
-
-    async fn get_usage(&self, request: Request<UsageRequest>) -> Result<Response<UsageResponse>, Status> {
-        self.check_permissions(&request, 0)?;
-        let owner = request.into_inner().owner;
-        let usage = self.get_user_quota_usage(&owner).await;
-        Ok(Response::new(UsageResponse { bytes: usage as u64 }))
-    }
-
-    // Dummy Implementationen für den Rest
-    async fn read_file(&self, _: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> { Err(Status::unimplemented("Use download for files")) }
-    async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, 50)?;
-        let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path)?;
-
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "DELETE", &req.path).await;
-        }
-
-        match repo.delete_node_recursive(&relative_path).await {
-            Ok(_) => Ok(Response::new(ActionResponse { success: true, message: "Deleted.".to_string() })),
-            Err(e) => Ok(Response::new(ActionResponse { success: false, message: e.to_string() })),
-        }
-    }
-
-    async fn move_node(&self, _: Request<MoveNodeRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update move_node")) }
-    async fn copy_node(&self, _: Request<CopyNodeRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update copy_node")) }
-    async fn change_mode(&self, _: Request<ChangeModeRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update change_mode")) }
-    async fn chown_node(&self, _: Request<ChownRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update chown_node")) }
-    async fn lock_node(&self, _: Request<LockRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update lock_node")) }
-    async fn find_node(&self, _: Request<FindRequest>) -> Result<Response<FindResponse>, Status> { Err(Status::unimplemented("Update find_node")) }
-    async fn grep_node(&self, _: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> { Err(Status::unimplemented("Update grep_node")) }
-    async fn get_tree(&self, _: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> { Err(Status::unimplemented("Update get_tree")) }
-
-    async fn exec_script(&self, request: Request<ExecRequest>) -> Result<Response<Self::ExecScriptStream>, Status> {
-        let claims = self.check_permissions(&request, 80)?;
-        let req = request.into_inner();
-        let (_repo, _relative_path) = self.resolve_repo(&req.script_path)?;
-
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "EXEC", &req.script_path).await;
-        }
-
-        // Mock Implementation für Exec Stream
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let _ = tx.send(Ok(ExecResponse { output_line: "Remote Execution initiated...".into() })).await;
-            let _ = tx.send(Ok(ExecResponse { output_line: "Security Sandbox: Active".into() })).await;
-            let _ = tx.send(Ok(ExecResponse { output_line: "Result: [Function executed]".into() })).await;
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    // --- FILE MANIPULATION ---
-
-    async fn create_node(&self, request: Request<CreateNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path)?;
-
-        let path_obj = std::path::Path::new(&relative_path);
-        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
-
-        let node = FileNode {
-            path: relative_path.clone(),
-            name,
-            owner: req.owner,
-            is_folder: req.is_folder,
-            size: req.content.len(),
-            content: req.content, // Für kleine Files ok, große gehen über upload_file
-            lock_pass: if req.lock_password.is_empty() { None } else { Some(req.lock_password) },
-            permissions: 0,
-            created_at: chrono::Utc::now().timestamp() as f64,
-            blob_id: None,
-        };
-
-        if let Err(e) = repo.save_node(&node).await {
-            // Check for duplicate
-            if e.to_string().contains("constraint") || e.to_string().contains("exists") {
-                return Err(Status::already_exists("Node already exists"));
-            }
-            return Err(Status::internal(e.to_string()));
-        }
-
-        // Audit Log
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "CREATE", &req.path).await;
-        }
-
-        Ok(Response::new(ActionResponse { success: true, message: "Created successfully".into() }))
-    }
-
-    async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read"))?;
-        let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path)?;
-
-        let node = repo.get_node(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?
-            .ok_or(Status::not_found("File not found"))?;
-
-        // Security Check: Lock Password
-        if let Some(pass) = node.lock_pass {
-            if pass != req.password { return Err(Status::permission_denied("File is locked (Wrong Password)")); }
-        }
-
-        // WICHTIG: Wenn blob_id existiert, verweisen wir auf Download (Performance!)
-        if node.blob_id.is_some() {
-            return Err(Status::failed_precondition("File is stored in Blob Storage. Use 'download' command instead of 'cat/read'."));
-        }
-
-        Ok(Response::new(ReadFileResponse {
-            content: node.content,
-            message: "Read success".into()
-        }))
-    }
-
-    async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path)?;
-
-        // Audit Log VOR Löschung
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "DELETE", &req.path).await;
-        }
-
-        // Falls Blob vorhanden, müsste man theoretisch auch den Blob im Storage löschen.
-        // In V3.0 löschen wir nur den DB-Eintrag. Ein "Garbage Collector" Job würde verwaiste Blobs später aufräumen.
-        match repo.delete_node_recursive(&relative_path).await {
-            Ok(_) => Ok(Response::new(ActionResponse { success: true, message: "Deleted".into() })),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
-    }
-
-    async fn move_node(&self, request: Request<MoveNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-
-        // Wir gehen davon aus, dass Source und Dest im selben Repo liegen
-        let (repo, src_rel) = self.resolve_repo(&req.source_path)?;
-        let (_, dst_rel) = self.resolve_repo(&req.dest_path)?; // Check mount logic implicitly
-
-        repo.move_path(&src_rel, &dst_rel).await.map_err(|e| Status::internal(e.to_string()))?;
-
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "MOVE", &format!("{}->{}", req.source_path, req.dest_path)).await;
-        }
-
-        Ok(Response::new(ActionResponse { success: true, message: "Moved".into() }))
-    }
-
-    async fn copy_node(&self, request: Request<CopyNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-        let (repo, src_rel) = self.resolve_repo(&req.source_path)?;
-        let (_, dst_rel) = self.resolve_repo(&req.dest_path)?;
-
-        // 1. Source laden
-        let src_node = repo.get_node(&src_rel).await.map_err(|e| Status::internal(e.to_string()))?
-            .ok_or(Status::not_found("Source file not found"))?;
-
-        if src_node.is_folder {
-            return Err(Status::unimplemented("Recursive folder copy not supported in V3 server yet"));
-        }
-
-        // 2. Als neuen Node speichern
-        let path_obj = std::path::Path::new(&dst_rel);
-        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
-
-        let new_node = FileNode {
-            path: dst_rel,
-            name,
-            owner: claims.sub.clone(), // Neuer Owner ist der Kopierer
-            is_folder: false,
-            content: src_node.content,
-            blob_id: src_node.blob_id, // Zeigt auf denselben Blob (Deduplication!)
-            size: src_node.size,
-            lock_pass: None, // Lock wird nicht kopiert
-            permissions: 0,
-            created_at: chrono::Utc::now().timestamp() as f64,
-        };
-
-        repo.save_node(&new_node).await.map_err(|e| Status::internal(e.to_string()))?;
-
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "COPY", &format!("{}->{}", req.source_path, req.dest_path)).await;
-        }
-
-        Ok(Response::new(ActionResponse { success: true, message: "Copied".into() }))
-    }
-
-    async fn change_mode(&self, request: Request<ChangeModeRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-        let (repo, rel_path) = self.resolve_repo(&req.path)?;
-
-        repo.update_permissions(&rel_path, req.permissions as u8).await.map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(ActionResponse { success: true, message: "Permissions updated".into() }))
-    }
-
-    async fn chown_node(&self, request: Request<ChownRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-        let (repo, rel_path) = self.resolve_repo(&req.path)?;
-
-        // Prüfen ob neuer User existiert (Global Check in Primary DB)
-        if let Some(primary) = self.manager.get_repo("primary") {
-            if !primary.user_exists(&req.new_owner).await.unwrap_or(false) {
-                return Err(Status::not_found("New owner user does not exist"));
-            }
-        }
-
-        repo.update_metadata(&rel_path, None, Some(req.new_owner)).await.map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(ActionResponse { success: true, message: "Ownership transferred".into() }))
-    }
-
-    async fn lock_node(&self, request: Request<LockRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:write"))?;
-        let req = request.into_inner();
-        let (repo, rel_path) = self.resolve_repo(&req.path)?;
-
-        let lock_val = if req.password.is_empty() { None } else { Some(req.password) };
-        repo.update_metadata(&rel_path, lock_val, None).await.map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(ActionResponse { success: true, message: "Lock updated".into() }))
-    }
-
-    // --- SEARCH & INFO ---
-
-    async fn get_usage(&self, request: Request<UsageRequest>) -> Result<Response<UsageResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read"))?;
-        let req = request.into_inner();
-
-        // Usage wird global über alle Mounts aggregiert? Nein, aktuell per Owner.
-        // Wir fragen die Primary DB (User DB) oder iterieren über alle Mounts (Teuer).
-        // V3.0 Implementierung: Frage Primary DB (Metadata Store).
-        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
-        let bytes = repo.get_total_usage(&req.owner).await.unwrap_or(0);
-
-        Ok(Response::new(UsageResponse { bytes: bytes as u64 }))
-    }
-
-    async fn find_node(&self, request: Request<FindRequest>) -> Result<Response<FindResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read"))?;
-        let req = request.into_inner();
-
-        // Suche aktuell nur auf Primary (Mount-übergreifende Suche wäre komplexer)
-        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
-        let pattern = format!("%{}%", req.pattern);
-
-        let paths = repo.find_nodes(&pattern).await.map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(FindResponse { paths }))
-    }
-
-    async fn grep_node(&self, request: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read"))?;
-        let req = request.into_inner();
-        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
-
-        // WARNUNG: Grep auf Server-Seite ist teuer. Wir suchen nur in kleinen Files (Content in DB).
-        let files = repo.get_all_files_content().await.map_err(|e| Status::internal(e.to_string()))?;
-        let mut matches = Vec::new();
-
-        for (path, content) in files {
-            if let Ok(text) = std::str::from_utf8(&content) {
-                if text.contains(&req.pattern) {
-                    matches.push(path);
-                }
-            }
-        }
-        Ok(Response::new(GrepResponse { matches }))
-    }
-
-    async fn get_tree(&self, request: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read"))?;
-        let req = request.into_inner();
-        let (repo, rel_path) = self.resolve_repo(&req.root_path)?;
-
-        // Simpler Tree: Liste Directory und Kind-Elemente (Rekursion wäre hier zu heavy für einen Call)
-        // Wir geben nur die erste Ebene zurück oder eine Text-Repräsentation.
-        // V3.0: Wir listen alle Files die mit dem Pfad beginnen (SQL LIKE).
-        let all_nodes = repo.list_directory(&rel_path).await.map_err(|e| Status::internal(e.to_string()))?;
-
-        // Formatiere als String Liste
-        let mut output = String::new();
-        for node in all_nodes {
-            let marker = if node.is_folder { "[DIR]" } else { "[FILE]" };
-            output.push_str(&format!("{} {}\n", marker, node.path));
-        }
-
-        Ok(Response::new(TreeResponse { tree_output: output }))
-    }
-
-    async fn stat_node(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        // Public Access erlaubt (Level 0), aber wir prüfen Auth Header
-        self.check_permissions(&request, None)?;
-        let req = request.into_inner();
-
-        let clean = req.path.trim_start_matches('/');
-        // Check Mounts
-        for m in self.manager.list_mounts() {
-            if clean == m {
-                return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false }));
-            }
-        }
-
-        let (repo, rel_path) = self.resolve_repo(&req.path)?;
-        if rel_path == "/" { return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false })); }
-
-        match repo.get_node(&rel_path).await {
-            Ok(Some(n)) => Ok(Response::new(StatResponse { exists: true, is_folder: n.is_folder, is_locked: n.lock_pass.is_some() })),
-            Ok(None) => Ok(Response::new(StatResponse { exists: false, is_folder: false, is_locked: false })),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
-    }
-
-    // --- EXECUTION (Sandbox Stub) ---
-
-    async fn exec_script(&self, request: Request<ExecRequest>) -> Result<Response<Self::ExecScriptStream>, Status> {
-        let claims = self.check_permissions(&request, Some("core:exec"))?; // Hohe Rechte nötig
-        let req = request.into_inner();
-        let (_repo, _relative_path) = self.resolve_repo(&req.script_path)?;
-
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "EXEC", &req.script_path).await;
-        }
-
-        // Streaming Response Channel
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let _ = tx.send(Ok(ExecResponse { output_line: format!("Executing {} on Pytja Kernel...", req.script_path) })).await;
-
-            // Hier würde der Code an einen Python/WASM Runner gesendet werden.
-            // Für V3 ist es ein Mock, der Sicherheit simuliert.
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let _ = tx.send(Ok(ExecResponse { output_line: "Initializing Sandbox environment [SECURE]...".into() })).await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let _ = tx.send(Ok(ExecResponse { output_line: "Result: Execution completed successfully (Mock).".into() })).await;
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    // --- ADMIN & SESSIONS ---
-
-    async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:read"))?; // Admin only
-
-        let sessions: Vec<SessionInfo> = self.sessions.get_all_sessions().into_iter().map(|s| SessionInfo {
-            session_id: s.session_id,
-            username: s.username,
-            ip_address: s.ip_address,
-            role_level: 0, // Legacy Feld, ignorieren oder mappen
-            login_time: s.login_time.to_rfc3339(),
-            last_activity: s.last_activity.to_rfc3339()
-        }).collect();
-
         let total = sessions.len() as i32;
         Ok(Response::new(GetSessionsResponse { sessions, total_active: total }))
     }
@@ -801,13 +587,8 @@ impl PytjaService for MyPytjaService {
     async fn kick_user(&self, request: Request<KickUserRequest>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(&request, Some("core:admin:users"))?;
         let req = request.into_inner();
-
         self.sessions.remove_session(&req.session_id);
-
-        if let Some(primary) = self.manager.get_repo("primary") {
-            let _ = primary.log_action(&claims.sub, "KICK", &req.session_id).await;
-        }
-
+        if let Some(primary) = self.manager.get_repo("primary") { let _ = primary.log_action(&claims.sub, "KICK", &req.session_id).await; }
         Ok(Response::new(ActionResponse { success: true, message: "User session terminated.".into() }))
     }
 }

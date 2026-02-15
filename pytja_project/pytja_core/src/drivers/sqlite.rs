@@ -101,8 +101,13 @@ impl PytjaRepository for SqliteDriver {
     // --- USER MANAGEMENT ---
 
     async fn create_user(&self, user: &User) -> Result<(), PytjaError> {
-        sqlx::query("INSERT INTO users (username, public_key, role_level, created_at, description, is_active) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(&user.username).bind(&user.public_key).bind(user.role_level).bind(&user.created_at).bind(&user.description).bind(user.is_active)
+        sqlx::query("INSERT INTO users (username, public_key, role, created_at, description, is_active) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&user.username)
+            .bind(&user.public_key)
+            .bind(&user.role) // FIX: .role statt .role_level
+            .bind(&user.created_at)
+            .bind(&user.description)
+            .bind(user.is_active)
             .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
     }
@@ -138,8 +143,12 @@ impl PytjaRepository for SqliteDriver {
         }).collect())
     }
 
-    async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError> {
-        sqlx::query("UPDATE users SET is_active = ?, role_level = ? WHERE username = ?").bind(is_active).bind(role_level).bind(username).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+    async fn update_user_status(&self, username: &str, is_active: bool, role: &str) -> Result<(), PytjaError> {
+        sqlx::query("UPDATE users SET is_active = ?, role = ? WHERE username = ?")
+            .bind(is_active)
+            .bind(role)
+            .bind(username)
+            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
     }
 

@@ -5,9 +5,9 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt}; // FIX: TryStreamExt hinzugefügt
 use uuid::Uuid;
-use tracing::{info, warn, debug};
+use tracing::{info, debug}; // warn entfernt, da ungenutzt
 use tokio_util::io::ReaderStream;
 
 // AWS S3 verlangt mindestens 5MB pro Part (außer beim letzten).

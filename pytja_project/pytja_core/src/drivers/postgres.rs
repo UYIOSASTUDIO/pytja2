@@ -1,5 +1,5 @@
 use crate::repo::PytjaRepository;
-use crate::models::{User, FileNode, AuditLogEntry};
+use crate::models::{User, FileNode, AuditLogEntry, Role}; // Role importiert
 use crate::error::PytjaError;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
@@ -13,17 +13,13 @@ pub struct PostgresDriver {
 }
 
 impl PostgresDriver {
-    /// Erstellt einen High-Performance Connection Pool für PostgreSQL
     pub async fn new(connection_string: &str) -> Result<Self, PytjaError> {
-        // Parsing des Connection Strings (z.B. postgres://user:pass@localhost/mydb)
         let options = PgConnectOptions::from_str(connection_string)
             .map_err(|e| PytjaError::System(format!("Invalid Postgres Connection String: {}", e)))?;
 
-        // Enterprise Tuning: Connection Pool Konfiguration
         let pool = PgPoolOptions::new()
-            .max_connections(50) // Skaliert für hohe Last (Discord-Scale)
-            .min_connections(5)  // Hält Verbindungen warm
-            .acquire_timeout(std::time::Duration::from_secs(5))
+            .max_connections(50)
+            .min_connections(5)
             .connect_with(options)
             .await
             .map_err(|e| PytjaError::DatabaseConnection(format!("Failed to connect to Postgres: {}", e)))?;
@@ -37,49 +33,14 @@ impl PytjaRepository for PostgresDriver {
 
     #[instrument(skip(self))]
     async fn init(&self) -> Result<(), PytjaError> {
-        // Tabellen-Initialisierung (Schema Migration)
+        // RBAC Tabellen
+        sqlx::query("CREATE TABLE IF NOT EXISTS roles (name TEXT PRIMARY KEY)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS role_permissions (role_name TEXT REFERENCES roles(name) ON DELETE CASCADE, permission TEXT, PRIMARY KEY (role_name, permission))").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
 
-        // 1. Users
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                public_key TEXT NOT NULL,
-                description TEXT,
-                role_level INTEGER,
-                is_active BOOLEAN,
-                created_at TEXT
-            )"
-        ).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-
-        // 2. File System (Postgres spezifisch: BYTEA für Binary Data)
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS file_system (
-                path TEXT PRIMARY KEY,
-                name TEXT,
-                owner TEXT,
-                is_folder BOOLEAN,
-                content BYTEA,
-                lock_pass TEXT,
-                permissions INTEGER DEFAULT 0,
-                created_at DOUBLE PRECISION
-            )"
-        ).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-
-        // 3. Audit Logs (Postgres spezifisch: SERIAL für Auto-Increment)
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS audit_logs (
-                id SERIAL PRIMARY KEY,
-                timestamp TEXT,
-                actor TEXT,
-                action TEXT,
-                target TEXT
-            )"
-        ).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-
-        // Performance Indizes
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_owner ON file_system(owner)").execute(&self.pool).await.ok();
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_parent ON file_system(path text_pattern_ops)").execute(&self.pool).await.ok();
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_actor ON audit_logs(actor)").execute(&self.pool).await.ok();
+        // User & Files
+        sqlx::query("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, public_key TEXT NOT NULL, description TEXT, role TEXT DEFAULT 'guest', is_active BOOLEAN, created_at TEXT)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS file_system (path TEXT PRIMARY KEY, name TEXT, owner TEXT, is_folder BOOLEAN, content BYTEA, blob_id TEXT, lock_pass TEXT, permissions INTEGER DEFAULT 0, created_at DOUBLE PRECISION)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS audit_logs (id SERIAL PRIMARY KEY, timestamp TEXT, actor TEXT, action TEXT, target TEXT)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
 
         info!("PostgreSQL Database initialized successfully");
         Ok(())
@@ -88,149 +49,91 @@ impl PytjaRepository for PostgresDriver {
     // --- USER MANAGEMENT ---
 
     async fn create_user(&self, user: &User) -> Result<(), PytjaError> {
-        sqlx::query(
-            "INSERT INTO users (username, public_key, role_level, created_at, description, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6)"
-        )
-            .bind(&user.username)
-            .bind(&user.public_key)
-            .bind(user.role_level)
-            .bind(&user.created_at)
-            .bind(&user.description)
-            .bind(user.is_active)
+        sqlx::query("INSERT INTO users (username, public_key, role, created_at, description, is_active) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(&user.username).bind(&user.public_key).bind(&user.role).bind(&user.created_at).bind(&user.description).bind(user.is_active)
             .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
     }
 
     async fn get_user(&self, username: &str) -> Result<Option<User>, PytjaError> {
-        let row = sqlx::query("SELECT * FROM users WHERE username = $1")
-            .bind(username)
-            .fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-
-        if let Some(row) = row {
+        let row = sqlx::query("SELECT * FROM users WHERE username = $1").bind(username).fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        if let Some(r) = row {
             Ok(Some(User {
-                username: row.try_get("username").unwrap_or_default(),
-                public_key: row.try_get("public_key").unwrap_or_default(),
-                description: row.try_get("description").ok(),
-                role_level: row.try_get("role_level").unwrap_or(0),
-                is_active: row.try_get("is_active").unwrap_or(true),
-                created_at: row.try_get("created_at").unwrap_or_default(),
+                username: r.try_get("username").unwrap_or_default(),
+                public_key: r.try_get("public_key").unwrap_or_default(),
+                description: r.try_get("description").ok(),
+                role: r.try_get("role").unwrap_or("guest".to_string()),
+                is_active: r.try_get("is_active").unwrap_or(true),
+                created_at: r.try_get("created_at").unwrap_or_default(),
             }))
-        } else {
-            Ok(None)
-        }
+        } else { Ok(None) }
     }
 
-    async fn user_exists(&self, username: &str) -> Result<bool, PytjaError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = $1")
-            .bind(username)
-            .fetch_one(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-        Ok(count > 0)
-    }
+    async fn user_exists(&self, u: &str) -> Result<bool, PytjaError> { let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = $1").bind(u).fetch_one(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?; Ok(c > 0) }
 
     async fn get_all_users(&self) -> Result<Vec<User>, PytjaError> {
         let rows = sqlx::query("SELECT * FROM users").fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-        let mut users = Vec::new();
-        for r in rows {
-            users.push(User {
-                username: r.try_get("username")?,
-                public_key: r.try_get("public_key")?,
-                description: r.try_get("description").ok(),
-                role_level: r.try_get("role_level")?,
-                is_active: r.try_get("is_active")?,
-                created_at: r.try_get("created_at")?,
-            });
-        }
-        Ok(users)
+        Ok(rows.into_iter().map(|r| User {
+            username: r.try_get("username").unwrap_or_default(),
+            public_key: r.try_get("public_key").unwrap_or_default(),
+            description: r.try_get("description").ok(),
+            role: r.try_get("role").unwrap_or("guest".to_string()),
+            is_active: r.try_get("is_active").unwrap_or(true),
+            created_at: r.try_get("created_at").unwrap_or_default(),
+        }).collect())
     }
 
-    async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError> {
-        sqlx::query("UPDATE users SET is_active = $1, role_level = $2 WHERE username = $3")
-            .bind(is_active).bind(role_level).bind(username)
-            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+    async fn update_user_status(&self, username: &str, is_active: bool, role: &str) -> Result<(), PytjaError> {
+        sqlx::query("UPDATE users SET is_active = $1, role = $2 WHERE username = $3").bind(is_active).bind(role).bind(username).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
     }
 
-    // --- FILE SYSTEM OPERATIONS ---
+    // --- RBAC ---
 
+    async fn create_role(&self, role: &Role) -> Result<(), PytjaError> {
+        let mut tx = self.pool.begin().await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        sqlx::query("INSERT INTO roles (name) VALUES ($1) ON CONFLICT DO NOTHING").bind(&role.name).execute(&mut *tx).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        sqlx::query("DELETE FROM role_permissions WHERE role_name = $1").bind(&role.name).execute(&mut *tx).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        for perm in &role.permissions {
+            sqlx::query("INSERT INTO role_permissions (role_name, permission) VALUES ($1, $2)").bind(&role.name).bind(perm).execute(&mut *tx).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        }
+        tx.commit().await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, PytjaError> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT name FROM roles WHERE name = $1").bind(name).fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        if exists.is_none() { return Ok(None); }
+        let perms: Vec<String> = sqlx::query_scalar("SELECT permission FROM role_permissions WHERE role_name = $1").bind(name).fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(Some(Role { name: name.to_string(), permissions: perms }))
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>, PytjaError> {
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM roles").fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        let mut roles = Vec::new();
+        for name in names {
+            if let Ok(Some(r)) = self.get_role(&name).await { roles.push(r); }
+        }
+        Ok(roles)
+    }
+
+    async fn update_role_permissions(&self, role_name: &str, permissions: Vec<String>) -> Result<(), PytjaError> {
+        self.create_role(&Role { name: role_name.to_string(), permissions }).await
+    }
+
+    // --- FILES & AUDIT (Stubs implementation um Compile-Fehler zu vermeiden) ---
     async fn save_node(&self, node: &FileNode) -> Result<(), PytjaError> {
-        // Upsert (Insert or Update) für Postgres
-        sqlx::query(
-            "INSERT INTO file_system (path, name, owner, is_folder, content, lock_pass, permissions, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (path) DO UPDATE SET
-             name = EXCLUDED.name,
-             owner = EXCLUDED.owner,
-             content = EXCLUDED.content,
-             lock_pass = EXCLUDED.lock_pass,
-             permissions = EXCLUDED.permissions,
-             created_at = EXCLUDED.created_at"
-        )
-            .bind(&node.path)
-            .bind(&node.name)
-            .bind(&node.owner)
-            .bind(node.is_folder)
-            .bind(&node.content)
-            .bind(&node.blob_id)
-            .bind(&node.lock_pass)
-            .bind(node.permissions as i32) // Cast u8 -> i32 für Postgres
-            .bind(node.created_at)
-            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-        Ok(())
+        sqlx::query("INSERT INTO file_system (path, name, owner, is_folder, content, blob_id, lock_pass, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (path) DO UPDATE SET name=EXCLUDED.name, owner=EXCLUDED.owner, content=EXCLUDED.content, blob_id=EXCLUDED.blob_id, lock_pass=EXCLUDED.lock_pass, permissions=EXCLUDED.permissions, created_at=EXCLUDED.created_at")
+            .bind(&node.path).bind(&node.name).bind(&node.owner).bind(node.is_folder).bind(&node.content).bind(&node.blob_id).bind(&node.lock_pass).bind(node.permissions as i32).bind(node.created_at).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?; Ok(())
     }
-
     async fn get_node(&self, path: &str) -> Result<Option<FileNode>, PytjaError> {
-        let row = sqlx::query("SELECT * FROM file_system WHERE path = $1")
-            .bind(path)
-            .fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-
-        if let Some(row) = row {
-            Ok(Some(FileNode {
-                path: row.try_get("path").unwrap_or_default(),
-                name: row.try_get("name").unwrap_or_default(),
-                owner: row.try_get("owner").unwrap_or_default(),
-                is_folder: row.try_get("is_folder").unwrap_or(false),
-                content: row.try_get("content").unwrap_or_default(),
-                blob_id: row.try_get("blob_id").ok(),
-                size: 0, // Größe wird dynamisch berechnet oder bei Bedarf geladen
-                lock_pass: row.try_get("lock_pass").ok(),
-                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
-                created_at: row.try_get("created_at").unwrap_or(0.0),
-            }))
-        } else {
-            Ok(None)
-        }
+        let r = sqlx::query("SELECT * FROM file_system WHERE path = $1").bind(path).fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        if let Some(row) = r { Ok(Some(FileNode { path: row.try_get("path")?, name: row.try_get("name")?, owner: row.try_get("owner")?, is_folder: row.try_get("is_folder")?, content: row.try_get("content")?, blob_id: row.try_get("blob_id").ok(), size: 0, lock_pass: row.try_get("lock_pass").ok(), permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8, created_at: row.try_get("created_at")? })) } else { Ok(None) }
     }
-
     async fn list_directory(&self, path: &str) -> Result<Vec<FileNode>, PytjaError> {
-        let query_path = if path == "/" { "".to_string() } else { path.to_string() };
-
-        // Optimierte Query: Lädt NICHT den Content (spart Bandbreite), sondern berechnet LENGTH()
-        let rows = sqlx::query(
-            "SELECT path, name, owner, is_folder, created_at, lock_pass, permissions, LENGTH(content) as size
-              FROM file_system
-              WHERE path LIKE $1 || '/%' AND path NOT LIKE $1 || '/%/%'"
-        )
-            .bind(&query_path)
-            .bind(&query_path) // Zweimal binden, da Postgres Parameter nicht wiederverwendet wie SQLite
-            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-
-        let mut nodes = Vec::new();
-        for row in rows {
-            nodes.push(FileNode {
-                path: row.try_get("path").unwrap_or_default(),
-                name: row.try_get("name").unwrap_or_default(),
-                owner: row.try_get("owner").unwrap_or_default(),
-                is_folder: row.try_get("is_folder").unwrap_or(false),
-                content: vec![],
-                blob_id: row.try_get("blob_id").ok(),
-                size: row.try_get::<i32, _>("size").unwrap_or(0) as usize,
-                lock_pass: row.try_get("lock_pass").ok(),
-                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
-                created_at: row.try_get("created_at").unwrap_or(0.0),
-            });
-        }
-        Ok(nodes)
+        let q = if path == "/" { "".to_string() } else { path.to_string() };
+        let rows = sqlx::query("SELECT path, name, owner, is_folder, created_at, blob_id, lock_pass, permissions FROM file_system WHERE path LIKE $1 || '/%' AND path NOT LIKE $1 || '/%/%'").bind(&q).fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        let mut nodes = Vec::new(); for row in rows { nodes.push(FileNode { path: row.try_get("path")?, name: row.try_get("name")?, owner: row.try_get("owner")?, is_folder: row.try_get("is_folder")?, content: vec![], blob_id: row.try_get("blob_id").ok(), size: 0, lock_pass: row.try_get("lock_pass").ok(), permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8, created_at: row.try_get("created_at")? }); } Ok(nodes)
     }
 
     async fn delete_node_recursive(&self, path: &str) -> Result<(), PytjaError> {
