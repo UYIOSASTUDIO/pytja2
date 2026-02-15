@@ -1,7 +1,6 @@
 use redis::AsyncCommands; // Import für async Redis calls
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
-use std::sync::Arc;
 use pytja_core::models::Role;
 
 const SESSION_TTL: usize = 3600; // 1 Stunde
@@ -50,7 +49,8 @@ impl SessionManager {
         let key = format!("session:{}", session_id);
 
         let mut con = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
-        let _: () = con.set_ex(key, json, SESSION_TTL).await.map_err(|e| e.to_string())?;
+        // FIX: Cast zu u64
+        let _: () = con.set_ex(key, json, SESSION_TTL as u64).await.map_err(|e| e.to_string())?;
 
         tracing::info!("New Redis session: {} ({})", username, session_id);
         Ok(session_id)
@@ -62,7 +62,8 @@ impl SessionManager {
             // Check Existenz UND aktualisiere TTL (Heartbeat)
             let exists: bool = con.exists(&key).await.unwrap_or(false);
             if exists {
-                let _: () = con.expire(&key, SESSION_TTL).await.unwrap_or(());
+                // FIX: Cast zu i64 (Redis expire nutzt oft i64 oder usize, je nach crate version, hier i64 sicher)
+                let _: () = con.expire(&key, SESSION_TTL as i64).await.unwrap_or(());
                 return true;
             }
         }
@@ -80,15 +81,18 @@ impl SessionManager {
     pub async fn get_all_sessions(&self) -> Vec<ActiveSession> {
         let mut sessions = Vec::new();
         if let Ok(mut con) = self.client.get_async_connection().await {
+            // FIX: Borrow Checker Logic
+            // Wir können 'con' nicht für 'scan_match' UND 'get' gleichzeitig nutzen.
+            // 1. Keys sammeln
+            let mut keys: Vec<String> = Vec::new();
             let mut iter: redis::AsyncIter<String> = con.scan_match("session:*").await.unwrap();
 
-            // Sammle Keys
-            let mut keys = Vec::new();
             while let Some(key) = iter.next_item().await {
                 keys.push(key);
             }
+            drop(iter); // Iterator freigeben, damit 'con' wieder frei ist
 
-            // Hole Values (MGET wäre besser, aber Loop ist ok für Admin Dashboard)
+            // 2. Values holen
             for key in keys {
                 if let Ok(json) = con.get::<_, String>(&key).await {
                     if let Ok(sess) = serde_json::from_str::<ActiveSession>(&json) {
@@ -116,7 +120,8 @@ impl SessionManager {
         let key = format!("cache:role:{}", role.name);
         if let Ok(json) = serde_json::to_string(role) {
             if let Ok(mut con) = self.client.get_async_connection().await {
-                let _: () = con.set_ex(key, json, ROLE_CACHE_TTL).await.unwrap_or(());
+                // FIX: Cast zu u64
+                let _: () = con.set_ex(key, json, ROLE_CACHE_TTL as u64).await.unwrap_or(());
             }
         }
     }

@@ -1,4 +1,5 @@
 use tonic::{transport::Server, Request, Response, Status};
+use tonic::metadata::MetadataMap; // Wichtig für den Fix
 
 use pytja_proto::{PytjaService, PytjaServiceServer};
 use pytja_proto::pytja::{
@@ -53,9 +54,10 @@ pub struct MyPytjaService {
 }
 
 impl MyPytjaService {
-    // FIX: Async Permission Check für Redis
-    async fn check_permissions<T>(&self, req: &Request<T>, required_perm: Option<&str>) -> Result<Claims, Status> {
-        let token = match req.metadata().get("authorization") {
+    // FIX: Wir übergeben nur die MetadataMap, nicht den ganzen Request!
+    // Das verhindert Sync-Probleme bei Streaming-Requests.
+    async fn check_permissions(&self, meta: &MetadataMap, required_perm: Option<&str>) -> Result<Claims, Status> {
+        let token = match meta.get("authorization") {
             Some(t) => t.to_str().map_err(|_| Status::unauthenticated("Invalid Token format"))?,
             None => return Err(Status::unauthenticated("Login required")),
         };
@@ -69,7 +71,6 @@ impl MyPytjaService {
         ).map_err(|_| Status::unauthenticated("Invalid Token or Signature"))?;
 
         if let Some(sid) = &token_data.claims.sid {
-            // ASYNC Call zu Redis
             if !self.sessions.is_valid(sid).await {
                 return Err(Status::unauthenticated("Session expired or terminated"));
             }
@@ -158,7 +159,6 @@ impl PytjaService for MyPytjaService {
             return Ok(Response::new(LoginResponse { success: false, token: "".into(), message: "Invalid Signature".into() }));
         }
 
-        // REDIS CACHE CHECK für Permissions
         let role = if let Some(cached) = self.sessions.get_cached_role(&user.role).await {
             tracing::info!("Cache hit for role: {}", user.role);
             cached
@@ -166,7 +166,7 @@ impl PytjaService for MyPytjaService {
             tracing::info!("Cache miss for role: {}, fetching from DB", user.role);
             let r = repo.get_role(&user.role).await.map_err(|e| Status::internal(e.to_string()))?
                 .unwrap_or(Role { name: "guest".into(), permissions: vec![] });
-            self.sessions.cache_role(&r).await; // Cache auffüllen
+            self.sessions.cache_role(&r).await;
             r
         };
 
@@ -175,7 +175,6 @@ impl PytjaService for MyPytjaService {
 
         let expiration = chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(60)).unwrap().timestamp() as usize;
 
-        // Session in Redis registrieren
         let session_id = self.sessions.register_session(&user.username, &user.role, "127.0.0.1").await
             .map_err(|e| Status::internal(format!("Redis Error: {}", e)))?;
 
@@ -194,7 +193,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn list_directory(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?; // AWAIT
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?; // Metadata übergeben!
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
@@ -221,7 +220,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn upload_file(&self, request: Request<tonic::Streaming<UploadRequest>>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?; // Metadata!
         let mut stream = request.into_inner();
 
         let first_msg = stream.message().await.map_err(|e| Status::internal(e.to_string()))?;
@@ -271,14 +270,16 @@ impl PytjaService for MyPytjaService {
         };
 
         repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
+
         if let Some(primary) = self.manager.get_repo("primary") {
             let _ = primary.log_action(&claims.sub, "UPLOAD", &metadata.path).await;
         }
+
         Ok(Response::new(ActionResponse { success: true, message: "Upload complete".into() }))
     }
 
     async fn download_file(&self, request: Request<DownloadRequest>) -> Result<Response<Self::DownloadFileStream>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
@@ -314,7 +315,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn create_node(&self, request: Request<CreateNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
@@ -336,7 +337,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
@@ -352,7 +353,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
@@ -362,7 +363,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn move_node(&self, request: Request<MoveNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, src_rel) = self.resolve_repo(&req.source_path)?;
         let (_, dst_rel) = self.resolve_repo(&req.dest_path)?;
@@ -373,7 +374,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn copy_node(&self, request: Request<CopyNodeRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:fs:write")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, src_rel) = self.resolve_repo(&req.source_path)?;
         let (_, dst_rel) = self.resolve_repo(&req.dest_path)?;
@@ -398,7 +399,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn change_mode(&self, request: Request<ChangeModeRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:write")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, rel_path) = self.resolve_repo(&req.path)?;
         repo.update_permissions(&rel_path, req.permissions as u8).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -406,7 +407,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn chown_node(&self, request: Request<ChownRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:write")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, rel_path) = self.resolve_repo(&req.path)?;
 
@@ -418,7 +419,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn lock_node(&self, request: Request<LockRequest>) -> Result<Response<ActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:write")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
         let (repo, rel_path) = self.resolve_repo(&req.path)?;
         let lock_val = if req.password.is_empty() { None } else { Some(req.password) };
@@ -427,14 +428,14 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn get_usage(&self, request: Request<UsageRequest>) -> Result<Response<UsageResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let usage = self.get_user_quota_usage(&req.owner).await;
         Ok(Response::new(UsageResponse { bytes: usage as u64 }))
     }
 
     async fn find_node(&self, request: Request<FindRequest>) -> Result<Response<FindResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
         let paths = repo.find_nodes(&format!("%{}%", req.pattern)).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -442,7 +443,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn grep_node(&self, request: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
         let files = repo.get_all_files_content().await.map_err(|e| Status::internal(e.to_string()))?;
@@ -456,7 +457,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn get_tree(&self, request: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> {
-        self.check_permissions(&request, Some("core:fs:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, rel_path) = self.resolve_repo(&req.root_path)?;
         let all_nodes = repo.list_directory(&rel_path).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -470,7 +471,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn stat_node(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        self.check_permissions(&request, None).await?;
+        self.check_permissions(request.metadata(), None).await?;
         let req = request.into_inner();
         let clean = req.path.trim_start_matches('/');
         for m in self.manager.list_mounts() { if clean == m { return Ok(Response::new(StatResponse { exists: true, is_folder: true, is_locked: false })); } }
@@ -485,7 +486,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn exec_script(&self, request: Request<ExecRequest>) -> Result<Response<Self::ExecScriptStream>, Status> {
-        let claims = self.check_permissions(&request, Some("core:exec")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:exec")).await?;
         let req = request.into_inner();
         let (_repo, _relative_path) = self.resolve_repo(&req.script_path)?;
 
@@ -505,7 +506,7 @@ impl PytjaService for MyPytjaService {
     // --- ADMIN RPCS ---
 
     async fn create_role(&self, request: Request<CreateRoleRequest>) -> Result<Response<AdminActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:roles")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:roles")).await?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
         repo.create_role(&Role { name: req.name, permissions: vec![] }).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -513,7 +514,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn add_permission(&self, request: Request<AddPermissionRequest>) -> Result<Response<AdminActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:roles")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:roles")).await?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
 
@@ -529,7 +530,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn assign_role(&self, request: Request<AssignRoleRequest>) -> Result<Response<AdminActionResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:users")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
 
@@ -540,7 +541,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn list_roles(&self, request: Request<ListRolesRequest>) -> Result<Response<ListRolesResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
         let roles = repo.list_roles().await.map_err(|e| Status::internal(e.to_string()))?;
         let infos = roles.into_iter().map(|r| RoleInfo { name: r.name, permissions: r.permissions }).collect();
@@ -548,7 +549,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
-        self.check_permissions(&request, Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
         // FIX: Typ Explizit (Vec<_>) damit Compiler es versteht
         let sessions: Vec<_> = self.sessions.get_all_sessions().await.into_iter().map(|s| SessionInfo {
             session_id: s.session_id, username: s.username, ip_address: s.ip_address, role_level: 0, login_time: s.login_time.to_rfc3339(), last_activity: s.last_activity.to_rfc3339()
@@ -558,7 +559,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn kick_user(&self, request: Request<KickUserRequest>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(&request, Some("core:admin:users")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
         let req = request.into_inner();
         self.sessions.remove_session(&req.session_id).await; // ASYNC
         if let Some(primary) = self.manager.get_repo("primary") { let _ = primary.log_action(&claims.sub, "KICK", &req.session_id).await; }

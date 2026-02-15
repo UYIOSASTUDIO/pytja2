@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # --- PYTJA SERVER ---
+  server:
+    build: .
+    container_name: pytja_hub
+    restart: unless-stopped
+    ports:
+      - "50051:50051"
+    depends_on:
+      - db
+      - redis
+      - minio
+    environment:
+      # Globale Einstellungen
+      - RUN_MODE=production
+      - RUST_LOG=info
+
+      # Server Config
+      - PYTJA_SERVER__HOST=0.0.0.0
+      - PYTJA_SERVER__PORT=50051
+      - PYTJA_SERVER__WORKER_THREADS=8
+
+      # Security
+      - PYTJA_SECURITY__JWT_SECRET=super_secure_docker_secret_change_me
+
+      # Database (Postgres Connection)
+      - PYTJA_DATABASE__PRIMARY_URL=postgres://pytja:securepass@db:5432/pytja_db
+
+      # Redis Cache
+      - PYTJA_REDIS__URL=redis://redis:6379/
+
+      # Storage (Wir nutzen MinIO als S3 Backend)
+      - PYTJA_STORAGE__STORAGE_TYPE=s3
+      - PYTJA_STORAGE__S3_BUCKET=pytja-data
+      - PYTJA_STORAGE__S3_REGION=us-east-1 # MinIO Default
+      # AWS SDK liest diese automatisch:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_ENDPOINT_URL=http://minio:9000
+      # Wichtig für lokales MinIO (S3 Force Path Style)
+      - AWS_S3_FORCE_PATH_STYLE=true
+
+    volumes:
+      - ./logs:/app/logs
+      - ./mounts.json:/app/mounts.json
+
+  # --- POSTGRESQL (Primary DB) ---
+  db:
+    image: postgres:16-alpine
+    container_name: pytja_db
+    restart: always
+    environment:
+      POSTGRES_USER: pytja
+      POSTGRES_PASSWORD: securepass
+      POSTGRES_DB: pytja_db
+    volumes:
+      - pytja_pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # Optional: Um von lokal zuzugreifen
+
+  # --- REDIS (Cache & Sessions) ---
+  redis:
+    image: redis:7-alpine
+    container_name: pytja_redis
+    restart: always
+    volumes:
+      - pytja_redis_data:/data
+
+  # --- MINIO (S3 Compatible Storage) ---
+  minio:
+    image: minio/minio
+    container_name: pytja_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - pytja_s3_data:/data
+    ports:
+      - "9000:9000" # API
+      - "9001:9001" # Web Console
+
+volumes:
+  pytja_pg_data:
+  pytja_redis_data:
+  pytja_s3_data:
