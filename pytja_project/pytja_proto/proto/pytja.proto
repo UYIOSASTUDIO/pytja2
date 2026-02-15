@@ -29,6 +29,7 @@ service PytjaService {
     rpc AddPermission (AddPermissionRequest) returns (AdminActionResponse);
     rpc AssignRole (AssignRoleRequest) returns (AdminActionResponse);
     rpc ListRoles (ListRolesRequest) returns (ListRolesResponse);
+    rpc BanUser (BanUserRequest) returns (BanUserResponse); // NEU
 }
 
 // --- Messages (Datenpakete) ---
@@ -220,9 +221,10 @@ message SessionInfo {
     string session_id = 1;
     string username = 2;
     string ip_address = 3;
-    string login_time = 4; // ISO 8601
-    int32 role_level = 5;
-    string last_activity = 6; // Timestamp der letzten Aktion
+    int32 role_level = 4; // Deprecated, ignorieren wir
+    string login_time = 5;
+    string last_activity = 6;
+    string role = 7; // NEU: Die echte String-Rolle
 }
 
 message GetSessionsRequest {
@@ -269,4 +271,15 @@ message RoleInfo {
 
 message ListRolesResponse {
     repeated RoleInfo roles = 1;
+}
+
+message BanUserRequest {
+    string username = 1;
+    bool ban = 2; // true = ban, false = unban
+    string reason = 3;
+}
+
+message BanUserResponse {
+    bool success = 1;
+    string message = 2;
 }

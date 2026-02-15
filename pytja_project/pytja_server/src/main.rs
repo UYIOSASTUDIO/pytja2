@@ -550,10 +550,17 @@ impl PytjaService for MyPytjaService {
 
     async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
-        // FIX: Typ Explizit (Vec<_>) damit Compiler es versteht
+
         let sessions: Vec<_> = self.sessions.get_all_sessions().await.into_iter().map(|s| SessionInfo {
-            session_id: s.session_id, username: s.username, ip_address: s.ip_address, role_level: 0, login_time: s.login_time.to_rfc3339(), last_activity: s.last_activity.to_rfc3339()
+            session_id: s.session_id,
+            username: s.username,
+            ip_address: s.ip_address,
+            role_level: 0,
+            login_time: s.login_time.to_rfc3339(),
+            last_activity: s.last_activity.to_rfc3339(),
+            role: s.role // NEU: Rolle aus Redis übernehmen
         }).collect();
+
         let total = sessions.len() as i32;
         Ok(Response::new(GetSessionsResponse { sessions, total_active: total }))
     }
@@ -564,6 +571,34 @@ impl PytjaService for MyPytjaService {
         self.sessions.remove_session(&req.session_id).await; // ASYNC
         if let Some(primary) = self.manager.get_repo("primary") { let _ = primary.log_action(&claims.sub, "KICK", &req.session_id).await; }
         Ok(Response::new(ActionResponse { success: true, message: "User session terminated.".into() }))
+    }
+
+    async fn ban_user(&self, request: Request<BanUserRequest>) -> Result<Response<BanUserResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
+
+        // 1. User Status in DB ändern
+        // Wir müssen die aktuelle Rolle holen, um sie nicht zu überschreiben
+        let user = repo.get_user(&req.username).await.map_err(|e| Status::internal(e.to_string()))?
+            .ok_or(Status::not_found("User not found"))?;
+
+        let new_active_status = !req.ban; // Ban = true -> Active = false
+        repo.update_user_status(&req.username, new_active_status, &user.role).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // 2. Wenn Ban, alle aktiven Sessions kicken
+        if req.ban {
+            let all_sessions = self.sessions.get_all_sessions().await;
+            for s in all_sessions {
+                if s.username == req.username {
+                    self.sessions.remove_session(&s.session_id).await;
+                }
+            }
+        }
+
+        let msg = if req.ban { "User banned and sessions terminated." } else { "User unbanned." };
+        Ok(Response::new(BanUserResponse { success: true, message: msg.into() }))
     }
 }
 
