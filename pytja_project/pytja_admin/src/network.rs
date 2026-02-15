@@ -2,8 +2,9 @@ use anyhow::Result;
 use pytja_proto::pytja::pytja_service_client::PytjaServiceClient;
 use pytja_proto::pytja::{
     LoginRequest, GetSessionsRequest, ListRolesRequest,
-    ChallengeRequest, KickUserRequest, SessionInfo, RoleInfo,
-    BanUserRequest
+    ChallengeRequest, KickUserRequest, BanUserRequest,
+    ChangeRoleRequest, GetMountsRequest, AddMountRequest, // Neue Request Typen
+    SessionInfo, RoleInfo, MountInfo // Neue Daten Typen
 };
 use tonic::transport::Channel;
 use tonic::Request;
@@ -52,9 +53,13 @@ impl AdminClient {
 
     fn auth_req<T>(&self, msg: T) -> Request<T> {
         let mut req = Request::new(msg);
-        req.metadata_mut().insert("authorization", self.token.parse().unwrap());
+        if !self.token.is_empty() {
+            req.metadata_mut().insert("authorization", self.token.parse().unwrap());
+        }
         req
     }
+
+    // --- STANDARD ADMIN ACTIONS ---
 
     pub async fn get_sessions(&mut self) -> Result<(Vec<SessionInfo>, i32)> {
         let req = self.auth_req(GetSessionsRequest {});
@@ -69,7 +74,6 @@ impl AdminClient {
     }
 
     pub async fn kick_user(&mut self, session_id: String) -> Result<String> {
-        // FIX: 'reason' Feld hinzugefügt
         let req = self.auth_req(KickUserRequest {
             session_id,
             reason: "Kicked by Admin Console".to_string()
@@ -85,6 +89,30 @@ impl AdminClient {
             reason: "Admin Action".to_string()
         });
         let resp = self.client.ban_user(req).await?.into_inner();
+        Ok(resp.message)
+    }
+
+    // --- NEUE FUNKTIONEN (Phase 2 & 3) ---
+
+    pub async fn change_role(&mut self, username: String, new_role: String) -> Result<String> {
+        let req = self.auth_req(ChangeRoleRequest { username, new_role });
+        let resp = self.client.change_user_role(req).await?.into_inner();
+        Ok(resp.message)
+    }
+
+    pub async fn get_mounts(&mut self) -> Result<Vec<MountInfo>> {
+        let req = self.auth_req(GetMountsRequest {});
+        let resp = self.client.get_mounts(req).await?.into_inner();
+        Ok(resp.mounts)
+    }
+
+    pub async fn add_mount(&mut self, name: String, db_type: String, connection: String) -> Result<String> {
+        let req = self.auth_req(AddMountRequest {
+            name,
+            r#type: db_type, // 'type' ist ein Keyword in Rust -> r#type
+            connection_string: connection,
+        });
+        let resp = self.client.add_mount(req).await?.into_inner();
         Ok(resp.message)
     }
 }

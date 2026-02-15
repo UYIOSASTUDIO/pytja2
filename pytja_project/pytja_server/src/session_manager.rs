@@ -125,4 +125,31 @@ impl SessionManager {
             }
         }
     }
+
+    // Löscht alle Sessions eines bestimmten Users (Cleanup)
+    pub async fn clear_user_sessions(&self, username: &str) {
+        let all = self.get_all_sessions().await;
+        for session in all {
+            if session.username == username {
+                self.remove_session(&session.session_id).await;
+            }
+        }
+    }
+
+    // Aktualisiert die Rolle in einer laufenden Session (ohne Logout!)
+    pub async fn update_session_role(&self, username: &str, new_role: &str) {
+        let all = self.get_all_sessions().await;
+        for mut session in all {
+            if session.username == username {
+                session.role = new_role.to_string();
+                // Zurückschreiben in Redis
+                if let Ok(json) = serde_json::to_string(&session) {
+                    let key = format!("session:{}", session.session_id);
+                    if let Ok(mut con) = self.client.get_async_connection().await {
+                        let _: () = con.set_ex(key, json, SESSION_TTL as u64).await.unwrap_or(());
+                    }
+                }
+            }
+        }
+    }
 }

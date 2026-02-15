@@ -7,12 +7,15 @@ pub enum CurrentTab {
     Dashboard,
     Sessions,
     Roles,
+    Databases,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum PopupType {
     None,
     UserActions,
+    ChangeRoleInput,
+    AddDbInput,
 }
 
 pub struct App {
@@ -31,6 +34,9 @@ pub struct App {
     pub status_message: String,
     pub total_active: i32,
     pub should_quit: bool,
+
+    pub mounts: Vec<MountInfo>,
+    pub input_buffer: String,
 }
 
 impl App {

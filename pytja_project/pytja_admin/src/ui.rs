@@ -1,8 +1,10 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    // FIX: 'Stylize' hinzugefügt für .yellow().bold()
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Row, Table, Cell, Clear, TableState},
+    // FIX: 'TableState' entfernt (wurde nicht genutzt)
+    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Row, Table, Cell, Clear},
     Frame,
 };
 use crate::app::{App, CurrentTab};
@@ -24,8 +26,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         CurrentTab::Dashboard => draw_dashboard(f, app, chunks[1]),
         CurrentTab::Sessions => draw_sessions(f, app, chunks[1]),
         CurrentTab::Roles => draw_roles(f, app, chunks[1]),
+        CurrentTab::Databases => draw_databases(f, app, chunks[1]),
     }
 
+    // Popup Layer (muss als letztes gezeichnet werden, damit es oben liegt)
     if app.active_popup == crate::app::PopupType::UserActions {
         draw_user_popup(f, app);
     }
@@ -33,6 +37,46 @@ pub fn draw(f: &mut Frame, app: &App) {
     let status = Paragraph::new(format!("Status: {}", app.status_message))
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(status, chunks[2]);
+}
+
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let titles: Vec<Line> = vec!["Dashboard [1]", "Sessions [2]", "Roles [3]", "Databases [4]"]
+        .iter()
+        .map(|t| Line::from(Span::styled(*t, Style::default().fg(Color::Green))))
+        .collect();
+
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::ALL).title("Pytja Admin Console V3.0"))
+        .select(app.current_tab as usize)
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD).bg(Color::DarkGray));
+
+    f.render_widget(tabs, area);
+}
+
+fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("PYTJA COMMAND CENTER V3.0", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(format!("Active Sessions: {}", app.total_active)),
+        Line::from(format!("Defined Roles:   {}", app.roles.len())),
+        Line::from(""),
+        Line::from(vec![Span::styled("CONTROLS:", Style::default().add_modifier(Modifier::UNDERLINED))]),
+        Line::from("  [1] Dashboard"),
+        Line::from("  [2] Sessions List  (Manage Users)"),
+        Line::from("  [3] RBAC Roles     (Manage Permissions)"),
+        Line::from(""),
+        Line::from(vec![Span::styled("ACTIONS:", Style::default().add_modifier(Modifier::UNDERLINED))]),
+        Line::from("  [r] Refresh Data"),
+        Line::from("  [q] Quit"),
+        Line::from(""),
+        Line::from(vec![Span::styled("HOW TO KICK/BAN:", Style::default().fg(Color::Green))]),
+        Line::from("  1. Go to 'Sessions' [2]"),
+        Line::from("  2. Select a user with Up/Down"),
+        Line::from("  3. Press [ENTER] to open Action Menu"),
+    ];
+    let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Overview"));
+    f.render_widget(p, area);
 }
 
 fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
@@ -50,7 +94,7 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(s.session_id.chars().take(8).collect::<String>()),
             Cell::from(s.username.clone()),
             Cell::from(s.ip_address.clone()),
-            Cell::from(s.role.clone()), // FIX: Echte Rolle anzeigen!
+            Cell::from(s.role.clone()),
             Cell::from(s.last_activity.clone()),
         ]).style(style)
     }).collect();
@@ -65,12 +109,25 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-// Das Popup Widget
+fn draw_roles(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app.roles.iter().map(|r| {
+        let perms = r.permissions.join(", ");
+        ListItem::new(format!("{} -> [{}]", r.name.to_uppercase(), perms))
+    }).collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("RBAC Roles"))
+        .highlight_style(Style::default().bg(Color::Blue));
+    f.render_widget(list, area);
+}
+
 fn draw_user_popup(f: &mut Frame, app: &App) {
     let block = Block::default().title("User Actions").borders(Borders::ALL).style(Style::default().bg(Color::DarkGray));
     let area = centered_rect(60, 20, f.size());
 
     let session = &app.sessions[app.selected_session_index];
+
+    // Hier nutzen wir jetzt .yellow().bold(), was dank 'use ... Stylize' funktioniert
     let text = vec![
         Line::from(format!("Selected User: {}", session.username).yellow().bold()),
         Line::from(""),
@@ -82,11 +139,32 @@ fn draw_user_popup(f: &mut Frame, app: &App) {
 
     let p = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Center);
 
-    f.render_widget(Clear, area); // Hintergrund löschen
+    f.render_widget(Clear, area); // Hintergrund löschen (Transparenz-Effekt)
     f.render_widget(p, area);
 }
 
-// Helper für Zentrierung
+fn draw_databases(f: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(vec!["Name", "Type", "Status"])
+        .style(Style::default().fg(Color::Yellow));
+
+    let rows: Vec<Row> = app.mounts.iter().map(|m| {
+        Row::new(vec![
+            Cell::from(m.name.clone()),
+            Cell::from(m.type.clone()),
+            if m.is_connected {
+                Cell::from("CONNECTED").style(Style::default().fg(Color::Green))
+            } else {
+                Cell::from("ERROR").style(Style::default().fg(Color::Red))
+            },
+        ])
+    }).collect();
+
+    let table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title("Connected Databases (Press 'a' to add)"));
+    f.render_widget(table, area);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -105,46 +183,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ].as_ref())
         .split(popup_layout[1])[1]
-}
-
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    // FIX: Explizite Typ-Annotation für den Compiler
-    let titles: Vec<Line> = vec!["Dashboard [1]", "Sessions [2]", "Roles [3]"]
-        .iter()
-        .map(|t| Line::from(Span::styled(*t, Style::default().fg(Color::Green))))
-        .collect();
-
-    let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title("Pytja Admin Console V3.0"))
-        .select(app.current_tab as usize)
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD).bg(Color::DarkGray));
-
-    f.render_widget(tabs, area);
-}
-
-fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
-    let text = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled("PYTJA ENTERPRISE HUB", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
-        Line::from(""),
-        Line::from(format!("Active Sessions: {}", app.total_active)),
-        Line::from(format!("Defined Roles:   {}", app.roles.len())),
-        Line::from(""),
-        Line::from("Press 'r' to refresh data."),
-        Line::from("Press 'q' to quit."),
-    ];
-    let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Overview"));
-    f.render_widget(p, area);
-}
-
-fn draw_roles(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app.roles.iter().map(|r| {
-        let perms = r.permissions.join(", ");
-        ListItem::new(format!("{} -> [{}]", r.name.to_uppercase(), perms))
-    }).collect();
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("RBAC Roles"))
-        .highlight_style(Style::default().bg(Color::Blue));
-    f.render_widget(list, area);
 }

@@ -23,13 +23,17 @@ service PytjaService {
     rpc ExecScript (ExecRequest) returns (stream ExecResponse);
     rpc GetChallenge (ChallengeRequest) returns (ChallengeResponse); // Schritt 1
     rpc Login (LoginRequest) returns (LoginResponse); // Schritt
-    rpc GetActiveSessions (GetSessionsRequest) returns (GetSessionsResponse);
     rpc KickUser (KickUserRequest) returns (ActionResponse);
     rpc CreateRole (CreateRoleRequest) returns (AdminActionResponse);
     rpc AddPermission (AddPermissionRequest) returns (AdminActionResponse);
     rpc AssignRole (AssignRoleRequest) returns (AdminActionResponse);
     rpc ListRoles (ListRolesRequest) returns (ListRolesResponse);
-    rpc BanUser (BanUserRequest) returns (BanUserResponse); // NEU
+    rpc GetActiveSessions (GetSessionsRequest) returns (GetSessionsResponse);
+    rpc BanUser (BanUserRequest) returns (BanUserResponse);
+    rpc ChangeUserRole (ChangeRoleRequest) returns (ChangeRoleResponse);
+    rpc GetMounts (GetMountsRequest) returns (GetMountsResponse);
+    rpc AddMount (AddMountRequest) returns (AdminActionResponse);
+    rpc RemoveMount (RemoveMountRequest) returns (AdminActionResponse);
 }
 
 // --- Messages (Datenpakete) ---
@@ -221,10 +225,10 @@ message SessionInfo {
     string session_id = 1;
     string username = 2;
     string ip_address = 3;
-    int32 role_level = 4; // Deprecated, ignorieren wir
+    int32 role_level = 4; // Muss int32 bleiben! (Feld 4)
     string login_time = 5;
     string last_activity = 6;
-    string role = 7; // NEU: Die echte String-Rolle
+    string role = 7;      // NEU: String Rolle (Feld 7)
 }
 
 message GetSessionsRequest {
@@ -282,4 +286,37 @@ message BanUserRequest {
 message BanUserResponse {
     bool success = 1;
     string message = 2;
+}
+
+message ChangeRoleRequest {
+    string username = 1;
+    string new_role = 2;
+}
+
+message ChangeRoleResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// Datenbanken / Mounts
+message MountInfo {
+    string name = 1;        // z.B. "primary", "archive"
+    string type = 2;        // "sqlite", "postgres", "s3"
+    string connection = 3;  // Der Pfad oder URL (maskiert)
+    bool is_connected = 4;
+}
+
+message GetMountsRequest {}
+message GetMountsResponse {
+    repeated MountInfo mounts = 1;
+}
+
+message AddMountRequest {
+    string name = 1;
+    string type = 2;
+    string connection_string = 3;
+}
+
+message RemoveMountRequest {
+    string name = 1;
 }

@@ -19,8 +19,12 @@ use pytja_proto::pytja::{
     ChallengeRequest, ChallengeResponse,
     LoginRequest, LoginResponse,
     GetSessionsRequest, GetSessionsResponse, KickUserRequest, SessionInfo,
+    BanUserRequest, BanUserResponse,
     CreateRoleRequest, AddPermissionRequest, AssignRoleRequest, AdminActionResponse,
     ListRolesRequest, ListRolesResponse, RoleInfo,
+    ChangeRoleRequest, ChangeRoleResponse,
+    GetMountsRequest, GetMountsResponse, MountInfo,
+    AddMountRequest, RemoveMountRequest,
     upload_request::Data as UploadData
 };
 
@@ -174,6 +178,8 @@ impl PytjaService for MyPytjaService {
         for p in role.permissions { perms_set.insert(p); }
 
         let expiration = chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(60)).unwrap().timestamp() as usize;
+
+        self.sessions.clear_user_sessions(&user.username).await;
 
         let session_id = self.sessions.register_session(&user.username, &user.role, "127.0.0.1").await
             .map_err(|e| Status::internal(format!("Redis Error: {}", e)))?;
@@ -599,6 +605,68 @@ impl PytjaService for MyPytjaService {
 
         let msg = if req.ban { "User banned and sessions terminated." } else { "User unbanned." };
         Ok(Response::new(BanUserResponse { success: true, message: msg.into() }))
+    }
+
+    async fn change_user_role(&self, request: Request<ChangeRoleRequest>) -> Result<Response<ChangeRoleResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
+
+        // 1. DB Update
+        let user = repo.get_user(&req.username).await.map_err(|e| Status::internal(e.to_string()))?
+            .ok_or(Status::not_found("User not found"))?;
+
+        repo.update_user_status(&req.username, user.is_active, &req.new_role).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // 2. Live Session Update (damit der User sich nicht neu einloggen muss)
+        self.sessions.update_session_role(&req.username, &req.new_role).await;
+
+        Ok(Response::new(ChangeRoleResponse { success: true, message: format!("Role changed to {}", req.new_role) }))
+    }
+
+    async fn get_mounts(&self, request: Request<GetMountsRequest>) -> Result<Response<GetMountsResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+
+        let mounts_list = self.manager.list_mounts(); // Gibt Strings zurück
+        let mut infos = Vec::new();
+
+        // Wir iterieren durch die Namen und raten/wissen den Typ (vereinfacht, da Manager keine Typ-Info exponiert)
+        // Für eine echte Implementation müsste DriverManager mehr Infos liefern.
+        // Hier simulieren wir es basierend auf dem Namen oder fragen Manager (wenn erweitert).
+        for m in mounts_list {
+            infos.push(MountInfo {
+                name: m.clone(),
+                type: if m == "primary" { "System DB" } else { "Mounted Storage" }.to_string(),
+                connection: "Hosted".to_string(), // Security: Connection String nicht leaken
+                is_connected: self.manager.get_repo(&m).is_some(),
+            });
+        }
+
+        Ok(Response::new(GetMountsResponse { mounts: infos }))
+    }
+
+    async fn add_mount(&self, request: Request<AddMountRequest>) -> Result<Response<AdminActionResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:sys")).await?;
+        let req = request.into_inner();
+
+        let db_type = match req.type.as_str() {
+            "sqlite" => DatabaseType::Sqlite,
+            "postgres" => DatabaseType::Postgres,
+            _ => return Err(Status::invalid_argument("Unknown DB Type")),
+        };
+
+        self.manager.mount(&req.name, &req.connection_string, db_type).await
+            .map_err(|e| Status::internal(format!("Mount failed: {}", e)))?;
+
+        Ok(Response::new(AdminActionResponse { success: true, message: "Database mounted".into() }))
+    }
+
+    async fn remove_mount(&self, request: Request<RemoveMountRequest>) -> Result<Response<AdminActionResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:sys")).await?;
+        // DriverManager braucht eine unmount methode (optional, für jetzt lassen wir es, oder implementieren es später)
+        // self.manager.unmount(&request.into_inner().name);
+        Err(Status::unimplemented("Unmount not yet supported in Driver Manager"))
     }
 }
 
