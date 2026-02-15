@@ -41,14 +41,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     io::stdin().read_line(&mut pubkey)?;
     let pubkey = pubkey.trim().to_string();
 
-    // 3. User erstellen (KORRIGIERT)
+    // 3. User erstellen (KORRIGIERT für RBAC)
     let new_user = User {
         username: username.clone(),
-        public_key: pubkey,
-        role_level: 100, // 100 = Admin
-        // FIX 1: Zeit als String (ISO 8601), da die DB TEXT erwartet
+        // Hex String zu Bytes konvertieren, falls nötig, oder direkt speichern
+        // Hinweis: In Core speichern wir Vec<u8>, hier kommt ein String.
+        // Wir nehmen an, dass 'pubkey' hier als Hex-String kommt und konvertieren ihn:
+        public_key: hex::decode(&pubkey).unwrap_or_else(|_| pubkey.as_bytes().to_vec()),
+
+        role: "admin".to_string(), // FIX: String-Rolle statt role_level: 100
+
         created_at: chrono::Utc::now().to_rfc3339(),
-        // FIX 2: Option<String>, da es NULL sein kann
         description: Some("Created via Admin CLI".to_string()),
         is_active: true,
     };

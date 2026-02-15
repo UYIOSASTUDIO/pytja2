@@ -25,3 +25,5 @@ serde_json = "1.0"
 tracing = "0.1"
 dashmap = "5.5" # Oder 6.0
 bytes = "1.5" # <-- FEHLTE
+
+redis = { version = "0.24", features = ["tokio-comp", "json"] }

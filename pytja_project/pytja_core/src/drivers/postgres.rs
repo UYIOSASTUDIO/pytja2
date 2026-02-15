@@ -38,7 +38,14 @@ impl PytjaRepository for PostgresDriver {
         sqlx::query("CREATE TABLE IF NOT EXISTS role_permissions (role_name TEXT REFERENCES roles(name) ON DELETE CASCADE, permission TEXT, PRIMARY KEY (role_name, permission))").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
 
         // User & Files
-        sqlx::query("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, public_key TEXT NOT NULL, description TEXT, role TEXT DEFAULT 'guest', is_active BOOLEAN, created_at TEXT)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL,
+            description TEXT,
+            role TEXT DEFAULT 'guest',
+            is_active BOOLEAN,
+            created_at TEXT
+        )").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         sqlx::query("CREATE TABLE IF NOT EXISTS file_system (path TEXT PRIMARY KEY, name TEXT, owner TEXT, is_folder BOOLEAN, content BYTEA, blob_id TEXT, lock_pass TEXT, permissions INTEGER DEFAULT 0, created_at DOUBLE PRECISION)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         sqlx::query("CREATE TABLE IF NOT EXISTS audit_logs (id SERIAL PRIMARY KEY, timestamp TEXT, actor TEXT, action TEXT, target TEXT)").execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
 

@@ -63,7 +63,7 @@ impl PytjaRepository for SqliteDriver {
                 username TEXT PRIMARY KEY,
                 public_key TEXT NOT NULL,
                 description TEXT,
-                role_level INTEGER,
+                role TEXT DEFAULT 'guest',
                 is_active BOOLEAN,
                 created_at TEXT
             )"

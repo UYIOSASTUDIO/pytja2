@@ -1,31 +1,39 @@
-use std::sync::Arc;
-use dashmap::DashMap;
+use redis::AsyncCommands; // Import für async Redis calls
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
+use std::sync::Arc;
+use pytja_core::models::Role;
+
+const SESSION_TTL: usize = 3600; // 1 Stunde
+const ROLE_CACHE_TTL: usize = 300; // 5 Minuten
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub session_id: String,
     pub username: String,
     pub ip_address: String,
-    pub role: String, // FIX: String statt i32
+    pub role: String,
     pub login_time: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
 }
 
 pub struct SessionManager {
-    sessions: Arc<DashMap<String, ActiveSession>>,
+    client: redis::Client,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(DashMap::new()),
-        }
+    pub async fn new(redis_url: &str) -> Result<Self, String> {
+        let client = redis::Client::open(redis_url).map_err(|e| e.to_string())?;
+        // Test connection
+        let mut con = client.get_async_connection().await.map_err(|e| format!("Redis connection failed: {}", e))?;
+        let _: () = redis::cmd("PING").query_async(&mut con).await.map_err(|e| e.to_string())?;
+
+        Ok(Self { client })
     }
 
-    // FIX: Signatur angepasst (role: &str)
-    pub fn register_session(&self, username: &str, role: &str, ip: &str) -> String {
+    // --- SESSION MANAGEMENT ---
+
+    pub async fn register_session(&self, username: &str, role: &str, ip: &str) -> Result<String, String> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
 
@@ -38,28 +46,78 @@ impl SessionManager {
             last_activity: now,
         };
 
-        self.sessions.insert(session_id.clone(), session);
-        tracing::info!("New session started: {} ({}) [{}]", username, session_id, role);
-        session_id
+        let json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+        let key = format!("session:{}", session_id);
+
+        let mut con = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
+        let _: () = con.set_ex(key, json, SESSION_TTL).await.map_err(|e| e.to_string())?;
+
+        tracing::info!("New Redis session: {} ({})", username, session_id);
+        Ok(session_id)
     }
 
-    pub fn update_activity(&self, session_id: &str) {
-        if let Some(mut session) = self.sessions.get_mut(session_id) {
-            session.last_activity = Utc::now();
+    pub async fn is_valid(&self, session_id: &str) -> bool {
+        let key = format!("session:{}", session_id);
+        if let Ok(mut con) = self.client.get_async_connection().await {
+            // Check Existenz UND aktualisiere TTL (Heartbeat)
+            let exists: bool = con.exists(&key).await.unwrap_or(false);
+            if exists {
+                let _: () = con.expire(&key, SESSION_TTL).await.unwrap_or(());
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn remove_session(&self, session_id: &str) {
+        let key = format!("session:{}", session_id);
+        if let Ok(mut con) = self.client.get_async_connection().await {
+            let _: () = con.del(&key).await.unwrap_or(());
         }
     }
 
-    pub fn remove_session(&self, session_id: &str) {
-        if self.sessions.remove(session_id).is_some() {
-            tracing::info!("Session terminated: {}", session_id);
+    // ACHTUNG: SCAN ist teuer, nur für Admin-Zwecke!
+    pub async fn get_all_sessions(&self) -> Vec<ActiveSession> {
+        let mut sessions = Vec::new();
+        if let Ok(mut con) = self.client.get_async_connection().await {
+            let mut iter: redis::AsyncIter<String> = con.scan_match("session:*").await.unwrap();
+
+            // Sammle Keys
+            let mut keys = Vec::new();
+            while let Some(key) = iter.next_item().await {
+                keys.push(key);
+            }
+
+            // Hole Values (MGET wäre besser, aber Loop ist ok für Admin Dashboard)
+            for key in keys {
+                if let Ok(json) = con.get::<_, String>(&key).await {
+                    if let Ok(sess) = serde_json::from_str::<ActiveSession>(&json) {
+                        sessions.push(sess);
+                    }
+                }
+            }
         }
+        sessions
     }
 
-    pub fn get_all_sessions(&self) -> Vec<ActiveSession> {
-        self.sessions.iter().map(|entry| entry.value().clone()).collect()
+    // --- PERMISSION CACHING (NEU) ---
+
+    pub async fn get_cached_role(&self, role_name: &str) -> Option<Role> {
+        let key = format!("cache:role:{}", role_name);
+        if let Ok(mut con) = self.client.get_async_connection().await {
+            if let Ok(json) = con.get::<_, String>(key).await {
+                return serde_json::from_str::<Role>(&json).ok();
+            }
+        }
+        None
     }
 
-    pub fn is_valid(&self, session_id: &str) -> bool {
-        self.sessions.contains_key(session_id)
+    pub async fn cache_role(&self, role: &Role) {
+        let key = format!("cache:role:{}", role.name);
+        if let Ok(json) = serde_json::to_string(role) {
+            if let Ok(mut con) = self.client.get_async_connection().await {
+                let _: () = con.set_ex(key, json, ROLE_CACHE_TTL).await.unwrap_or(());
+            }
+        }
     }
 }
