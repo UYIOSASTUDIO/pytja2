@@ -1,5 +1,5 @@
 use tonic::{transport::Server, Request, Response, Status};
-use tonic::metadata::MetadataMap; // Wichtig für den Fix
+use tonic::metadata::MetadataMap;
 
 use pytja_proto::{PytjaService, PytjaServiceServer};
 use pytja_proto::pytja::{
@@ -19,9 +19,11 @@ use pytja_proto::pytja::{
     ChallengeRequest, ChallengeResponse,
     LoginRequest, LoginResponse,
     GetSessionsRequest, GetSessionsResponse, KickUserRequest, SessionInfo,
+    // Admin Messages
     BanUserRequest, BanUserResponse,
     CreateRoleRequest, AddPermissionRequest, AssignRoleRequest, AdminActionResponse,
     ListRolesRequest, ListRolesResponse, RoleInfo,
+    // Database Management Messages
     ChangeRoleRequest, ChangeRoleResponse,
     GetMountsRequest, GetMountsResponse, MountInfo,
     AddMountRequest, RemoveMountRequest,
@@ -58,8 +60,6 @@ pub struct MyPytjaService {
 }
 
 impl MyPytjaService {
-    // FIX: Wir übergeben nur die MetadataMap, nicht den ganzen Request!
-    // Das verhindert Sync-Probleme bei Streaming-Requests.
     async fn check_permissions(&self, meta: &MetadataMap, required_perm: Option<&str>) -> Result<Claims, Status> {
         let token = match meta.get("authorization") {
             Some(t) => t.to_str().map_err(|_| Status::unauthenticated("Invalid Token format"))?,
@@ -179,6 +179,7 @@ impl PytjaService for MyPytjaService {
 
         let expiration = chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(60)).unwrap().timestamp() as usize;
 
+        // CLEANUP: Alte Sessions löschen
         self.sessions.clear_user_sessions(&user.username).await;
 
         let session_id = self.sessions.register_session(&user.username, &user.role, "127.0.0.1").await
@@ -199,7 +200,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn list_directory(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:fs:read")).await?; // Metadata übergeben!
+        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
@@ -226,7 +227,7 @@ impl PytjaService for MyPytjaService {
     }
 
     async fn upload_file(&self, request: Request<tonic::Streaming<UploadRequest>>) -> Result<Response<ActionResponse>, Status> {
-        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?; // Metadata!
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let mut stream = request.into_inner();
 
         let first_msg = stream.message().await.map_err(|e| Status::internal(e.to_string()))?;
@@ -556,17 +557,9 @@ impl PytjaService for MyPytjaService {
 
     async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
-
         let sessions: Vec<_> = self.sessions.get_all_sessions().await.into_iter().map(|s| SessionInfo {
-            session_id: s.session_id,
-            username: s.username,
-            ip_address: s.ip_address,
-            role_level: 0,
-            login_time: s.login_time.to_rfc3339(),
-            last_activity: s.last_activity.to_rfc3339(),
-            role: s.role // NEU: Rolle aus Redis übernehmen
+            session_id: s.session_id, username: s.username, ip_address: s.ip_address, role_level: 0, login_time: s.login_time.to_rfc3339(), last_activity: s.last_activity.to_rfc3339(), role: s.role // NEU: Rolle aus Redis übernehmen
         }).collect();
-
         let total = sessions.len() as i32;
         Ok(Response::new(GetSessionsResponse { sessions, total_active: total }))
     }
@@ -574,7 +567,7 @@ impl PytjaService for MyPytjaService {
     async fn kick_user(&self, request: Request<KickUserRequest>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
         let req = request.into_inner();
-        self.sessions.remove_session(&req.session_id).await; // ASYNC
+        self.sessions.remove_session(&req.session_id).await;
         if let Some(primary) = self.manager.get_repo("primary") { let _ = primary.log_action(&claims.sub, "KICK", &req.session_id).await; }
         Ok(Response::new(ActionResponse { success: true, message: "User session terminated.".into() }))
     }
@@ -585,41 +578,35 @@ impl PytjaService for MyPytjaService {
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
 
         // 1. User Status in DB ändern
-        // Wir müssen die aktuelle Rolle holen, um sie nicht zu überschreiben
         let user = repo.get_user(&req.username).await.map_err(|e| Status::internal(e.to_string()))?
             .ok_or(Status::not_found("User not found"))?;
 
-        let new_active_status = !req.ban; // Ban = true -> Active = false
+        let new_active_status = !req.ban;
         repo.update_user_status(&req.username, new_active_status, &user.role).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // 2. Wenn Ban, alle aktiven Sessions kicken
         if req.ban {
-            let all_sessions = self.sessions.get_all_sessions().await;
-            for s in all_sessions {
-                if s.username == req.username {
-                    self.sessions.remove_session(&s.session_id).await;
-                }
-            }
+            self.sessions.clear_user_sessions(&req.username).await;
         }
 
         let msg = if req.ban { "User banned and sessions terminated." } else { "User unbanned." };
         Ok(Response::new(BanUserResponse { success: true, message: msg.into() }))
     }
 
+    // --- DATABASE MANAGEMENT RPCS ---
+
     async fn change_user_role(&self, request: Request<ChangeRoleRequest>) -> Result<Response<ChangeRoleResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").ok_or(Status::internal("DB Error"))?;
 
-        // 1. DB Update
         let user = repo.get_user(&req.username).await.map_err(|e| Status::internal(e.to_string()))?
             .ok_or(Status::not_found("User not found"))?;
 
         repo.update_user_status(&req.username, user.is_active, &req.new_role).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // 2. Live Session Update (damit der User sich nicht neu einloggen muss)
         self.sessions.update_session_role(&req.username, &req.new_role).await;
 
         Ok(Response::new(ChangeRoleResponse { success: true, message: format!("Role changed to {}", req.new_role) }))
@@ -628,17 +615,14 @@ impl PytjaService for MyPytjaService {
     async fn get_mounts(&self, request: Request<GetMountsRequest>) -> Result<Response<GetMountsResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
 
-        let mounts_list = self.manager.list_mounts(); // Gibt Strings zurück
+        let mounts_list = self.manager.list_mounts();
         let mut infos = Vec::new();
 
-        // Wir iterieren durch die Namen und raten/wissen den Typ (vereinfacht, da Manager keine Typ-Info exponiert)
-        // Für eine echte Implementation müsste DriverManager mehr Infos liefern.
-        // Hier simulieren wir es basierend auf dem Namen oder fragen Manager (wenn erweitert).
         for m in mounts_list {
             infos.push(MountInfo {
                 name: m.clone(),
-                type: if m == "primary" { "System DB" } else { "Mounted Storage" }.to_string(),
-                connection: "Hosted".to_string(), // Security: Connection String nicht leaken
+                r#type: if m == "primary" { "System DB" } else { "Mounted Storage" }.to_string(), // r#type statt type
+                connection: "Hosted".to_string(),
                 is_connected: self.manager.get_repo(&m).is_some(),
             });
         }
@@ -650,7 +634,7 @@ impl PytjaService for MyPytjaService {
         self.check_permissions(request.metadata(), Some("core:admin:sys")).await?;
         let req = request.into_inner();
 
-        let db_type = match req.type.as_str() {
+        let db_type = match req.r#type.as_str() { // r#type
             "sqlite" => DatabaseType::Sqlite,
             "postgres" => DatabaseType::Postgres,
             _ => return Err(Status::invalid_argument("Unknown DB Type")),
@@ -664,8 +648,7 @@ impl PytjaService for MyPytjaService {
 
     async fn remove_mount(&self, request: Request<RemoveMountRequest>) -> Result<Response<AdminActionResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:sys")).await?;
-        // DriverManager braucht eine unmount methode (optional, für jetzt lassen wir es, oder implementieren es später)
-        // self.manager.unmount(&request.into_inner().name);
+        // self.manager.unmount(&request.into_inner().name); // Noch nicht in Core implementiert
         Err(Status::unimplemented("Unmount not yet supported in Driver Manager"))
     }
 }

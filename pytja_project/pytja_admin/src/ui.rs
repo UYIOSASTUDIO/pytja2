@@ -1,9 +1,7 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    // FIX: 'Stylize' hinzugefügt für .yellow().bold()
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    // FIX: 'TableState' entfernt (wurde nicht genutzt)
     widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Row, Table, Cell, Clear},
     Frame,
 };
@@ -26,12 +24,19 @@ pub fn draw(f: &mut Frame, app: &App) {
         CurrentTab::Dashboard => draw_dashboard(f, app, chunks[1]),
         CurrentTab::Sessions => draw_sessions(f, app, chunks[1]),
         CurrentTab::Roles => draw_roles(f, app, chunks[1]),
-        CurrentTab::Databases => draw_databases(f, app, chunks[1]),
+        CurrentTab::Databases => draw_databases(f, app, chunks[1]), // NEU
     }
 
-    // Popup Layer (muss als letztes gezeichnet werden, damit es oben liegt)
+    // --- POPUP LAYER ---
+
+    // 1. User Action Menu
     if app.active_popup == crate::app::PopupType::UserActions {
         draw_user_popup(f, app);
+    }
+
+    // 2. Input Field (z.B. für Role Change)
+    if app.active_popup == crate::app::PopupType::ChangeRoleInput {
+        draw_input_popup(f, app, "Enter new Role Name:");
     }
 
     let status = Paragraph::new(format!("Status: {}", app.status_message))
@@ -60,20 +65,12 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(format!("Active Sessions: {}", app.total_active)),
         Line::from(format!("Defined Roles:   {}", app.roles.len())),
+        Line::from(format!("Mounted DBs:     {}", app.mounts.len())),
         Line::from(""),
         Line::from(vec![Span::styled("CONTROLS:", Style::default().add_modifier(Modifier::UNDERLINED))]),
-        Line::from("  [1] Dashboard"),
-        Line::from("  [2] Sessions List  (Manage Users)"),
-        Line::from("  [3] RBAC Roles     (Manage Permissions)"),
-        Line::from(""),
-        Line::from(vec![Span::styled("ACTIONS:", Style::default().add_modifier(Modifier::UNDERLINED))]),
-        Line::from("  [r] Refresh Data"),
-        Line::from("  [q] Quit"),
-        Line::from(""),
-        Line::from(vec![Span::styled("HOW TO KICK/BAN:", Style::default().fg(Color::Green))]),
-        Line::from("  1. Go to 'Sessions' [2]"),
-        Line::from("  2. Select a user with Up/Down"),
-        Line::from("  3. Press [ENTER] to open Action Menu"),
+        Line::from("  [1-4] Switch Tabs"),
+        Line::from("  [r]   Refresh Data"),
+        Line::from("  [q]   Quit"),
     ];
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Overview"));
     f.render_widget(p, area);
@@ -104,7 +101,7 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(10), Constraint::Min(20)
     ])
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title("Active Sessions (Up/Down to select, Enter to act)"));
+        .block(Block::default().borders(Borders::ALL).title("Active Sessions (Enter to manage)"));
 
     f.render_widget(table, area);
 }
@@ -121,28 +118,7 @@ fn draw_roles(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_user_popup(f: &mut Frame, app: &App) {
-    let block = Block::default().title("User Actions").borders(Borders::ALL).style(Style::default().bg(Color::DarkGray));
-    let area = centered_rect(60, 20, f.size());
-
-    let session = &app.sessions[app.selected_session_index];
-
-    // Hier nutzen wir jetzt .yellow().bold(), was dank 'use ... Stylize' funktioniert
-    let text = vec![
-        Line::from(format!("Selected User: {}", session.username).yellow().bold()),
-        Line::from(""),
-        Line::from("[K] Kick Session"),
-        Line::from("[B] Ban User (Kick & Lock)"),
-        Line::from(""),
-        Line::from("[Esc] Cancel"),
-    ];
-
-    let p = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Center);
-
-    f.render_widget(Clear, area); // Hintergrund löschen (Transparenz-Effekt)
-    f.render_widget(p, area);
-}
-
+// NEU: Database Tab
 fn draw_databases(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec!["Name", "Type", "Status"])
         .style(Style::default().fg(Color::Yellow));
@@ -150,7 +126,8 @@ fn draw_databases(f: &mut Frame, app: &App, area: Rect) {
     let rows: Vec<Row> = app.mounts.iter().map(|m| {
         Row::new(vec![
             Cell::from(m.name.clone()),
-            Cell::from(m.type.clone()),
+            // FIX: 'type' ist Keyword, daher r#type nutzen (Prost generiert das so)
+            Cell::from(m.r#type.clone()),
             if m.is_connected {
                 Cell::from("CONNECTED").style(Style::default().fg(Color::Green))
             } else {
@@ -161,8 +138,46 @@ fn draw_databases(f: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title("Connected Databases (Press 'a' to add)"));
+        .block(Block::default().borders(Borders::ALL).title("Connected Databases"));
     f.render_widget(table, area);
+}
+
+fn draw_user_popup(f: &mut Frame, app: &App) {
+    let block = Block::default().title("User Actions").borders(Borders::ALL).style(Style::default().bg(Color::DarkGray));
+    let area = centered_rect(60, 25, f.size());
+
+    if app.sessions.is_empty() { return; }
+    let session = &app.sessions[app.selected_session_index];
+
+    let text = vec![
+        Line::from(format!("User: {}", session.username).yellow().bold()),
+        Line::from(format!("Role: {}", session.role)),
+        Line::from(""),
+        Line::from("[R] Change Role (Set Admin/Editor...)"),
+        Line::from("[K] Kick Session (Force Logout)"),
+        Line::from("[B] Ban User (Deactivate Account)"),
+        Line::from(""),
+        Line::from("[Esc] Cancel"),
+    ];
+
+    let p = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(Clear, area);
+    f.render_widget(p, area);
+}
+
+// NEU: Generisches Input Popup
+fn draw_input_popup(f: &mut Frame, app: &App, title: &str) {
+    let block = Block::default().title(title).borders(Borders::ALL).style(Style::default().bg(Color::Blue));
+    let area = centered_rect(50, 10, f.size()); // Kleines Fenster
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(app.input_buffer.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+    ];
+
+    let p = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(Clear, area);
+    f.render_widget(p, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

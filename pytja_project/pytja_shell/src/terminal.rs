@@ -122,26 +122,32 @@ impl Terminal {
                 println!("\n{}", "PYTJA SHELL MANUAL V2.0".white().bold());
                 println!("{}", "=".repeat(60));
                 println!("\n{}", "[ FILE OPERATIONS ]".cyan());
-                println!("{:<10} : {:<30}", "ls", "List [-a] [-s DATE/SIZE/NAME/EXT] [-r]");
+                println!("{:<10} : {:<30}", "ls", "List [-a] [-s DATE/SIZE/NAME] [-r]");
                 println!("{:<10} : {:<30}", "cd", "Change directory");
                 println!("{:<10} : {:<30}", "mkdir", "Create dir [-lock]");
                 println!("{:<10} : {:<30}", "touch", "Create file [-lock]");
-                println!("{:<10} : {:<30}", "cp", "Copy file");
-                println!("{:<10} : {:<30}", "mv", "Move/Rename [-lock]");
+                println!("{:<10} : {:<30}", "cp", "Copy file <src> <dst>");
+                println!("{:<10} : {:<30}", "mv", "Move/Rename <src> <dst>");
                 println!("{:<10} : {:<30}", "rm", "Delete file/folder");
                 println!("{:<10} : {:<30}", "nano", "Edit file");
                 println!("{:<10} : {:<30}", "cat", "Read file");
+                println!("\n{}", "[ SECURITY & PERMISSIONS ]".cyan());
+                println!("{:<10} : {:<30}", "chmod", "Change Mode <0|1|2> <file>");
+                println!("{:<10} : {:<30}", "chown", "Change Owner <user> <file>");
+                println!("{:<10} : {:<30}", "lock", "Set/Change Password <file>");
                 println!("\n{}", "[ INTELLIGENCE ]".cyan());
-                println!("{:<10} : {:<30}", "tree", "Show structure");
-                println!("{:<10} : {:<30}", "find", "Find by name");
-                println!("{:<10} : {:<30}", "grep", "Search content");
-                println!("{:<10} : {:<30}", "du", "Disk usage");
+                println!("{:<10} : {:<30}", "tree", "Show structure [path]");
+                println!("{:<10} : {:<30}", "stat", "Show node details <file>");
+                println!("{:<10} : {:<30}", "find", "Find by name <pattern>");
+                println!("{:<10} : {:<30}", "grep", "Search content <pattern>");
+                println!("{:<10} : {:<30}", "du", "Disk usage / Quota");
                 println!("\n{}", "[ NETWORK ]".cyan());
                 println!("{:<10} : {:<30}", "upload", "Import from Host [-lock]");
                 println!("{:<10} : {:<30}", "download", "Export to Host");
                 println!("{}", "=".repeat(60));
             },
             "clear" => self.print_banner(),
+            "whoami" => println!("{}", self.user_id.green().bold()),
 
             "ls" => {
                 let show_hidden = args.contains(&"-a") || args.contains(&"-sh");
@@ -312,6 +318,28 @@ impl Terminal {
                 }
             },
 
+            "cp" => {
+                if args.len() < 2 { println!("Usage: cp <source> <dest>"); return true; }
+                let src_path = self.vfs.lock().await.resolve_path(args[0]);
+                let dst_path = self.vfs.lock().await.resolve_path(args[1]);
+
+                match self.client.copy_node(&src_path, &dst_path).await {
+                    Ok(msg) => println!("{}", msg.green()),
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "mv" => {
+                if args.len() < 2 { println!("Usage: mv <source> <dest>"); return true; }
+                let src_path = self.vfs.lock().await.resolve_path(args[0]);
+                let dst_path = self.vfs.lock().await.resolve_path(args[1]);
+
+                match self.client.move_node(&src_path, &dst_path).await {
+                    Ok(msg) => println!("{}", msg.green()),
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
             "rm" => {
                 if args.is_empty() { println!("Usage: rm <name>"); return true; }
                 let full_path = self.vfs.lock().await.resolve_path(args[0]);
@@ -436,6 +464,115 @@ impl Terminal {
                 println!("{}", "[!] EXECUTING REMOTE KERNEL...".yellow());
                 if let Err(e) = self.client.exec_script(&path).await {
                     println!("{}", e.to_string().red());
+                }
+            },
+
+            // --- SECURITY & PERMISSIONS ---
+
+            "chmod" => {
+                if args.len() < 2 { println!("Usage: chmod <0|1|2> <file>\n0=Private, 1=PubRead, 2=PubWrite"); return true; }
+                let perm_val: i32 = args[0].parse().unwrap_or(-1);
+                if perm_val < 0 || perm_val > 2 { println!("Invalid mode. Use 0, 1 or 2."); return true; }
+
+                let full_path = self.vfs.lock().await.resolve_path(args[1]);
+                match self.client.change_mode(&full_path, perm_val).await {
+                    Ok(msg) => println!("{}", msg.green()),
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "chown" => {
+                if args.len() < 2 { println!("Usage: chown <new_owner> <file>"); return true; }
+                let new_owner = args[0];
+                let full_path = self.vfs.lock().await.resolve_path(args[1]);
+
+                match self.client.chown_node(&full_path, new_owner).await {
+                    Ok(msg) => println!("{}", msg.green()),
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "lock" => {
+                if args.is_empty() { println!("Usage: lock <file>"); return true; }
+                let full_path = self.vfs.lock().await.resolve_path(args[0]);
+
+                let p1 = self.ask_password("Enter new Password (leave empty to unlock): ");
+                if !p1.is_empty() {
+                    let p2 = self.ask_password("Confirm Password: ");
+                    if p1 != p2 { println!("{}", "Passwords do not match.".red()); return true; }
+                }
+
+                match self.client.lock_node(&full_path, &p1).await {
+                    Ok(msg) => println!("{}", msg.green()),
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            // --- INTELLIGENCE ---
+
+            "tree" => {
+                let path = if args.is_empty() { "." } else { args[0] };
+                let full_path = self.vfs.lock().await.resolve_path(path);
+
+                match self.client.get_tree(&full_path).await {
+                    Ok(tree_str) => println!("{}", tree_str.cyan()),
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "stat" => {
+                if args.is_empty() { println!("Usage: stat <file>"); return true; }
+                let full_path = self.vfs.lock().await.resolve_path(args[0]);
+
+                match self.client.stat_node(&full_path).await {
+                    Ok((exists, is_folder, is_locked)) => {
+                        println!("{}", "--- NODE STATUS ---".yellow());
+                        println!("Path:   {}", full_path);
+                        println!("Exists: {}", exists);
+                        println!("Type:   {}", if is_folder { "Directory" } else { "File" });
+                        println!("Locked: {}", if is_locked { "YES (Encrypted)" } else { "NO" });
+                    },
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "find" => {
+                if args.is_empty() { println!("Usage: find <pattern>"); return true; }
+                let pattern = args[0];
+
+                match self.client.find_node(pattern).await {
+                    Ok(paths) => {
+                        println!("Found {} matches:", paths.len());
+                        for p in paths { println!(" - {}", p.cyan()); }
+                    },
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "grep" => {
+                if args.is_empty() { println!("Usage: grep <content_pattern>"); return true; }
+                let pattern = args[0];
+
+                match self.client.grep_node(pattern).await {
+                    Ok(matches) => {
+                        println!("Found content in {} files:", matches.len());
+                        for m in matches { println!(" - {}", m.green()); }
+                    },
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
+            },
+
+            "du" => {
+                // Disk Usage / Quota für den aktuellen User
+                match self.client.get_usage(&self.user_id).await {
+                    Ok(bytes) => {
+                        let mb = bytes as f64 / 1024.0 / 1024.0;
+                        let gb = mb / 1024.0;
+                        println!("Disk Usage for {}:", self.user_id.yellow());
+                        println!("  {:.2} MB", mb);
+                        println!("  {:.4} GB", gb);
+                    },
+                    Err(e) => println!("{}", e.to_string().red()),
                 }
             },
 
