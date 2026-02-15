@@ -30,6 +30,34 @@ impl SqliteDriver {
 #[async_trait]
 impl PytjaRepository for SqliteDriver {
     async fn init(&self) -> Result<(), PytjaError> {
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles (
+                name TEXT PRIMARY KEY
+            )"
+        ).execute(&self.pool).await.map_err(PytjaError::SqlxError)?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS role_permissions (
+                role_name TEXT,
+                permission TEXT,
+                PRIMARY KEY (role_name, permission),
+                FOREIGN KEY(role_name) REFERENCES roles(name) ON DELETE CASCADE
+            )"
+        ).execute(&self.pool).await.map_err(PytjaError::SqlxError)?;
+
+        // Default Rollen anlegen, falls leer
+        let count: i32 = sqlx::query_scalar("SELECT COUNT(*) FROM roles").fetch_one(&self.pool).await.unwrap_or(0);
+        if count == 0 {
+            // Admin Rolle
+            sqlx::query("INSERT INTO roles (name) VALUES ('admin')").execute(&self.pool).await.ok();
+            sqlx::query("INSERT INTO role_permissions (role_name, permission) VALUES ('admin', '*')").execute(&self.pool).await.ok();
+
+            // Guest Rolle
+            sqlx::query("INSERT INTO roles (name) VALUES ('guest')").execute(&self.pool).await.ok();
+            sqlx::query("INSERT INTO role_permissions (role_name, permission) VALUES ('guest', 'core:read')").execute(&self.pool).await.ok();
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
@@ -86,7 +114,7 @@ impl PytjaRepository for SqliteDriver {
                 username: r.try_get("username").unwrap_or_default(),
                 public_key: r.try_get("public_key").unwrap_or_default(),
                 description: r.try_get("description").ok(),
-                role_level: r.try_get("role_level").unwrap_or(0),
+                role: r.try_get("role").unwrap_or("guest".to_string()),
                 is_active: r.try_get("is_active").unwrap_or(true),
                 created_at: r.try_get("created_at").unwrap_or_default(),
             }))
@@ -104,7 +132,7 @@ impl PytjaRepository for SqliteDriver {
             username: r.try_get("username").unwrap_or_default(),
             public_key: r.try_get("public_key").unwrap_or_default(),
             description: r.try_get("description").ok(),
-            role_level: r.try_get("role_level").unwrap_or(0),
+            role: r.try_get("role").unwrap_or("guest".to_string()),
             is_active: r.try_get("is_active").unwrap_or(true),
             created_at: r.try_get("created_at").unwrap_or_default(),
         }).collect())
@@ -113,6 +141,58 @@ impl PytjaRepository for SqliteDriver {
     async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError> {
         sqlx::query("UPDATE users SET is_active = ?, role_level = ? WHERE username = ?").bind(is_active).bind(role_level).bind(username).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
+    }
+
+    async fn create_role(&self, role: &Role) -> Result<(), PytjaError> {
+        let mut tx = self.pool.begin().await.map_err(PytjaError::SqlxError)?;
+
+        sqlx::query("INSERT OR IGNORE INTO roles (name) VALUES (?)")
+            .bind(&role.name)
+            .execute(&mut *tx).await.map_err(PytjaError::SqlxError)?;
+
+        // Permissions löschen und neu setzen (einfachste Update-Logik)
+        sqlx::query("DELETE FROM role_permissions WHERE role_name = ?")
+            .bind(&role.name)
+            .execute(&mut *tx).await.map_err(PytjaError::SqlxError)?;
+
+        for perm in &role.permissions {
+            sqlx::query("INSERT INTO role_permissions (role_name, permission) VALUES (?, ?)")
+                .bind(&role.name).bind(perm)
+                .execute(&mut *tx).await.map_err(PytjaError::SqlxError)?;
+        }
+
+        tx.commit().await.map_err(PytjaError::SqlxError)?;
+        Ok(())
+    }
+
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, PytjaError> {
+        let role_exists: Option<String> = sqlx::query_scalar("SELECT name FROM roles WHERE name = ?")
+            .bind(name).fetch_optional(&self.pool).await.map_err(PytjaError::SqlxError)?;
+
+        if role_exists.is_none() { return Ok(None); }
+
+        let perms: Vec<String> = sqlx::query_scalar("SELECT permission FROM role_permissions WHERE role_name = ?")
+            .bind(name).fetch_all(&self.pool).await.map_err(PytjaError::SqlxError)?;
+
+        Ok(Some(Role {
+            name: name.to_string(),
+            permissions: perms,
+        }))
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>, PytjaError> {
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM roles").fetch_all(&self.pool).await.map_err(PytjaError::SqlxError)?;
+        let mut roles = Vec::new();
+        for name in names {
+            if let Ok(Some(r)) = self.get_role(&name).await {
+                roles.push(r);
+            }
+        }
+        Ok(roles)
+    }
+
+    async fn update_role_permissions(&self, role_name: &str, permissions: Vec<String>) -> Result<(), PytjaError> {
+        self.create_role(&Role { name: role_name.to_string(), permissions }).await
     }
 
     // --- FILES ---

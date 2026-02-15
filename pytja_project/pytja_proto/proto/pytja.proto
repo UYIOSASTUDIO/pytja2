@@ -25,6 +25,10 @@ service PytjaService {
     rpc Login (LoginRequest) returns (LoginResponse); // Schritt
     rpc GetActiveSessions (GetSessionsRequest) returns (GetSessionsResponse);
     rpc KickUser (KickUserRequest) returns (ActionResponse);
+    rpc CreateRole (CreateRoleRequest) returns (AdminActionResponse);
+    rpc AddPermission (AddPermissionRequest) returns (AdminActionResponse);
+    rpc AssignRole (AssignRoleRequest) returns (AdminActionResponse);
+    rpc ListRoles (ListRolesRequest) returns (ListRolesResponse);
 }
 
 // --- Messages (Datenpakete) ---
@@ -233,4 +237,36 @@ message GetSessionsResponse {
 message KickUserRequest {
     string session_id = 1;
     string reason = 2;
+}
+
+// --- RBAC MANAGEMENT (ADMIN ONLY) ---
+
+message CreateRoleRequest {
+    string name = 1;
+}
+
+message AddPermissionRequest {
+    string role_name = 1;
+    string permission = 2; // z.B. "core:fs:write" oder "chat:send"
+}
+
+message AssignRoleRequest {
+    string username = 1;
+    string role_name = 2;
+}
+
+message AdminActionResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ListRolesRequest {}
+
+message RoleInfo {
+    string name = 1;
+    repeated string permissions = 2;
+}
+
+message ListRolesResponse {
+    repeated RoleInfo roles = 1;
 }

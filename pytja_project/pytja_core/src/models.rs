@@ -1,11 +1,20 @@
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Deserialize};
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Role {
+    pub name: String,        // z.B. "admin", "editor", "guest"
+    pub permissions: Vec<String>, // z.B. ["core:fs:read", "core:upload"]
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub username: String,
-    pub public_key: String,
+    pub public_key: Vec<u8>,
     pub description: Option<String>,
-    pub role_level: i32,
+
+    pub role: String,
+
     pub is_active: bool,
     pub created_at: String,
 }
@@ -31,9 +40,10 @@ pub struct FileNode {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,       // Username
-    pub role_level: i32,   // ÄNDERUNG: Zahl statt String (z.B. 100 = Admin)
-    pub exp: usize,        // Expiration
+    pub sub: String,
+    pub role: String,
+    pub permissions: HashSet<String>,
+    pub exp: usize,
     pub sid: Option<String>,
 }
 

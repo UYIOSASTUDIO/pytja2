@@ -14,6 +14,12 @@ pub trait PytjaRepository: Send + Sync {
     async fn get_all_users(&self) -> Result<Vec<User>, PytjaError>;
     async fn update_user_status(&self, username: &str, is_active: bool, role_level: i32) -> Result<(), PytjaError>;
 
+    // --- RBAC ---
+    async fn create_role(&self, role: &Role) -> Result<(), PytjaError>;
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, PytjaError>;
+    async fn list_roles(&self) -> Result<Vec<Role>, PytjaError>;
+    async fn update_role_permissions(&self, role_name: &str, permissions: Vec<String>) -> Result<(), PytjaError>;
+
     // File System Ops
     async fn save_node(&self, node: &FileNode) -> Result<(), PytjaError>;
     async fn get_node(&self, path: &str) -> Result<Option<FileNode>, PytjaError>;

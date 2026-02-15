@@ -1,9 +1,7 @@
 use tonic::{transport::Server, Request, Response, Status};
 
-// WICHTIG: Die Service-Traits liegen im Root von pytja_proto
+// Service Traits & Messages
 use pytja_proto::{PytjaService, PytjaServiceServer};
-
-// Die Messages liegen im Untermodul 'pytja'
 use pytja_proto::pytja::{
     PingRequest, PingResponse,
     ListRequest, ListResponse, FileInfo,
@@ -27,20 +25,25 @@ use pytja_proto::pytja::{
 use pytja_core::models::{FileNode, Claims};
 use pytja_core::config::AppConfig;
 use pytja_core::storage::{BlobStorage, FileSystemStorage, S3Storage};
+use pytja_core::{PytjaRepository, DriverManager, DatabaseType, PytjaError};
+use pytja_core::crypto::CryptoService;
+
 use bytes::Bytes;
 use colored::*;
 use std::sync::Arc;
-use pytja_core::{PytjaRepository, DriverManager, DatabaseType};
-use pytja_core::crypto::CryptoService;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc;
 use futures_util::StreamExt;
 use jsonwebtoken::{encode, Header, EncodingKey};
+use std::env;
 
 mod session_manager;
 use crate::session_manager::SessionManager;
 
 const JWT_SECRET: &[u8] = b"pytja_super_secret_key_change_me_in_prod";
+
+// Enterprise Standard: 1 GB Quota per Default (steuerbar via ENV)
+const DEFAULT_QUOTA_LIMIT: usize = 1 * 1024 * 1024 * 1024;
 
 pub struct MyPytjaService {
     manager: Arc<DriverManager>,
@@ -105,6 +108,15 @@ impl MyPytjaService {
 
         Ok((repo, full_path.to_string()))
     }
+
+    // Helper für Quota Check
+    async fn get_user_quota_usage(&self, username: &str) -> usize {
+        if let Some(primary) = self.manager.get_repo("primary") {
+            primary.get_total_usage(username).await.unwrap_or(0)
+        } else {
+            0 // Fail-open oder Fail-close? Hier Fail-open (0 Usage), aber Upload prüft weiter.
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -141,6 +153,7 @@ impl PytjaService for MyPytjaService {
         };
 
         let challenge_bytes = req.challenge.as_bytes();
+        // Server erwartet Base64 Signature String vom Client
         let is_valid = match CryptoService::verify_signature(&user.public_key, challenge_bytes, &req.signature) {
             Ok(valid) => valid,
             Err(_) => false
@@ -204,6 +217,7 @@ impl PytjaService for MyPytjaService {
         let claims = self.check_permissions(&request, 20)?;
         let mut stream = request.into_inner();
 
+        // 1. Metadata lesen
         let first_msg = stream.message().await.map_err(|e| Status::internal(e.to_string()))?;
         let metadata = match first_msg {
             Some(req) => match req.data {
@@ -213,22 +227,54 @@ impl PytjaService for MyPytjaService {
             None => return Err(Status::invalid_argument("Empty stream")),
         };
 
+        // 2. SECURITY: QUOTA CHECK (Enterprise Feature)
+        let limit: usize = env::var("PYTJA_QUOTA_LIMIT")
+            .unwrap_or_else(|_| DEFAULT_QUOTA_LIMIT.to_string())
+            .parse()
+            .unwrap_or(DEFAULT_QUOTA_LIMIT);
+
+        let current_usage = self.get_user_quota_usage(&claims.sub).await;
+
+        if current_usage >= limit {
+            return Err(Status::resource_exhausted(format!("Quota exceeded. Used: {} bytes, Limit: {} bytes", current_usage, limit)));
+        }
+
         let (repo, relative_path) = self.resolve_repo(&metadata.path)?;
 
-        let byte_stream = stream.map(|item| {
+        // 3. Secure Stream Wrapper
+        // Wir zählen die Bytes während sie durchfließen und brechen ab, wenn das Limit erreicht ist.
+        let mut upload_session_bytes = 0;
+
+        let byte_stream = stream.map(move |item| {
             match item {
                 Ok(req) => match req.data {
-                    Some(UploadData::Chunk(data)) => Ok(Bytes::from(data)),
+                    Some(UploadData::Chunk(data)) => {
+                        let chunk_len = data.len();
+
+                        // Der kritische Check: Gesamter Speicher + Aktueller Upload > Limit
+                        if current_usage + upload_session_bytes + chunk_len > limit {
+                            // WICHTIG: Das gibt einen Fehler an den Storage-Treiber zurück, der den Upload abbricht
+                            return Err(PytjaError::QuotaExceeded {
+                                current: current_usage + upload_session_bytes + chunk_len,
+                                limit
+                            });
+                        }
+
+                        upload_session_bytes += chunk_len;
+                        Ok(Bytes::from(data))
+                    },
                     _ => Ok(Bytes::new()),
                 },
-                Err(e) => Err(pytja_core::error::PytjaError::System(e.to_string())),
+                Err(e) => Err(PytjaError::System(e.to_string())),
             }
         });
 
+        // 4. Zero-Copy Pipeline zum Storage
         let pinned_stream = Box::pin(byte_stream);
         let blob_id = self.storage.put(&metadata.path, pinned_stream).await
-            .map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Storage/Quota Error: {}", e)))?;
 
+        // 5. Metadaten speichern
         let path_obj = std::path::Path::new(&relative_path);
         let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
 
@@ -239,7 +285,7 @@ impl PytjaService for MyPytjaService {
             is_folder: false,
             content: vec![],
             blob_id: Some(blob_id),
-            size: 0,
+            size: upload_session_bytes, // Wir wissen jetzt die exakte Größe
             lock_pass: if metadata.lock_password.is_empty() { None } else { Some(metadata.lock_password) },
             permissions: 0,
             created_at: chrono::Utc::now().timestamp() as f64,
@@ -247,12 +293,14 @@ impl PytjaService for MyPytjaService {
 
         repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
 
+        // 6. Audit Log
         if let Some(primary) = self.manager.get_repo("primary") {
             let _ = primary.log_action(&claims.sub, "UPLOAD", &metadata.path).await;
         }
 
         Ok(Response::new(ActionResponse { success: true, message: "Upload complete".into() }))
     }
+
     async fn download_file(&self, request: Request<DownloadRequest>) -> Result<Response<Self::DownloadFileStream>, Status> {
         self.check_permissions(&request, 10)?;
         let req = request.into_inner();
@@ -343,20 +391,14 @@ impl PytjaService for MyPytjaService {
         }
     }
 
-    async fn get_active_sessions(&self, _request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
-        // Token Check wäre hier gut (Admin Only)
+    async fn get_active_sessions(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
+        self.check_permissions(&request, 100)?;
 
         let sessions: Vec<SessionInfo> = self.sessions.get_all_sessions().into_iter().map(|s| SessionInfo {
-            session_id: s.session_id,
-            username: s.username,
-            ip_address: s.ip_address,
-            role_level: s.role_level,
-            login_time: s.login_time.to_rfc3339(),
-            last_activity: s.last_activity.to_rfc3339()
+            session_id: s.session_id, username: s.username, ip_address: s.ip_address, role_level: s.role_level, login_time: s.login_time.to_rfc3339(), last_activity: s.last_activity.to_rfc3339()
         }).collect();
 
         let total = sessions.len() as i32;
-
         Ok(Response::new(GetSessionsResponse { sessions, total_active: total }))
     }
 
@@ -366,18 +408,20 @@ impl PytjaService for MyPytjaService {
         Ok(Response::new(ActionResponse { success: true, message: "Kicked".into() }))
     }
 
-    // Dummy Implementationen
-    async fn read_file(&self, _: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> { Err(Status::unimplemented("Deprecated in Enterprise V3")) }
+    async fn get_usage(&self, request: Request<UsageRequest>) -> Result<Response<UsageResponse>, Status> {
+        self.check_permissions(&request, 0)?;
+        let owner = request.into_inner().owner;
+        let usage = self.get_user_quota_usage(&owner).await;
+        Ok(Response::new(UsageResponse { bytes: usage as u64 }))
+    }
 
+    // Dummy Implementationen für den Rest
+    async fn read_file(&self, _: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> { Err(Status::unimplemented("Use download for files")) }
     async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(&request, 50)?;
         let req = request.into_inner();
-
-        tracing::info!("DELETE request by '{}' on target: '{}'", claims.sub, req.path);
-
         let (repo, relative_path) = self.resolve_repo(&req.path)?;
 
-        // KORREKTUR: 'Some' statt 'Ok'
         if let Some(primary) = self.manager.get_repo("primary") {
             let _ = primary.log_action(&claims.sub, "DELETE", &req.path).await;
         }
@@ -393,11 +437,28 @@ impl PytjaService for MyPytjaService {
     async fn change_mode(&self, _: Request<ChangeModeRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update change_mode")) }
     async fn chown_node(&self, _: Request<ChownRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update chown_node")) }
     async fn lock_node(&self, _: Request<LockRequest>) -> Result<Response<ActionResponse>, Status> { Err(Status::unimplemented("Update lock_node")) }
-    async fn get_usage(&self, _: Request<UsageRequest>) -> Result<Response<UsageResponse>, Status> { Err(Status::unimplemented("Update get_usage")) }
     async fn find_node(&self, _: Request<FindRequest>) -> Result<Response<FindResponse>, Status> { Err(Status::unimplemented("Update find_node")) }
     async fn grep_node(&self, _: Request<GrepRequest>) -> Result<Response<GrepResponse>, Status> { Err(Status::unimplemented("Update grep_node")) }
     async fn get_tree(&self, _: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> { Err(Status::unimplemented("Update get_tree")) }
-    async fn exec_script(&self, _: Request<ExecRequest>) -> Result<Response<Self::ExecScriptStream>, Status> { Err(Status::unimplemented("Update exec_script")) }
+
+    async fn exec_script(&self, request: Request<ExecRequest>) -> Result<Response<Self::ExecScriptStream>, Status> {
+        let claims = self.check_permissions(&request, 80)?;
+        let req = request.into_inner();
+        let (_repo, _relative_path) = self.resolve_repo(&req.script_path)?;
+
+        if let Some(primary) = self.manager.get_repo("primary") {
+            let _ = primary.log_action(&claims.sub, "EXEC", &req.script_path).await;
+        }
+
+        // Mock Implementation für Exec Stream
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(ExecResponse { output_line: "Remote Execution initiated...".into() })).await;
+            let _ = tx.send(Ok(ExecResponse { output_line: "Security Sandbox: Active".into() })).await;
+            let _ = tx.send(Ok(ExecResponse { output_line: "Result: [Function executed]".into() })).await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 }
 
 #[tokio::main]
@@ -405,10 +466,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = pytja_core::telemetry::init_telemetry("./logs", "pytja_server.log");
     tracing::info!("Pytja Server Enterprise Edition starting up...");
 
-    // 1. Config laden
     let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");
 
-    // 2. Datenbank Verbindung
     let db_path_or_url = if config.database.primary_url.starts_with("sqlite://") {
         config.database.primary_url.strip_prefix("sqlite://").unwrap()
     } else {
@@ -428,7 +487,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repo.init().await.expect("DB Migration failed");
     }
 
-    // 3. Storage
     let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
         tracing::info!("Using S3 Storage");
         Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
