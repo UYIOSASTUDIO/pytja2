@@ -1,9 +1,13 @@
-use pytja_proto::pytja::pytja_service_client::PytjaServiceClient; // Pfad korrigiert
-use pytja_proto::pytja; // Wichtig für Request Typen
-use tonic::transport::Channel;
-use tonic::Request;
+use pytja_proto::pytja::{self, pytja_service_client::PytjaServiceClient};
+use tonic::{transport::Channel, Request};
 use ed25519_dalek::{Signer, SigningKey};
 use std::fs;
+use base64::{Engine as _, engine::general_purpose};
+use dialoguer::Password;
+use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use pbkdf2::pbkdf2;
+use hmac::Hmac;
+use sha2::Sha256;
 
 pub struct AdminClient {
     pub client: PytjaServiceClient<Channel>,
@@ -14,66 +18,72 @@ pub struct AdminClient {
 impl AdminClient {
     pub async fn connect(url: String) -> anyhow::Result<Self> {
         let client = PytjaServiceClient::connect(url).await?;
-        Ok(Self {
-            client,
-            token: String::new(),
-            username: String::new()
-        })
+        Ok(Self { client, token: String::new(), username: String::new() })
     }
 
-    pub async fn login_with_identity(&mut self, identity_path: &str) -> anyhow::Result<bool> {
-        let content = fs::read_to_string(identity_path)
-            .map_err(|_| anyhow::anyhow!("Could not read identity file"))?;
+    pub async fn login_with_identity(&mut self, path: &str) -> anyhow::Result<bool> {
+        println!("Loading identity from: {}", path);
+        let content = fs::read_to_string(path).map_err(|_| anyhow::anyhow!("File not found: {}", path))?;
 
-        let lines: Vec<&str> = content.lines().collect();
-        let mut username = "";
-        let mut priv_key_b64 = "";
+        let mut username = String::new();
+        let mut priv_b64 = String::new();
 
-        for line in lines {
-            if line.starts_with("USER:") { username = line.strip_prefix("USER:").unwrap(); }
-            if line.starts_with("PRIV:") { priv_key_b64 = line.strip_prefix("PRIV:").unwrap(); }
+        for line in content.lines() {
+            if let Some(v) = line.strip_prefix("USER:") { username = v.trim().to_string(); }
+            if let Some(v) = line.strip_prefix("PRIV:") { priv_b64 = v.trim().to_string(); }
         }
 
-        if username.is_empty() || priv_key_b64.is_empty() {
-            return Err(anyhow::anyhow!("Invalid identity file format"));
+        if username.is_empty() || priv_b64.is_empty() {
+            return Err(anyhow::anyhow!("Invalid identity file"));
+        }
+        self.username = username.clone();
+
+        // 1. Password Prompt & Decrypt (wie in der Shell)
+        let password = Password::new().with_prompt("Enter Identity Password").interact()?;
+        let blob = general_purpose::STANDARD.decode(&priv_b64)?;
+
+        if blob.len() < 28 { return Err(anyhow::anyhow!("Corrupted identity file")); }
+
+        let salt = &blob[0..16];
+        let nonce_bytes = &blob[16..28];
+        let ciphertext = &blob[28..];
+
+        let mut derived_key = [0u8; 32];
+        pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 100_000, &mut derived_key);
+
+        let cipher = Aes256Gcm::new(&derived_key.into());
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let priv_key_bytes = cipher.decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow::anyhow!("Decryption failed - wrong password?"))?;
+
+        let signing_key = SigningKey::from_bytes(priv_key_bytes.as_slice().try_into()?);
+
+        // 2. Challenge
+        let chal_req = Request::new(pytja::ChallengeRequest { username: username.clone() });
+        let chal_resp: pytja::ChallengeResponse = self.client.get_challenge(chal_req).await?.into_inner();
+
+        if !chal_resp.user_exists {
+            return Err(anyhow::anyhow!("User not found on server"));
         }
 
-        self.username = username.to_string();
-
-        let challenge_req = Request::new(pytja::ChallengeRequest {
-            username: username.to_string(),
-        });
-
-        let challenge_resp: pytja::ChallengeResponse = self.client.get_challenge(challenge_req).await?.into_inner();
-
-        if !challenge_resp.user_exists {
-            return Err(anyhow::anyhow!("User '{}' does not exist on server.", username));
-        }
-
-        use base64::{Engine as _, engine::general_purpose};
-        let priv_bytes = general_purpose::STANDARD.decode(priv_key_b64)?;
-        let signing_key = SigningKey::from_bytes(&priv_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?);
-
-        // 1. Signieren (Ergibt Bytes)
-        let signature = signing_key.sign(challenge_resp.challenge.as_bytes());
-        let signature_bytes = signature.to_bytes().to_vec();
-
-        // 2. FIX: Bytes zu Base64 String konvertieren für Proto
-        let signature_str = general_purpose::STANDARD.encode(signature_bytes);
+        // 3. Sign & Login
+        let signature_bytes = signing_key.sign(chal_resp.challenge.as_bytes()).to_bytes().to_vec();
+        let signature_str = general_purpose::STANDARD.encode(&signature_bytes);
 
         let login_req = Request::new(pytja::LoginRequest {
-            username: username.to_string(),
-            challenge: challenge_resp.challenge,
-            signature: signature_str, // Jetzt String, wie erwartet
+            username,
+            challenge: chal_resp.challenge,
+            signature: signature_str,
         });
 
         let login_resp: pytja::LoginResponse = self.client.login(login_req).await?.into_inner();
 
         if login_resp.success {
             self.token = login_resp.token;
-            return Ok(true);
+            Ok(true)
         } else {
-            return Err(anyhow::anyhow!("Login failed: {}", login_resp.message));
+            Err(anyhow::anyhow!("Login rejected: {}", login_resp.message))
         }
     }
 

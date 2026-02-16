@@ -176,11 +176,15 @@ impl PytjaService for MyPytjaService {
         };
 
         let challenge_bytes = req.challenge.as_bytes();
-        let pub_key_str = std::str::from_utf8(&user.public_key).map_err(|_| Status::internal("Corrupt Public Key"))?;
 
-        let is_valid = match CryptoService::verify_signature(pub_key_str, challenge_bytes, &req.signature) {
+        // FIX: Kein from_utf8 mehr! Wir übergeben die Bytes direkt.
+        // user.public_key ist Vec<u8> (BLOB aus DB)
+        let is_valid = match CryptoService::verify_signature(&user.public_key, challenge_bytes, &req.signature) {
             Ok(valid) => valid,
-            Err(_) => false
+            Err(e) => {
+                warn!("Signature verification error for user {}: {}", req.username, e);
+                false
+            }
         };
 
         if !is_valid {

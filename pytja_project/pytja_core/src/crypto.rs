@@ -27,9 +27,10 @@ impl CryptoService {
         BASE64.encode(signature.to_bytes())
     }
 
-    pub fn verify_signature(pub_key_hex: &str, message: &[u8], signature_b64: &str) -> Result<bool> {
-        let pub_bytes = hex::decode(pub_key_hex)?;
-        let pub_key = VerifyingKey::from_bytes(&pub_bytes.try_into().map_err(|_| anyhow!("Invalid PubKey length"))?)?;
+    // FIX: Akzeptiert jetzt &[u8] statt Hex-String
+    pub fn verify_signature(pub_key_bytes: &[u8], message: &[u8], signature_b64: &str) -> Result<bool> {
+        // Direktes Parsen der Bytes, kein Hex-Decode mehr nötig
+        let pub_key = VerifyingKey::from_bytes(pub_key_bytes.try_into().map_err(|_| anyhow!("Invalid PubKey length"))?)?;
 
         let sig_bytes = BASE64.decode(signature_b64)?;
         let signature = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("Invalid Sig length"))?);
