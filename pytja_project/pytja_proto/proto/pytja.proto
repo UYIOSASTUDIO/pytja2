@@ -34,6 +34,12 @@ service PytjaService {
     rpc GetMounts (GetMountsRequest) returns (GetMountsResponse);
     rpc AddMount (AddMountRequest) returns (AdminActionResponse);
     rpc RemoveMount (RemoveMountRequest) returns (AdminActionResponse);
+    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+    rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+    rpc SetUserQuota(SetQuotaRequest) returns (SetQuotaResponse);
+    rpc GetSystemStats(SystemStatsRequest) returns (SystemStatsResponse);
+    rpc GetAuditLogs(GetAuditLogsRequest) returns (GetAuditLogsResponse);
+    rpc StreamServerLogs(LogStreamRequest) returns (stream LogStreamEntry);
 }
 
 // --- Messages (Datenpakete) ---
@@ -319,4 +325,76 @@ message AddMountRequest {
 
 message RemoveMountRequest {
     string name = 1;
+}
+
+// --- USER MANAGEMENT MESSAGES ---
+
+message UserData {
+    string username = 1;
+    string role = 2;
+    bool is_active = 3;
+    uint64 quota_used = 4;   // Aktueller Verbrauch
+    uint64 quota_limit = 5;  // Individuelles Limit (0 = Default)
+    string created_at = 6;
+}
+
+message ListUsersRequest {}
+message ListUsersResponse {
+    repeated UserData users = 1;
+}
+
+message RegisterUserRequest {
+    string username = 1;
+    bytes public_key = 2; // PEM oder Raw Bytes
+    string role = 3;
+    uint64 quota_limit = 4; // Optional
+}
+message RegisterUserResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message SetQuotaRequest {
+    string username = 1;
+    uint64 limit_bytes = 2;
+}
+message SetQuotaResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// --- SYSTEM & AUDIT MESSAGES ---
+
+message SystemStatsRequest {}
+message SystemStatsResponse {
+    double cpu_usage_percent = 1;
+    uint64 memory_usage_bytes = 2;
+    uint64 active_sessions = 3;
+    uint64 active_uploads = 4;
+    string uptime = 5;
+    bool redis_connected = 6;
+}
+
+message GetAuditLogsRequest {
+    uint32 limit = 1; // z.B. die letzten 50 Einträge
+    string filter_user = 2; // Optional
+}
+
+message AuditLogEntry {
+    string timestamp = 1;
+    string user = 2;
+    string action = 3;
+    string target = 4;
+}
+
+message GetAuditLogsResponse {
+    repeated AuditLogEntry logs = 1;
+}
+
+// Live Log Stream
+message LogStreamRequest {}
+message LogStreamEntry {
+    string level = 1; // "INFO", "WARN", "ERROR"
+    string message = 2;
+    string timestamp = 3;
 }

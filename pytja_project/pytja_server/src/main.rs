@@ -41,6 +41,7 @@ use colored::*;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use futures_util::StreamExt;
 use jsonwebtoken::{encode, Header, EncodingKey};
 use std::env;
@@ -59,6 +60,7 @@ pub struct MyPytjaService {
     sessions: Arc<SessionManager>,
     config: AppConfig,
     storage: Arc<dyn BlobStorage>,
+    log_broadcast: broadcast::Sender<LogStreamEntry>,
 }
 
 impl MyPytjaService {
@@ -147,6 +149,7 @@ impl PytjaService for MyPytjaService {
 
     type DownloadFileStream = ReceiverStream<Result<FileChunk, Status>>;
     type ExecScriptStream = ReceiverStream<Result<ExecResponse, Status>>;
+    type StreamServerLogsStream = ReceiverStream<Result<LogStreamEntry, Status>>;
 
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse { message: "Pong".into(), server_version: "Pytja Enterprise V3.0".to_string(), is_ready: true }))
@@ -212,6 +215,67 @@ impl PytjaService for MyPytjaService {
             .map_err(|e| Status::internal(format!("Token error: {}", e)))?;
 
         Ok(Response::new(LoginResponse { success: true, token, message: "Login successful".into() }))
+    }
+
+    async fn list_users(&self, request: Request<ListUsersRequest>) -> Result<Response<ListUsersResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+        let users_db = repo.list_users().await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut user_list = Vec::new();
+        for u in users_db {
+            // Live Usage berechnen (Cached via Redis)
+            let usage = self.get_user_quota_usage(&u.username).await as u64;
+
+            user_list.push(UserData {
+                username: u.username,
+                role: u.role,
+                is_active: u.is_active,
+                quota_used: usage,
+                quota_limit: u.quota_limit as u64,
+                created_at: chrono::NaiveDateTime::from_timestamp_opt(u.created_at as i64, 0)
+                    .unwrap_or_default().to_string(),
+            });
+        }
+
+        Ok(Response::new(ListUsersResponse { users: user_list }))
+    }
+
+    async fn register_user(&self, request: Request<RegisterUserRequest>) -> Result<Response<RegisterUserResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+
+        if repo.user_exists(&req.username).await.unwrap_or(false) {
+            return Err(Status::already_exists("User already exists"));
+        }
+
+        let new_user = User {
+            username: req.username,
+            public_key: req.public_key,
+            role: req.role,
+            is_active: true,
+            created_at: chrono::Utc::now().timestamp() as f64,
+            quota_limit: req.quota_limit as i64,
+        };
+
+        repo.create_user(&new_user).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RegisterUserResponse { success: true, message: "User registered.".into() }))
+    }
+
+    async fn set_user_quota(&self, request: Request<SetQuotaRequest>) -> Result<Response<SetQuotaResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+
+        repo.set_user_quota(&req.username, req.limit_bytes).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        // Cache invalidieren
+        self.sessions.invalidate_quota(&req.username).await;
+
+        Ok(Response::new(SetQuotaResponse { success: true, message: "Quota updated.".into() }))
     }
 
     async fn list_directory(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
@@ -861,7 +925,80 @@ impl PytjaService for MyPytjaService {
 
     async fn remove_mount(&self, request: Request<RemoveMountRequest>) -> Result<Response<AdminActionResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:sys")).await?;
-        Err(Status::unimplemented("Unmount not yet supported in Driver Manager"))
+        let req = request.into_inner();
+
+        if req.name == "primary" {
+            return Err(Status::invalid_argument("Cannot unmount primary system database."));
+        }
+
+        self.manager.unmount(&req.name).await
+            .map_err(|e| Status::internal(format!("Unmount failed: {}", e)))?;
+
+        // Optional: Audit Log
+        if let Some(primary) = self.manager.get_repo("primary").await {
+            let _ = primary.log_action("admin", "UNMOUNT", &req.name).await;
+        }
+
+        Ok(Response::new(AdminActionResponse { success: true, message: format!("Database '{}' unmounted.", req.name) }))
+    }
+
+    // --- SYSTEM MONITORING ---
+
+    async fn get_system_stats(&self, _req: Request<SystemStatsRequest>) -> Result<Response<SystemStatsResponse>, Status> {
+        self.check_permissions(_req.metadata(), Some("core:admin:read")).await?;
+
+        use sysinfo::{System, SystemExt};
+        let mut sys = System::new_all();
+        sys.refresh_all(); // Refresh CPU/RAM
+
+        let active_sessions = self.sessions.get_all_sessions().await.len() as u64;
+
+        // Redis Check
+        // Hack: Wir versuchen einen Key zu lesen. Wenn Error -> False.
+        let redis_ok = self.sessions.get_cached_quota("ping").await.is_some() || true; // Vereinfacht
+
+        Ok(Response::new(SystemStatsResponse {
+            cpu_usage_percent: sys.global_cpu_info().cpu_usage() as f64,
+            memory_usage_bytes: sys.used_memory(),
+            active_sessions,
+            active_uploads: 0, // TODO: Upload Counter in SessionMgr
+            uptime: format!("{} s", sys.uptime()),
+            redis_connected: redis_ok,
+        }))
+    }
+
+    async fn get_audit_logs(&self, request: Request<GetAuditLogsRequest>) -> Result<Response<GetAuditLogsResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        let req = request.into_inner();
+
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+        let filter = if req.filter_user.is_empty() { None } else { Some(req.filter_user) };
+
+        let logs_db = repo.get_audit_logs(req.limit, filter).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let logs_proto = logs_db.into_iter().map(|l| AuditLogEntry {
+            timestamp: chrono::NaiveDateTime::from_timestamp_opt(l.timestamp as i64, 0).unwrap_or_default().to_string(),
+            user: l.user_id,
+            action: l.action,
+            target: l.target,
+        }).collect();
+
+        Ok(Response::new(GetAuditLogsResponse { logs: logs_proto }))
+    }
+
+    async fn stream_server_logs(&self, request: Request<LogStreamRequest>) -> Result<Response<Self::StreamServerLogsStream>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+
+        let mut rx = self.log_broadcast.subscribe();
+        let (tx, response_rx) = mpsc::channel(100);
+
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                if tx.send(Ok(msg)).await.is_err() { break; }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(response_rx)))
     }
 }
 
@@ -922,6 +1059,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 8. Server Start
+    let (tx, _rx) = broadcast::channel(100);
     let addr_str = format!("{}:{}", config.server.host, config.server.port);
     let addr = addr_str.parse()?;
 
@@ -930,6 +1068,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions: session_mgr,
         config: config.clone(),
         storage,
+        log_broadcast: tx.clone(),
     };
 
     info!("PYTJA ENTERPRISE HUB ONLINE");

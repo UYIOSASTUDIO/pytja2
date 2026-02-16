@@ -8,11 +8,14 @@ pub trait PytjaRepository: Send + Sync {
     async fn init(&self) -> Result<(), PytjaError>;
 
     // User Management
-    async fn create_user(&self, user: &User) -> Result<(), PytjaError>;
     async fn get_user(&self, username: &str) -> Result<Option<User>, PytjaError>;
     async fn user_exists(&self, username: &str) -> Result<bool, PytjaError>;
     async fn get_all_users(&self) -> Result<Vec<User>, PytjaError>;
     async fn update_user_status(&self, username: &str, is_active: bool, role: &str) -> Result<(), PytjaError>;
+    async fn list_users(&self) -> Result<Vec<User>, PytjaError>;
+    async fn create_user(&self, user: &User) -> Result<(), PytjaError>;
+    async fn set_user_quota(&self, username: &str, limit: u64) -> Result<(), PytjaError>;
+    async fn get_user_quota_limit(&self, username: &str) -> Result<u64, PytjaError>;
 
     // --- RBAC ---
     async fn create_role(&self, role: &Role) -> Result<(), PytjaError>;
@@ -37,4 +40,5 @@ pub trait PytjaRepository: Send + Sync {
     // Auditing
     async fn log_action(&self, actor: &str, action: &str, target: &str) -> Result<(), PytjaError>;
     async fn get_audit_logs(&self, limit: usize) -> Result<Vec<AuditLogEntry>, PytjaError>;
+    async fn get_audit_logs(&self, limit: u32, user_filter: Option<String>) -> Result<Vec<AuditLog>, PytjaError>;
 }

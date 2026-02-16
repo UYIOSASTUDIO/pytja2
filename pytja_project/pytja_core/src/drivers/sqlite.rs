@@ -100,16 +100,47 @@ impl PytjaRepository for SqliteDriver {
 
     // --- USER MANAGEMENT ---
 
+    async fn list_users(&self) -> Result<Vec<User>, PytjaError> {
+        // Wir nutzen sqlx::query_as!, aber Achtung: quota_limit muss in der DB existieren.
+        // Für V1 Migration fügen wir es "soft" hinzu oder nutzen query_as (macro-less) für Flexibilität.
+        sqlx::query_as::<_, User>("SELECT * FROM users")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| PytjaError::Database(e.to_string()))
+    }
+
     async fn create_user(&self, user: &User) -> Result<(), PytjaError> {
-        sqlx::query("INSERT INTO users (username, public_key, role, created_at, description, is_active) VALUES (?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO users (username, public_key, role, is_active, created_at, quota_limit) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(&user.username)
             .bind(&user.public_key)
-            .bind(&user.role) // FIX: .role statt .role_level
-            .bind(&user.created_at)
-            .bind(&user.description)
+            .bind(&user.role)
             .bind(user.is_active)
-            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+            .bind(user.created_at)
+            .bind(user.quota_limit)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    async fn set_user_quota(&self, username: &str, limit: u64) -> Result<(), PytjaError> {
+        sqlx::query("UPDATE users SET quota_limit = ? WHERE username = ?")
+            .bind(limit as i64)
+            .bind(username)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_user_quota_limit(&self, username: &str) -> Result<u64, PytjaError> {
+        let row: (i64,) = sqlx::query_as("SELECT quota_limit FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| PytjaError::Database(e.to_string()))?
+            .unwrap_or((0,));
+        Ok(row.0 as u64)
     }
 
     async fn get_user(&self, username: &str) -> Result<Option<User>, PytjaError> {
@@ -323,12 +354,23 @@ impl PytjaRepository for SqliteDriver {
         Ok(())
     }
 
-    async fn get_audit_logs(&self, limit: usize) -> Result<Vec<AuditLogEntry>, PytjaError> {
-        let rows = sqlx::query("SELECT id, timestamp, actor, action, target FROM audit_logs ORDER BY id DESC LIMIT ?").bind(limit as i64).fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
-        let mut logs = Vec::new();
-        for r in rows {
-            logs.push(AuditLogEntry { id: r.try_get("id")?, timestamp: r.try_get("timestamp")?, actor: r.try_get("actor")?, action: r.try_get("action")?, target: r.try_get("target")? });
-        }
-        Ok(logs)
+    // In impl PytjaRepository:
+
+    async fn get_audit_logs(&self, limit: u32, user_filter: Option<String>) -> Result<Vec<AuditLog>, PytjaError> {
+        let sql = if let Some(user) = user_filter {
+            format!("SELECT * FROM audit_logs WHERE user_id = ? ORDER BY timestamp DESC LIMIT {}", limit)
+        } else {
+            format!("SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT {}", limit)
+        };
+
+        let query = sqlx::query_as::<_, AuditLog>(&sql);
+
+        let query = if let Some(user) = user_filter {
+            query.bind(user)
+        } else {
+            query
+        };
+
+        query.fetch_all(&self.pool).await.map_err(|e| PytjaError::Database(e.to_string()))
     }
 }

@@ -17,6 +17,8 @@ pub struct User {
 
     pub is_active: bool,
     pub created_at: String,
+    #[sqlx(default)]
+    pub quota_limit: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,4 +56,14 @@ pub struct AuditLogEntry {
     pub actor: String,
     pub action: String,
     pub target: String,
+}
+
+// Ergänze AuditLog Model falls noch nicht da:
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AuditLog {
+    pub id: i64,
+    pub user_id: String,
+    pub action: String,
+    pub target: String,
+    pub timestamp: f64,
 }
