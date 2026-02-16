@@ -51,7 +51,7 @@ impl AppConfig {
             let data_dir = proj_dirs.data_dir();
             let config_dir = proj_dirs.config_dir();
 
-            // Ordner erstellen, falls nicht existent (wichtig!)
+            // Ordner erstellen
             let _ = std::fs::create_dir_all(data_dir);
             let _ = std::fs::create_dir_all(config_dir);
 
@@ -61,7 +61,7 @@ impl AppConfig {
                 data_dir.join("storage").to_string_lossy().to_string()
             )
         } else {
-            // Fallback auf lokal, falls OS-Pfade nicht ermittelbar (sehr unwahrscheinlich)
+            // Fallback auf lokal
             ("mounts.json".to_string(), "logs".to_string(), "data_storage".to_string())
         };
 
@@ -70,13 +70,15 @@ impl AppConfig {
             .set_default("server.port", 50051)?
             .set_default("database.primary_url", "sqlite://pytja.db")?
             .set_default("storage.storage_type", "local")?
-            .set_default("storage.local_path", "./data_storage")?
+
+            // FIX: Hier nutzen wir jetzt die Variable 'default_storage' statt Hardcode
+            .set_default("storage.local_path", default_storage)?
+
             .set_default("storage.s3_bucket", "")?
             .set_default("storage.s3_region", "us-east-1")?
             .set_default("paths.mounts_file", default_mounts)?
             .set_default("paths.logs_dir", default_logs)?
 
-            // Config Sources (Priorität aufsteigend)
             .add_source(File::with_name("config").required(false))
             .add_source(File::with_name(&format!("config/{}", run_mode)).required(false))
             .add_source(Environment::with_prefix("PYTJA").separator("__"))

@@ -404,9 +404,12 @@ impl PytjaService for MyPytjaService {
         let path_obj = std::path::Path::new(&relative_path);
         let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
 
+        // FIX: Größe vor dem Move speichern!
+        let content_len = req.content.len();
+
         let node = FileNode {
             path: relative_path.clone(), name, owner: req.owner, is_folder: req.is_folder,
-            size: req.content.len(), content: req.content,
+            size: content_len, content: req.content,
             lock_pass: if req.lock_password.is_empty() { None } else { Some(req.lock_password) },
             permissions: 0, created_at: chrono::Utc::now().timestamp() as f64, blob_id: None,
         };
@@ -418,7 +421,8 @@ impl PytjaService for MyPytjaService {
 
         res.map_err(|e| Status::internal(e.to_string()))?;
 
-        self.sessions.update_quota(&claims.sub, req.content.len() as i64).await;
+        // FIX: content_len Variable nutzen
+        self.sessions.update_quota(&claims.sub, content_len as i64).await;
 
         if let Some(primary) = self.manager.get_repo("primary").await {
             let _ = primary.log_action(&claims.sub, "CREATE", &req.path).await;
@@ -475,17 +479,14 @@ impl PytjaService for MyPytjaService {
         let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
 
-        // 1. Distributed Locking (Deadlock Prevention: Source first, then Dest)
+        // 1. Distributed Locking
         if !self.sessions.try_lock_file(&req.source_path, &claims.sub).await {
             return Err(Status::aborted("Source file is busy/locked."));
         }
         if !self.sessions.try_lock_file(&req.dest_path, &claims.sub).await {
-            self.sessions.unlock_file(&req.source_path, &claims.sub).await; // Rollback Source
+            self.sessions.unlock_file(&req.source_path, &claims.sub).await;
             return Err(Status::aborted("Destination file is busy/locked."));
         }
-
-        // Helper für sauberes Unlocking im Fehlerfall (RAII Pattern Emulation)
-        // Wir nutzen hier manuelle Unlocks in Error-Branches, da wir keine Destructors haben.
 
         // 2. Resolve Repositories
         let (repo_src, src_rel) = match self.resolve_repo(&req.source_path).await {
@@ -506,19 +507,17 @@ impl PytjaService for MyPytjaService {
             }
         };
 
-        // 3. Ausführungs-Logik: Native Move vs. Cross-Repo Move
+        // 3. Ausführungs-Logik
         let move_result = if Arc::ptr_eq(&repo_src, &repo_dst) {
-            // A) FAST PATH: Selbes Repository (SQL Rename)
-            // Das ist atomar und performant.
+            // A) FAST PATH
             repo_src.move_path(&src_rel, &dst_rel).await
                 .map_err(|e| Status::internal(e.to_string()))
         } else {
-            // B) SLOW PATH: Cross-Repository Move (Copy + Delete)
-            // Hier müssen wir Daten physisch bewegen.
+            // B) SLOW PATH: Cross-Repository Move
 
-            // B1. Source Node lesen
+            // FIX: Typen im match Block vereinheitlicht (Result zurückgeben)
             let src_node = match repo_src.get_node(&src_rel).await {
-                Ok(Some(n)) => n,
+                Ok(Some(n)) => Ok(n), // FIX: Hier fehlte das Ok()
                 Ok(None) => Err(Status::not_found("Source file not found")),
                 Err(e) => Err(Status::internal(format!("Source DB Error: {}", e))),
             };
@@ -526,17 +525,11 @@ impl PytjaService for MyPytjaService {
             match src_node {
                 Ok(node) => {
                     if node.is_folder {
-                        // Rekursives Verschieben über DB-Grenzen hinweg ist komplex.
-                        // Für V1 blockieren wir das, um Dateninkonsistenz zu vermeiden.
                         Err(Status::unimplemented("Cross-mount folder move not supported yet. Move files individually."))
                     } else {
-                        // B2. Blob Handling (Enterprise Safe Copy)
-                        // Wenn es ein Blob ist, müssen wir ihn kopieren, damit er eine NEUE ID bekommt.
-                        // Würden wir nur die ID kopieren, würde das Löschen der Source den Blob löschen -> Datenverlust am Ziel!
                         let new_blob_id = if let Some(old_id) = node.blob_id {
                             match self.storage.get(&old_id).await {
                                 Ok(stream) => {
-                                    // Wir nutzen den Dest-Pfad als neuen Storage Key
                                     match self.storage.put(&req.dest_path, stream).await {
                                         Ok(new_id) => Some(new_id),
                                         Err(e) => return Err(Status::internal(format!("Storage Write Error: {}", e))),
@@ -548,17 +541,16 @@ impl PytjaService for MyPytjaService {
                             None
                         };
 
-                        // B3. Node am Ziel erstellen
                         let path_obj = std::path::Path::new(&dst_rel);
                         let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
 
                         let new_node = FileNode {
                             path: dst_rel.clone(),
                             name,
-                            owner: claims.sub.clone(), // Der Mover wird zum Owner
+                            owner: claims.sub.clone(),
                             is_folder: false,
                             size: node.size,
-                            content: node.content, // Vec Copy (bei Blobs ist das leer)
+                            content: node.content,
                             blob_id: new_blob_id,
                             lock_pass: node.lock_pass,
                             permissions: node.permissions,
@@ -568,11 +560,8 @@ impl PytjaService for MyPytjaService {
                         if let Err(e) = repo_dst.save_node(&new_node).await {
                             Err(Status::internal(format!("Target DB Save Error: {}", e)))
                         } else {
-                            // B4. Source Löschen (Erst wenn Save erfolgreich war!)
                             if let Err(e) = repo_src.delete_node_recursive(&src_rel).await {
-                                // Kritischer Zustand: Ziel existiert, Quelle konnte nicht gelöscht werden.
-                                // Wir loggen das als Warnung, aber geben OK zurück, da die Daten sicher sind.
-                                tracing::error!("CRITICAL: Duplicate file created during move. Source delete failed: {}", e);
+                                tracing::error!("CRITICAL: Duplicate file created. Source delete failed: {}", e);
                                 Ok(())
                             } else {
                                 Ok(())
@@ -584,11 +573,11 @@ impl PytjaService for MyPytjaService {
             }
         };
 
-        // 4. Locks freigeben (Always execute)
+        // 4. Locks freigeben
         self.sessions.unlock_file(&req.source_path, &claims.sub).await;
         self.sessions.unlock_file(&req.dest_path, &claims.sub).await;
 
-        // 5. Audit Log & Response
+        // 5. Audit & Quota
         match move_result {
             Ok(_) => {
                 self.sessions.invalidate_quota(&claims.sub).await;
