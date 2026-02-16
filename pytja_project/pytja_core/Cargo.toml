@@ -42,3 +42,6 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
 anyhow = "1.0"
+
+directories = "5.0"
+futures-util = "0.3"

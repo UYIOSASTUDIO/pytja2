@@ -46,6 +46,8 @@ use jsonwebtoken::{encode, Header, EncodingKey};
 use std::env;
 use std::collections::HashSet;
 
+use tracing::{info, warn, error};
+
 mod session_manager;
 use crate::session_manager::SessionManager;
 
@@ -655,43 +657,61 @@ impl PytjaService for MyPytjaService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = pytja_core::telemetry::init_telemetry("./logs", "pytja_server.log");
-    tracing::info!("Pytja Server Enterprise Edition starting up...");
-
+    // 1. Config laden (Critical Path: Muss als erstes passieren)
     let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");
 
+    // 2. Telemetry initialisieren
+    // Wir nutzen den Pfad aus der Config. Der _guard muss im Scope bleiben, damit Logs geflushed werden.
+    let _guard = pytja_core::telemetry::init_telemetry(&config.paths.logs_dir, "pytja_server.log");
+
+    info!("Pytja Server Enterprise Edition starting up...");
+    info!("Configuration loaded. Host: {}:{}", config.server.host, config.server.port);
+
+    // 3. Driver Manager (Core System)
+    let manager = Arc::new(DriverManager::new());
+
+    // 4. Redis Session Manager (Async Connect)
+    let redis_url = config.redis.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| "redis://127.0.0.1/".to_string());
+    info!("Connecting to Redis at {}", redis_url);
+
+    let session_mgr = Arc::new(
+        SessionManager::new(&redis_url).await.expect("FATAL: Redis Connection Failed")
+    );
+
+    // 5. Load Mounts (Async I/O - Non Blocking)
+    // Lädt die mounts.json, ohne den Thread zu blockieren
+    manager.load_config(&config.paths.mounts_file).await;
+
+    // 6. Mount Primary Database
     let db_path_or_url = if config.database.primary_url.starts_with("sqlite://") {
         config.database.primary_url.strip_prefix("sqlite://").unwrap()
     } else {
         &config.database.primary_url
     };
 
-    let manager = Arc::new(DriverManager::new());
+    info!("Mounting Primary DB: {}", db_path_or_url);
 
-    // REDIS Setup
-    let redis_url = config.redis.as_ref().map(|r| r.url.clone()).unwrap_or("redis://127.0.0.1/".to_string());
-    tracing::info!("Connecting to Redis: {}", redis_url);
-
-    let session_mgr = Arc::new(SessionManager::new(&redis_url).await.expect("Redis Connection Failed"));
-
-    manager.load_config("mounts.json").await;
-
-    tracing::info!("Mounting Primary DB: {}", db_path_or_url);
     manager.mount("primary", db_path_or_url, DatabaseType::Sqlite).await
         .expect("FATAL: Failed to mount primary DB");
 
-    if let Some(repo) = manager.get_repo("primary") {
+    // WICHTIG: get_repo ist jetzt async, da wir tokio locks nutzen!
+    if let Some(repo) = manager.get_repo("primary").await {
         repo.init().await.expect("DB Migration failed");
+    } else {
+        panic!("FATAL: Primary DB lost immediately after mount!");
     }
 
+    // 7. Blob Storage Setup (Async)
     let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
-        tracing::info!("Using S3 Storage");
+        info!("Using S3 Storage (Region: {})", config.storage.s3_region);
         Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
     } else {
-        tracing::info!("Using Local Storage");
+        info!("Using Local Storage at: {}", config.storage.local_path);
+        // Auch FileSystem Init ist jetzt async (Ordner erstellen via tokio::fs)
         Arc::new(FileSystemStorage::new(&config.storage.local_path).await?)
     };
 
+    // 8. Server Start
     let addr_str = format!("{}:{}", config.server.host, config.server.port);
     let addr = addr_str.parse()?;
 
@@ -702,8 +722,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage,
     };
 
-    println!("{}", "PYTJA ENTERPRISE HUB ONLINE".green().bold());
-    println!("Listening on {}", addr);
+    info!("PYTJA ENTERPRISE HUB ONLINE");
+    info!("Listening on {}", addr);
 
     Server::builder()
         .add_service(PytjaServiceServer::new(service))

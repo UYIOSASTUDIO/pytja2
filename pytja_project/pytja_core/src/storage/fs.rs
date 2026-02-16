@@ -1,57 +1,63 @@
-use super::{BlobStorage, ByteStream};
+use crate::storage::BlobStorage;
 use crate::error::PytjaError;
 use async_trait::async_trait;
-use futures::StreamExt;
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt; // AsyncReadExt entfernt
-use tokio_util::io::ReaderStream;
-use std::path::PathBuf;
-use uuid::Uuid;
-use tracing::info;
+use futures::stream::{BoxStream, StreamExt};
+use tokio::fs; // ASYNC FS
+use tokio::io::AsyncWriteExt; // Traits für Async Write
+use std::path::Path;
+use bytes::Bytes;
 
 pub struct FileSystemStorage {
-    base_path: PathBuf,
+    base_path: String,
 }
 
 impl FileSystemStorage {
     pub async fn new(path: &str) -> Result<Self, PytjaError> {
         fs::create_dir_all(path).await.map_err(|e| PytjaError::System(e.to_string()))?;
-        Ok(Self { base_path: PathBuf::from(path) })
+        Ok(Self { base_path: path.to_string() })
     }
 }
 
 #[async_trait]
 impl BlobStorage for FileSystemStorage {
-    async fn put(&self, _name: &str, mut stream: ByteStream) -> Result<String, PytjaError> {
-        let blob_id = Uuid::new_v4().to_string();
-        let file_path = self.base_path.join(&blob_id);
+    async fn put(&self, path: &str, mut stream: BoxStream<'static, Result<Bytes, PytjaError>>) -> Result<String, PytjaError> {
+        let full_path = Path::new(&self.base_path).join(path);
 
-        let mut file = File::create(&file_path).await.map_err(|e| PytjaError::IoError(e))?;
-
-        let mut total_bytes = 0;
-        while let Some(chunk) = stream.next().await {
-            let data = chunk?;
-            total_bytes += data.len();
-            file.write_all(&data).await.map_err(|e| PytjaError::IoError(e))?;
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| PytjaError::System(e.to_string()))?;
         }
 
-        info!("Stored blob {} ({} bytes) on disk", blob_id, total_bytes);
-        Ok(blob_id)
+        let mut file = fs::File::create(&full_path).await.map_err(|e| PytjaError::System(e.to_string()))?;
+
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            file.write_all(&chunk).await.map_err(|e| PytjaError::System(e.to_string()))?;
+        }
+
+        file.flush().await.map_err(|e| PytjaError::System(e.to_string()))?;
+
+        Ok(path.to_string())
     }
 
-    async fn get(&self, key: &str) -> Result<ByteStream, PytjaError> {
-        let file_path = self.base_path.join(key);
-        if !file_path.exists() { return Err(PytjaError::NotFound("Blob not found".into())); }
+    async fn get(&self, blob_id: &str) -> Result<BoxStream<'static, Result<Bytes, PytjaError>>, PytjaError> {
+        let full_path = Path::new(&self.base_path).join(blob_id);
 
-        let file = File::open(file_path).await.map_err(|e| PytjaError::IoError(e))?;
-        let stream = ReaderStream::new(file).map(|r| r.map_err(|e| PytjaError::IoError(e)));
+        // Datei öffnen (Async)
+        let file = fs::File::open(full_path).await.map_err(|e| PytjaError::System(e.to_string()))?;
 
-        Ok(Box::pin(stream))
+        // In Stream verwandeln (Tokio util)
+        let stream = tokio_util::io::ReaderStream::new(file);
+
+        let s = stream.map(|res| {
+            res.map_err(|e| PytjaError::System(e.to_string()))
+                .map(Bytes::from)
+        });
+
+        Ok(Box::pin(s))
     }
 
-    async fn delete(&self, key: &str) -> Result<(), PytjaError> {
-        let path = self.base_path.join(key);
-        if path.exists() { fs::remove_file(path).await.map_err(|e| PytjaError::IoError(e))?; }
-        Ok(())
+    async fn delete(&self, blob_id: &str) -> Result<(), PytjaError> {
+        let full_path = Path::new(&self.base_path).join(blob_id);
+        fs::remove_file(full_path).await.map_err(|e| PytjaError::System(e.to_string()))
     }
 }

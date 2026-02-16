@@ -3,10 +3,11 @@ pub mod postgres;
 
 use crate::repo::PytjaRepository;
 use crate::error::PytjaError;
-use std::sync::{Arc, RwLock}; // WICHTIG: Sync Locks für High-Performance RAM Zugriff
+use std::sync::Arc;
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
-use tokio::fs; // WICHTIG: Async FS für non-blocking I/O
+use tokio::fs;
+use tokio::sync::RwLock; // WICHTIG: Async Lock für 100% Non-Blocking
 use tracing::{info, warn, error};
 
 // Enterprise Database Support
@@ -26,10 +27,10 @@ pub struct MountConfig {
 
 /// Der DriverManager verwaltet alle aktiven Datenbank-Verbindungen.
 pub struct DriverManager {
-    // Sync RwLock ist hier besser, da HashMap-Lookups extrem schnell sind (Nanosekunden).
-    // Async Locks (Tokio) sind nur nötig, wenn wir lange warten müssten (z.B. I/O).
+    // Async RwLock: Verhindert, dass Reader/Writer den Thread blockieren
     connections: Arc<RwLock<HashMap<String, Arc<dyn PytjaRepository>>>>,
     config_cache: Arc<RwLock<Vec<MountConfig>>>,
+    config_file_path: Arc<RwLock<String>>,
 }
 
 impl DriverManager {
@@ -37,6 +38,7 @@ impl DriverManager {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             config_cache: Arc::new(RwLock::new(Vec::new())),
+            config_file_path: Arc::new(RwLock::new("mounts.json".to_string())),
         }
     }
 
@@ -44,22 +46,27 @@ impl DriverManager {
     pub async fn load_config(&self, config_path: &str) {
         info!("Loading configuration from '{}'", config_path);
 
-        // Asynchrones Lesen der Datei (blockiert den Server nicht)
+        // Pfad speichern für spätere Writes (Async Lock)
+        {
+            let mut p = self.config_file_path.write().await;
+            *p = config_path.to_string();
+        }
+
+        // Asynchrones Lesen der Datei
         match fs::read_to_string(config_path).await {
             Ok(content) => {
                 match serde_json::from_str::<Vec<MountConfig>>(&content) {
                     Ok(configs) => {
                         info!("Found {} mount definitions.", configs.len());
 
-                        // Cache updaten (kurzes Blocking ist hier okay)
+                        // Cache updaten
                         {
-                            let mut cache = self.config_cache.write().unwrap();
+                            let mut cache = self.config_cache.write().await;
                             *cache = configs.clone();
                         }
 
                         // Mounts ausführen
                         for cfg in configs {
-                            // save=false, da wir gerade erst geladen haben
                             if let Err(e) = self.mount_internal(&cfg.name, &cfg.path, cfg.db_type.clone(), false).await {
                                 error!("Failed to mount database '{}': {}", cfg.name, e);
                             }
@@ -68,7 +75,7 @@ impl DriverManager {
                     Err(e) => warn!("Could not parse mounts.json: {}", e),
                 }
             },
-            Err(_) => warn!("No mounts.json found. Starting with empty configuration."),
+            Err(_) => warn!("No mounts.json found at '{}'. Starting with empty configuration.", config_path),
         }
     }
 
@@ -94,14 +101,14 @@ impl DriverManager {
             _ => return Err(PytjaError::System("Unsupported DB Type".into())),
         };
 
-        // In-Memory registrieren (Sync Lock)
+        // In-Memory registrieren (Async Lock)
         {
-            let mut map = self.connections.write().unwrap();
+            let mut map = self.connections.write().await;
             map.insert(name.to_string(), repo);
         }
         info!("Mounted database '{}' ({:?})", name, db_type);
 
-        // Persistent speichern (Async I/O)
+        // Persistent speichern
         if save_to_disk {
             self.persist_mount(name, path, db_type).await?;
         }
@@ -111,12 +118,16 @@ impl DriverManager {
 
     /// Speichert Config atomar (Async Write + Rename)
     async fn persist_mount(&self, name: &str, path: &str, db_type: DatabaseType) -> Result<(), PytjaError> {
-        let config_path = "mounts.json";
+        // Pfad holen (Async Lock)
+        let config_path = {
+            let p = self.config_file_path.read().await;
+            p.clone()
+        };
 
-        // 1. Cache im RAM aktualisieren (schnell)
+        // 1. Cache aktualisieren
         let configs_copy;
         {
-            let mut cache = self.config_cache.write().unwrap();
+            let mut cache = self.config_cache.write().await;
 
             if let Some(existing) = cache.iter_mut().find(|c| c.name == name) {
                 existing.path = path.to_string();
@@ -128,21 +139,21 @@ impl DriverManager {
                     db_type,
                 });
             }
-            configs_copy = cache.clone(); // Kopie für Async Write erstellen, damit Lock frei wird
+            configs_copy = cache.clone();
         }
 
         // 2. JSON generieren
         let json = serde_json::to_string_pretty(&configs_copy)
             .map_err(|e| PytjaError::System(format!("Serialization error: {}", e)))?;
 
-        // 3. Atomic Write Pattern (Async I/O)
+        // 3. Atomic Write Pattern
         let temp_path = format!("{}.tmp", config_path);
 
         if let Err(e) = fs::write(&temp_path, &json).await {
             return Err(PytjaError::System(format!("Failed to write temp config: {}", e)));
         }
 
-        if let Err(e) = fs::rename(&temp_path, config_path).await {
+        if let Err(e) = fs::rename(&temp_path, &config_path).await {
             return Err(PytjaError::System(format!("Failed to commit config file: {}", e)));
         }
 
@@ -151,20 +162,24 @@ impl DriverManager {
     }
 
     pub async fn unmount(&self, name: &str) -> Result<(), PytjaError> {
-        // Memory cleanup
+        // Pfad holen
+        let config_path = {
+            let p = self.config_file_path.read().await;
+            p.clone()
+        };
+
+        // Memory cleanup (Async Lock)
         {
-            let mut map = self.connections.write().unwrap();
+            let mut map = self.connections.write().await;
             if map.remove(name).is_none() {
                 return Err(PytjaError::NotFound(format!("Database '{}' not found", name)));
             }
         }
 
         // Config cleanup
-        let config_path = "mounts.json";
         let configs_copy;
-
         {
-            let mut cache = self.config_cache.write().unwrap();
+            let mut cache = self.config_cache.write().await;
             if let Some(pos) = cache.iter().position(|c| c.name == name) {
                 cache.remove(pos);
                 configs_copy = Some(cache.clone());
@@ -187,15 +202,15 @@ impl DriverManager {
         Ok(())
     }
 
-    // High-Performance Sync Reads (Kein .await nötig im Server Code!)
+    // Zugriffsmethoden sind jetzt ASYNC für 100% Non-Blocking
 
-    pub fn get_repo(&self, name: &str) -> Option<Arc<dyn PytjaRepository>> {
-        let map = self.connections.read().unwrap();
+    pub async fn get_repo(&self, name: &str) -> Option<Arc<dyn PytjaRepository>> {
+        let map = self.connections.read().await;
         map.get(name).cloned()
     }
 
-    pub fn list_mounts(&self) -> Vec<String> {
-        let map = self.connections.read().unwrap();
+    pub async fn list_mounts(&self) -> Vec<String> {
+        let map = self.connections.read().await;
         map.keys().cloned().collect()
     }
 }
