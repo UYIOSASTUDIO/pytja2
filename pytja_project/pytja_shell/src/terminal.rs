@@ -14,6 +14,7 @@ use std::sync::Arc;
 use pytja_proto::FileInfo;
 use indicatif::{ProgressBar, ProgressStyle}; // NEU: Für Ladebalken
 use directories::ProjectDirs; // NEU: Für Speicherpfade
+use rustyline::error::ReadlineError;
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
@@ -373,7 +374,8 @@ impl Terminal {
                 let src_path = self.vfs.lock().await.resolve_path(args[0]);
                 let dst_path = self.vfs.lock().await.resolve_path(args[1]);
 
-                match self.client.copy_node(&src_path, &dst_path).await {
+                // FIX: self.user_id als 3. Argument hinzugefügt
+                match self.client.copy_node(&src_path, &dst_path, &self.user_id).await {
                     Ok(msg) => println!("{}", msg.green()),
                     Err(e) => println!("{}", e.to_string().red()),
                 }
@@ -583,7 +585,8 @@ impl Terminal {
                 if perm_val < 0 || perm_val > 2 { println!("Invalid mode. Use 0, 1 or 2."); return true; }
 
                 let full_path = self.vfs.lock().await.resolve_path(args[1]);
-                match self.client.change_mode(&full_path, perm_val).await {
+                // FIX: 'as u32' Cast hinzugefügt
+                match self.client.change_mode(&full_path, perm_val as u32).await {
                     Ok(msg) => println!("{}", msg.green()),
                     Err(e) => println!("{}", e.to_string().red()),
                 }
@@ -610,7 +613,10 @@ impl Terminal {
                     if p1 != p2 { println!("{}", "Passwords do not match.".red()); return true; }
                 }
 
-                match self.client.lock_node(&full_path, &p1).await {
+                // FIX: Logik für Option<String>
+                let password_opt = if p1.is_empty() { None } else { Some(p1) };
+
+                match self.client.lock_node(&full_path, password_opt).await {
                     Ok(msg) => println!("{}", msg.green()),
                     Err(e) => println!("{}", e.to_string().red()),
                 }

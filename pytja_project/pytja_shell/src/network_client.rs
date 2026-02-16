@@ -187,10 +187,10 @@ impl PytjaClient {
         Ok((resp.exists, resp.is_folder, resp.is_locked))
     }
 
-    pub async fn get_tree(&self) -> Result<String> {
-        let mut client = self.raw_connect().await?;
-        let req = self.auth_req(TreeRequest { root_path: "/".to_string() });
-        let resp = client.get_tree(req).await?.into_inner();
+    pub async fn get_tree(&self, root_path: &str) -> Result<String> {
+        let mut client = self.raw_connect().await?; // Verbindung aufbauen
+        let req = self.auth_req(TreeRequest { root_path: root_path.to_string() });
+        let resp = client.get_tree(req).await?.into_inner(); // Lokale Variable 'client' nutzen
         Ok(resp.tree_output)
     }
 
