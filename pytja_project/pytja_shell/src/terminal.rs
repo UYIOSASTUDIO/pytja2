@@ -406,17 +406,18 @@ impl Terminal {
                 if args.is_empty() { println!("Usage: nano <file>"); return true; }
                 let path = self.vfs.lock().await.resolve_path(args[0]);
 
-                // WICHTIG: Local DB Check für Lock (falls gecacht)
-                // Hier fügen wir .expect() hinzu
+                // WICHTIG: Async DB check
                 let vfs_guard = self.vfs.lock().await;
-                if let Some(db) = vfs_guard.db() {
+
+                // FIX: get_db() ist async, also erst .await, dann das Option prüfen
+                if let Some(db) = vfs_guard.get_db().await {
                     if let Ok(Some(node)) = db.get_node(&path).await {
                         if !self.check_lock(&node) { return true; }
                     }
                 }
                 drop(vfs_guard); // Mutex freigeben für edit_file
 
-                // edit_file ist lokal (arbeitet auf Cache)
+                // edit_file ist jetzt auch async
                 if let Err(e) = self.vfs.lock().await.edit_file(args[0]).await {
                     println!("{}", e.to_string().red());
                 }

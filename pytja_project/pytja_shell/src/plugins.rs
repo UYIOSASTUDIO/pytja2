@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::vfs::VirtualFileSystem;
 use serde_json::Value;
-use pytja_core::PytjaRepository; // WICHTIG: Trait für DB Methoden
+use pytja_core::PytjaRepository;
 
 pub struct PluginManager {
     loaded_plugins: HashMap<String, Vec<u8>>,
@@ -81,8 +81,8 @@ impl PluginManager {
                                                let vfs = vfs_clone_read.lock().await;
                                                let full_path = vfs.resolve_path(&filename);
 
-                                               // FIX: Sicheres Unwrapping von db() (Option)
-                                               if let Some(db) = vfs.db() {
+                                               // FIX: async get_db().await statt db()
+                                               if let Some(db) = vfs.get_db().await {
                                                    match db.get_node(&full_path).await {
                                                        Ok(Some(mut node)) => {
                                                            // Content leeren für Metadaten-Transfer (Performance)
@@ -116,8 +116,8 @@ impl PluginManager {
                                              let vfs = vfs_clone_write.lock().await;
                                              let full_path = vfs.resolve_path(&filename);
 
-                                             // FIX: Sicheres Unwrapping von db() (Option)
-                                             if let Some(db) = vfs.db() {
+                                             // FIX: async get_db().await statt db()
+                                             if let Some(db) = vfs.get_db().await {
                                                  if let Ok(Some(node)) = db.get_node(&full_path).await {
                                                      if node.owner != vfs.user_id {
                                                          println!("Security Block: Plugin tried to edit file owned by {}", node.owner);

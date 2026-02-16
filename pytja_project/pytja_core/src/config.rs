@@ -46,16 +46,12 @@ impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
 
-        // Standard-Pfade ermitteln
-        let default_mounts = if cfg!(target_os = "windows") {
-            "mounts.json".to_string()
-        } else {
-            // Versuche System-Pfad, Fallback auf lokal
-            "/etc/pytja/mounts.json".to_string()
-        };
+        // FIX: Wir nutzen jetzt immer lokale Pfade als Default, um Permission-Fehler
+        // in /etc/ zu vermeiden, wenn man nicht als Root läuft.
+        let default_mounts = "mounts.json".to_string();
+        let default_logs = "logs".to_string();
 
         let s = Config::builder()
-            // 1. Defaults setzen
             .set_default("server.host", "127.0.0.1")?
             .set_default("server.port", 50051)?
             .set_default("database.primary_url", "sqlite://primary.db")?
@@ -64,18 +60,11 @@ impl AppConfig {
             .set_default("storage.s3_bucket", "")?
             .set_default("storage.s3_region", "us-east-1")?
             .set_default("paths.mounts_file", default_mounts)?
-            .set_default("paths.logs_dir", "./logs")?
+            .set_default("paths.logs_dir", default_logs)?
 
-            // 2. System Config (/etc/pytja/config.toml)
-            .add_source(File::with_name("/etc/pytja/config").required(false))
-
-            // 3. Lokale Config (config.toml)
+            // Config Sources (Priorität aufsteigend)
             .add_source(File::with_name("config").required(false))
-
-            // 4. Environment-spezifische Config (config/development.toml)
             .add_source(File::with_name(&format!("config/{}", run_mode)).required(false))
-
-            // 5. Environment Variablen (PYTJA_SERVER__PORT=9090)
             .add_source(Environment::with_prefix("PYTJA").separator("__"))
 
             .build()?;
