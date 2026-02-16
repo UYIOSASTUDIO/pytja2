@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use std::fs;
+use tokio::fs;
 use tracing::{info, warn, error};
 
 // Enterprise Database Support
@@ -40,18 +41,26 @@ impl DriverManager {
 
     /// Lädt die Konfiguration asynchron.
     /// Da dies oft beim Server-Start passiert, ist es wichtig, Fehler nur zu loggen und nicht abzustürzen.
+    /// Lädt die Konfiguration asynchron beim Start.
     pub async fn load_config(&self, config_path: &str) {
-        if let Ok(content) = fs::read_to_string(config_path) {
-            if let Ok(configs) = serde_json::from_str::<Vec<MountConfig>>(&content) {
-                info!("Loading {} mounts from config...", configs.len());
-                for cfg in configs {
-                    if let Err(e) = self.mount_internal(&cfg.name, &cfg.path, cfg.db_type, false).await {
-                        error!("Failed to mount {}: {}", cfg.name, e);
-                    }
+        info!("Loading configuration from '{}'", config_path);
+
+        match fs::read_to_string(config_path).await {
+            Ok(content) => {
+                match serde_json::from_str::<Vec<MountConfig>>(&content) {
+                    Ok(configs) => {
+                        info!("Found {} mount definitions.", configs.len());
+                        for cfg in configs {
+                            // save=false verhindert Endlosschleifen beim Laden
+                            if let Err(e) = self.mount_internal(&cfg.name, &cfg.path, cfg.db_type, false).await {
+                                error!("Failed to mount database '{}': {}", cfg.name, e);
+                            }
+                        }
+                    },
+                    Err(e) => warn!("Could not parse mounts.json: {}", e),
                 }
-            } else {
-                warn!("Could not parse mounts.json");
-            }
+            },
+            Err(_) => warn!("No mounts.json found. Starting with empty configuration."),
         }
     }
 
@@ -60,7 +69,6 @@ impl DriverManager {
         self.mount_internal(name, path, db_type, true).await
     }
 
-    /// Interne Logik: Erstellt den Treiber und speichert ihn in der Map.
     async fn mount_internal(&self, name: &str, path: &str, db_type: DatabaseType, save: bool) -> Result<(), PytjaError> {
         let repo: Arc<dyn PytjaRepository> = match db_type {
             DatabaseType::Sqlite => {
@@ -69,50 +77,67 @@ impl DriverManager {
                 Arc::new(driver)
             },
             DatabaseType::Postgres => {
-                // Connection String wird als "path" übergeben
                 let driver = postgres::PostgresDriver::new(path).await?;
                 driver.init().await?;
                 Arc::new(driver)
             },
-            _ => return Err(PytjaError::System("Unsupported DB".into())),
+            _ => return Err(PytjaError::System("Unsupported DB Type".into())),
         };
 
-        // In-Memory registrieren
+        // In-Memory registrieren (Sync Lock ist hier okay da kurzzeitig)
         {
             let mut map = self.connections.write().unwrap();
             map.insert(name.to_string(), repo);
         }
         info!("Mounted database '{}' type {:?}", name, db_type);
 
-        // Persistent speichern (JSON)
+        // Persistent speichern (Atomic & Async)
         if save {
-            let config_path = "mounts.json";
-            let mut configs: Vec<MountConfig> = Vec::new();
-
-            if let Ok(content) = fs::read_to_string(config_path) {
-                if let Ok(old) = serde_json::from_str::<Vec<MountConfig>>(&content) {
-                    configs = old;
-                }
-            }
-
-            let new_entry = MountConfig {
-                name: name.to_string(),
-                path: path.to_string(),
-                db_type: db_type.clone(),
-            };
-
-            // Update existierenden Eintrag oder füge neu hinzu
-            if let Some(existing) = configs.iter_mut().find(|c| c.name == name) {
-                *existing = new_entry;
-            } else {
-                configs.push(new_entry);
-            }
-
-            if let Ok(json) = serde_json::to_string_pretty(&configs) {
-                let _ = fs::write(config_path, json);
-            }
+            self.persist_mount(name, path, db_type).await?;
         }
 
+        Ok(())
+    }
+
+    /// Speichert die Konfiguration atomar auf der Festplatte.
+    async fn persist_mount(&self, name: &str, path: &str, db_type: DatabaseType) -> Result<(), PytjaError> {
+        let config_path = "mounts.json";
+        let temp_path = "mounts.json.tmp";
+
+        // 1. Bestehende Config lesen (oder leer starten)
+        let mut configs: Vec<MountConfig> = match fs::read_to_string(config_path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+
+        let new_entry = MountConfig {
+            name: name.to_string(),
+            path: path.to_string(),
+            db_type,
+        };
+
+        // 2. Eintrag aktualisieren oder hinzufügen
+        if let Some(existing) = configs.iter_mut().find(|c| c.name == name) {
+            *existing = new_entry;
+        } else {
+            configs.push(new_entry);
+        }
+
+        // 3. Serialisieren
+        let json = serde_json::to_string_pretty(&configs)
+            .map_err(|e| PytjaError::System(format!("Serialization error: {}", e)))?;
+
+        // 4. Atomic Write Pattern (Write .tmp -> Rename)
+        // Das verhindert korrupte Config-Dateien bei Abstürzen
+        if let Err(e) = fs::write(temp_path, &json).await {
+            return Err(PytjaError::System(format!("Failed to write temp config: {}", e)));
+        }
+
+        if let Err(e) = fs::rename(temp_path, config_path).await {
+            return Err(PytjaError::System(format!("Failed to commit config file: {}", e)));
+        }
+
+        info!("Persisted configuration to {}", config_path);
         Ok(())
     }
 

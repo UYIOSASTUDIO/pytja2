@@ -1,12 +1,15 @@
 use anyhow::Result;
 use pytja_core::crypto::CryptoService;
 use std::sync::Arc;
-use tokio::sync::Mutex; // WICHTIG: Tokio Mutex für async/await Support!
+use tokio::sync::Mutex;
 use colored::*;
 use rpassword::read_password;
 use std::io::{self, Write};
 use std::fs;
 use std::path::Path;
+// NEU: Für den Ladebalken
+use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Duration;
 
 // Module einbinden
 mod terminal;
@@ -31,7 +34,6 @@ async fn main() -> Result<()> {
     println!("========================================");
 
     // 2. Identity Load (Simulation eines Hardware-Keys)
-    // Wir suchen nach einer .pytja Datei im 'usb_drive' Ordner
     let mut key_file: Option<String> = None;
     let mut username = String::new();
 
@@ -59,50 +61,75 @@ async fn main() -> Result<()> {
     let key_path = key_file.unwrap();
     println!("Identity detected: {} ({})", username.cyan().bold(), key_path);
 
-    // 3. Password Prompt (Entschlüsselung des Private Keys)
+    // 3. Password Prompt
     print!("Enter Identity Password: ");
     io::stdout().flush()?;
     let password = read_password()?;
+
+    // --- START VISUAL FEEDBACK (SPINNER) ---
+    // Wir starten den Spinner HIER, weil jetzt die Arbeit beginnt
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.green} {msg}")
+        .unwrap());
+    pb.set_message("Decrypting Identity...");
+    pb.enable_steady_tick(Duration::from_millis(100));
 
     let encrypted_pem = fs::read_to_string(&key_path)?;
 
     // Versuche den Key zu entschlüsseln
     let signing_key = match CryptoService::decrypt_private_key_local(&encrypted_pem, &password) {
-        Ok(k) => k,
+        Ok(k) => {
+            pb.set_message("Identity Unlocked. Establishing Uplink...");
+            k
+        },
         Err(_) => {
-            println!("{}", "ACCESS DENIED. WRONG PASSWORD.".red().bold());
+            pb.finish_with_message("DECRYPTION FAILED.".red().to_string());
             return Ok(());
         }
     };
 
-    println!("{}", "Identity Unlocked. Connecting to Neural Link...".green());
-
     // 4. Server Handshake & Login
-    // Verbindung aufbauen
     let mut client = PytjaClient::new("127.0.0.1:50051", signing_key.clone(), username.clone());
 
-    // Uplink Check (Ping)
-    if !client.check_uplink().await? {
-        println!("Server unreachable or offline.");
+    // Uplink Check
+    if let Ok(true) = client.check_uplink().await {
+        // Alles gut
+    } else {
+        pb.finish_with_message("Server unreachable.".red().to_string());
         return Ok(());
     }
+
+    pb.set_message("Performing Cryptographic Handshake...");
 
     // Challenge-Response Authentifizierung
-    let challenge = client.get_challenge(&username).await?;
+    let challenge = match client.get_challenge(&username).await {
+        Ok(c) => c,
+        Err(e) => {
+            pb.finish_with_message(format!("Handshake Error: {}", e).red().to_string());
+            return Ok(());
+        }
+    };
 
-    // Signieren (Core liefert Base64 String zurück)
     let signature = CryptoService::sign_message(&signing_key, challenge.as_bytes());
 
-    // Login Request senden
-    let login_resp = client.login(&username, &challenge, &signature).await?;
+    let login_resp = match client.login(&username, &challenge, &signature).await {
+        Ok(r) => r,
+        Err(e) => {
+            pb.finish_with_message(format!("Login Error: {}", e).red().to_string());
+            return Ok(());
+        }
+    };
 
     if login_resp.success {
-        println!("{} Session Token acquired.", "LOGIN SUCCESSFUL.".green().bold());
         client.set_token(&login_resp.token);
+        // ERFOLG: Spinner beenden
+        pb.finish_with_message("ACCESS GRANTED.".green().bold().to_string());
     } else {
-        println!("Login Failed: {}", login_resp.message.red());
+        pb.finish_with_message(format!("Login Denied: {}", login_resp.message).red().to_string());
         return Ok(());
     }
+    // --- END VISUAL FEEDBACK ---
 
     // 5. Plugin System Init
     println!("Loading WASM Plugins...");
@@ -118,17 +145,13 @@ async fn main() -> Result<()> {
     println!("Plugins loaded: {}", plugin_manager.list_functions().len());
 
     // 6. Virtual File System (Local Cache)
-    // Initialisierung ist async wegen DB-Verbindung
     let vfs = VirtualFileSystem::new(username.clone(), DB_PATH).await;
-
-    // WICHTIG: Wir nutzen Arc<tokio::sync::Mutex<...>> für Thread-Safety im Async-Kontext
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
     // 7. Terminal Start
     println!("Starting Terminal Interface...\n");
     let mut term = Terminal::new(vfs_shared, username, plugin_manager, client);
 
-    // Hauptschleife starten (REPL)
     term.start().await?;
 
     println!("Session terminated.");

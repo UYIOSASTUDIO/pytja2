@@ -12,6 +12,8 @@ use chrono::{DateTime, Local};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use pytja_proto::FileInfo;
+use indicatif::{ProgressBar, ProgressStyle}; // NEU: Für Ladebalken
+use directories::ProjectDirs; // NEU: Für Speicherpfade
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
@@ -39,6 +41,21 @@ impl Terminal {
         self.print_banner();
         let mut rl = DefaultEditor::new()?;
 
+        // 1. History laden (Enterprise Standard)
+        let history_path = if let Some(proj_dirs) = ProjectDirs::from("com", "pytja", "shell") {
+            let data_dir = proj_dirs.data_dir();
+            std::fs::create_dir_all(data_dir).ok(); // Ordner erstellen falls nicht existent
+            Some(data_dir.join("history.txt"))
+        } else {
+            None
+        };
+
+        if let Some(ref path) = history_path {
+            if rl.load_history(path).is_err() {
+                // Keine History vorhanden oder Fehler, ignorieren wir beim ersten Start
+            }
+        }
+
         loop {
             let cwd = self.vfs.lock().await.get_cwd().to_string();
             let prompt = format!("┌──({}㉿pytja)-[{}]\n└─$ ", self.user_id.red(), cwd.blue());
@@ -53,13 +70,46 @@ impl Terminal {
                     // Support für verkettete Befehle (cmd1 && cmd2)
                     let commands: Vec<&str> = line.split("&&").collect();
                     for cmd_str in commands {
-                        if !self.execute_command(cmd_str.trim()).await { break; }
+                        if !self.execute_command(cmd_str.trim()).await {
+                            // Wenn 'exit' aufgerufen wurde, brechen wir den Loop ab
+                            break;
+                        }
                     }
                 },
-                Err(_) => break,
+                Err(ReadlineError::Interrupted) => {
+                    println!("CTRL-C");
+                    break;
+                },
+                Err(ReadlineError::Eof) => {
+                    println!("CTRL-D");
+                    break;
+                },
+                Err(err) => {
+                    println!("Error: {:?}", err);
+                    break;
+                }
             }
         }
+
+        // 2. History speichern beim Exit
+        if let Some(ref path) = history_path {
+            let _ = rl.save_history(path);
+        }
+
         Ok(())
+    }
+
+    fn format_size(&self, size: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+        let mut size = size as f64;
+        let mut unit_idx = 0;
+
+        while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit_idx += 1;
+        }
+
+        format!("{:.2} {}", size, UNITS[unit_idx])
     }
 
     fn print_banner(&self) {
@@ -402,16 +452,16 @@ impl Terminal {
 
             "upload" => {
                 if args.is_empty() { println!("Usage: upload <path> [dest] [-lock] [-a]"); return true; }
+                // Argument Parsing (gleich wie vorher)
                 let mut host_path_arg = String::new();
                 let mut dest_path_arg: Option<String> = None;
                 let mut lock_pass = None;
-                let mut apply_all = false;
                 let mut clean_args = Vec::new();
                 for arg in args {
                     if *arg == "-lock" {
                         let p = self.ask_password("Set Upload Password: ");
                         if !p.is_empty() { lock_pass = Some(p); }
-                    } else if *arg == "-a" { apply_all = true; }
+                    } else if *arg == "-a" { /* ignored */ }
                     else { clean_args.push(*arg); }
                 }
                 if !clean_args.is_empty() { host_path_arg = clean_args[0].to_string(); }
@@ -425,11 +475,36 @@ impl Terminal {
                     self.vfs.lock().await.resolve_path(&fname)
                 };
 
-                println!("{} {} -> {}", "Uploading:".blue(), clean_host_path, target_path);
+                // NEU: Dateigröße ermitteln für Progress Bar
+                let file_size = std::fs::metadata(clean_host_path).map(|m| m.len()).unwrap_or(0);
 
+                println!("{} {} -> {}", "Initiating Upload:".blue(), clean_host_path, target_path);
+
+                // Spinner starten (da wir Upload noch nicht in Chunks im Client exposed haben)
+                // Für echte Enterprise-Lösungen müssten wir den 'upload_file' Stream hier manuell steuern.
+                // Vorerst nutzen wir einen Spinner, der "Busy" anzeigt.
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(ProgressStyle::default_spinner()
+                    .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                    .unwrap());
+                pb.set_message(format!("Uploading {}...", clean_host_path));
+                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+                let start = std::time::Instant::now();
                 match self.client.upload_file(clean_host_path, &target_path, lock_pass, &self.user_id).await {
-                    Ok(msg) => println!("{}", msg.green()),
-                    Err(e) => println!("{}", e.to_string().red()),
+                    Ok(msg) => {
+                        pb.finish_and_clear();
+                        let duration = start.elapsed();
+                        let speed = if duration.as_secs_f64() > 0.0 {
+                            (file_size as f64 / 1024.0 / 1024.0) / duration.as_secs_f64()
+                        } else { 0.0 };
+
+                        println!("{} ({}) in {:.2}s ({:.2} MB/s)", msg.green(), self.format_size(file_size), duration.as_secs_f64(), speed);
+                    },
+                    Err(e) => {
+                        pb.finish_with_message("Failed");
+                        println!("{}", e.to_string().red());
+                    }
                 }
             },
 
@@ -441,16 +516,49 @@ impl Terminal {
 
                 let full_remote = self.vfs.lock().await.resolve_path(remote_arg);
 
+                // 1. UX Feedback start
+                println!("{} {} -> {}", "Downloading:".blue(), full_remote, clean_local);
+
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(ProgressStyle::default_spinner()
+                    .template("{spinner:.cyan} [{elapsed_precise}] {msg}")
+                    .unwrap());
+                pb.set_message(format!("Receiving {}...", full_remote));
+                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                let start = std::time::Instant::now();
+
+                // 2. Action
+                // Wir versuchen es erst ohne Passwort
                 match self.client.download_file(&full_remote, clean_local, None).await {
-                    Ok(msg) => println!("{}", msg.green()),
+                    Ok(msg) => {
+                        pb.finish_and_clear();
+                        let duration = start.elapsed().as_secs_f64();
+                        println!("{} in {:.2}s", msg.green(), duration);
+                    },
                     Err(e) => {
-                        if e.to_string().contains("Password") {
+                        // Check auf Passwort-Schutz
+                        if e.to_string().contains("Password") || e.to_string().contains("locked") {
+                            pb.finish_and_clear(); // Spinner stoppen für Eingabe
                             let pass = self.ask_password("🔒 Enter Password for Download: ");
+
+                            // Spinner Neustart für 2. Versuch
+                            let pb2 = ProgressBar::new_spinner();
+                            pb2.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}").unwrap());
+                            pb2.set_message("Decrypting & Downloading...");
+                            pb2.enable_steady_tick(std::time::Duration::from_millis(100));
+
                             match self.client.download_file(&full_remote, clean_local, Some(pass)).await {
-                                Ok(msg) => println!("{}", msg.green()),
-                                Err(e2) => println!("{}", e2.to_string().red()),
+                                Ok(msg) => {
+                                    pb2.finish_and_clear();
+                                    println!("{} (Decrypted)", msg.green());
+                                },
+                                Err(e2) => {
+                                    pb2.finish_with_message("Failed");
+                                    println!("{}", e2.to_string().red());
+                                }
                             }
                         } else {
+                            pb.finish_with_message("Failed");
                             println!("{}", e.to_string().red());
                         }
                     }
