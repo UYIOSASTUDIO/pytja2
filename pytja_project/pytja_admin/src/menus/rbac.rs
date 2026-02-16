@@ -1,5 +1,5 @@
 use crate::client::AdminClient;
-use dialoguer::{theme::ColorfulTheme, Select, Input, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, Select, Input, MultiSelect, Confirm}; // Confirm hinzugefügt
 use comfy_table::{Table, presets::UTF8_FULL, Cell, Color, Attribute};
 use console::Term;
 

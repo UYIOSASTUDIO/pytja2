@@ -48,7 +48,7 @@ async fn list_mounts(client: &mut AdminClient) -> anyhow::Result<()> {
         let status_cell = if m.is_connected {
             Cell::new("✅ ONLINE").fg(Color::Green).add_attribute(Attribute::Bold)
         } else {
-            Cell::new("❌ OFFLINE").fg(Color::Red).add_attribute(Attribute::Blink)
+            Cell::new("❌ OFFLINE").fg(Color::Red).add_attribute(Attribute::Bold)
         };
 
         let type_display = if m.name == "primary" {

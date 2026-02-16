@@ -80,11 +80,14 @@ async fn create_user_flow(client: &mut AdminClient) -> anyhow::Result<()> {
         .with_prompt("Username")
         .interact_text()?;
 
-    let role: String = Input::with_theme(&ColorfulTheme::default())
+    // FIX: Select statt Input für Rollen-Auswahl
+    let roles = vec!["user", "admin", "guest", "auditor"];
+    let role_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Role")
-        .default("user".into())
-        .items(&["user", "admin", "guest", "auditor"])
-        .interact_text()?;
+        .default(0)
+        .items(&roles)
+        .interact()?;
+    let role = roles[role_idx].to_string();
 
     let quota_gb: u64 = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("Quota Limit (GB) - 0 for Server Default")
@@ -103,11 +106,17 @@ async fn create_user_flow(client: &mut AdminClient) -> anyhow::Result<()> {
     if !usb_path.exists() { fs::create_dir_all(usb_path)?; }
 
     let id_file_path = usb_path.join(format!("{}.pytja", username));
+
+    // FIX: Neue Base64 Engine API nutzen (vermeidet Deprecation Warnings)
+    use base64::{Engine as _, engine::general_purpose};
+    let priv_b64 = general_purpose::STANDARD.encode(signing_key.to_bytes());
+    let pub_b64 = general_purpose::STANDARD.encode(&pub_key_bytes);
+
     let id_content = format!(
         "PYTJA-ID-V1\nUSER:{}\nPRIV:{}\nPUB:{}\nROLE:{}",
         username,
-        base64::encode(signing_key.to_bytes()), // Base64 crate nötig!
-        base64::encode(&pub_key_bytes),
+        priv_b64,
+        pub_b64,
         role
     );
 

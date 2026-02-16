@@ -1,11 +1,13 @@
 use tonic::{transport::Server, Request, Response, Status};
+use tonic::metadata::MetadataMap; // FIX: Import hinzugefügt
 use pytja_proto::pytja::pytja_service_server::{PytjaService, PytjaServiceServer};
-// FIX: Alle neuen Request/Response Typen hinzugefügt
 use pytja_proto::pytja::{
     ActionResponse, AddMountRequest, AdminActionResponse, ChallengeRequest, ChallengeResponse,
     CreateNodeRequest, DeleteNodeRequest, GetMountsRequest, GetMountsResponse, LoginRequest,
-    LoginResponse, MoveNodeRequest, RemoveMountRequest, UploadData, UploadRequest,
-    // NEU:
+    LoginResponse, MoveNodeRequest, RemoveMountRequest, UploadRequest,
+    // FIX: UploadData ist ein nested Enum (oneof), wir aliassen es hier
+    upload_request::Data as UploadData,
+
     ListUsersRequest, ListUsersResponse, UserData,
     RegisterUserRequest, RegisterUserResponse,
     SetQuotaRequest, SetQuotaResponse,
@@ -13,23 +15,46 @@ use pytja_proto::pytja::{
     GetAuditLogsRequest, GetAuditLogsResponse, AuditLogEntry,
     LogStreamRequest, LogStreamEntry,
     ListRolesRequest, ListRolesResponse, RoleInfo,
-    CreateRoleRequest, AddPermissionRequest
+    CreateRoleRequest, AddPermissionRequest,
+    ChangeRoleRequest, ChangeRoleResponse,
+    AssignRoleRequest,
+    GetSessionsRequest, GetSessionsResponse, SessionInfo,
+    KickUserRequest, BanUserRequest, BanUserResponse,
+    MountInfo,
+    PingRequest, PingResponse,
+    ListRequest, ListResponse, FileInfo,
+    DownloadRequest, FileChunk,
+    ReadFileRequest, ReadFileResponse,
+    CopyNodeRequest,
+    ChangeModeRequest, ChownRequest, LockRequest,
+    UsageRequest, UsageResponse,
+    FindRequest, FindResponse,
+    GrepRequest, GrepResponse,
+    TreeRequest, TreeResponse,
+    StatRequest, StatResponse,
+    ExecRequest, ExecResponse,
 };
 use pytja_core::{
-    DriverManager, PytjaRepository, PytjaError,
-    models::{FileNode, User}, // FIX: User Model importiert
-    drivers::DatabaseType
+    DriverManager, PytjaRepository, PytjaError, AppConfig, BlobStorage, FileSystemStorage, S3Storage,
+    models::{FileNode, User, Role, Claims},
+    drivers::DatabaseType,
+    crypto::CryptoService,
 };
-// FIX: CpuExt und SystemExt für cpu_usage()
+
+// FIX: SessionManager ist lokal in diesem Crate, nicht in Core
+mod session_manager;
+use crate::session_manager::SessionManager;
+
 use sysinfo::{CpuExt, SystemExt, System};
 use std::sync::Arc;
-use tokio::sync::{mpsc, broadcast}; // Broadcast für Logs
+use tokio::sync::{mpsc, broadcast};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use bytes::Bytes;
 use std::env;
+use std::collections::HashSet;
 use tracing::{info, warn, error};
-use pytja_server::session_manager::SessionManager;
+use jsonwebtoken::{encode, Header, EncodingKey};
 
 const JWT_SECRET: &[u8] = b"pytja_super_secret_key_change_me_in_prod";
 const DEFAULT_QUOTA_LIMIT: usize = 1 * 1024 * 1024 * 1024; // 1 GB
