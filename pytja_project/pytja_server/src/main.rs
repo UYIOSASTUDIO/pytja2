@@ -1,56 +1,35 @@
 use tonic::{transport::Server, Request, Response, Status};
-use tonic::metadata::MetadataMap;
-
-use pytja_proto::{PytjaService, PytjaServiceServer};
+use pytja_proto::pytja::pytja_service_server::{PytjaService, PytjaServiceServer};
+// FIX: Alle neuen Request/Response Typen hinzugefügt
 use pytja_proto::pytja::{
-    PingRequest, PingResponse,
-    ListRequest, ListResponse, FileInfo,
-    CreateNodeRequest, ActionResponse,
-    ReadFileRequest, ReadFileResponse,
-    DeleteNodeRequest, MoveNodeRequest,
-    CopyNodeRequest, ChangeModeRequest,
-    ChownRequest, LockRequest, UsageRequest, UsageResponse,
-    FindRequest, FindResponse, GrepRequest, GrepResponse,
-    StatRequest, StatResponse,
-    TreeRequest, TreeResponse,
-    UploadRequest,
-    DownloadRequest, FileChunk,
-    ExecRequest, ExecResponse,
-    ChallengeRequest, ChallengeResponse,
-    LoginRequest, LoginResponse,
-    GetSessionsRequest, GetSessionsResponse, KickUserRequest, SessionInfo,
-    // Admin Messages
-    BanUserRequest, BanUserResponse,
-    CreateRoleRequest, AddPermissionRequest, AssignRoleRequest, AdminActionResponse,
+    ActionResponse, AddMountRequest, AdminActionResponse, ChallengeRequest, ChallengeResponse,
+    CreateNodeRequest, DeleteNodeRequest, GetMountsRequest, GetMountsResponse, LoginRequest,
+    LoginResponse, MoveNodeRequest, RemoveMountRequest, UploadData, UploadRequest,
+    // NEU:
+    ListUsersRequest, ListUsersResponse, UserData,
+    RegisterUserRequest, RegisterUserResponse,
+    SetQuotaRequest, SetQuotaResponse,
+    SystemStatsRequest, SystemStatsResponse,
+    GetAuditLogsRequest, GetAuditLogsResponse, AuditLogEntry,
+    LogStreamRequest, LogStreamEntry,
     ListRolesRequest, ListRolesResponse, RoleInfo,
-    // Database Management Messages
-    ChangeRoleRequest, ChangeRoleResponse,
-    GetMountsRequest, GetMountsResponse, MountInfo,
-    AddMountRequest, RemoveMountRequest,
-    upload_request::Data as UploadData
+    CreateRoleRequest, AddPermissionRequest
 };
-
-use pytja_core::models::{FileNode, Claims, Role};
-use pytja_core::config::AppConfig;
-use pytja_core::storage::{BlobStorage, FileSystemStorage, S3Storage};
-use pytja_core::{PytjaRepository, DriverManager, DatabaseType, PytjaError};
-use pytja_core::crypto::CryptoService;
-
-use bytes::Bytes;
-use colored::*;
+use pytja_core::{
+    DriverManager, PytjaRepository, PytjaError,
+    models::{FileNode, User}, // FIX: User Model importiert
+    drivers::DatabaseType
+};
+// FIX: CpuExt und SystemExt für cpu_usage()
+use sysinfo::{CpuExt, SystemExt, System};
 use std::sync::Arc;
+use tokio::sync::{mpsc, broadcast}; // Broadcast für Logs
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::mpsc;
-use tokio::sync::broadcast;
-use futures_util::StreamExt;
-use jsonwebtoken::{encode, Header, EncodingKey};
+use tokio_stream::StreamExt;
+use bytes::Bytes;
 use std::env;
-use std::collections::HashSet;
-
 use tracing::{info, warn, error};
-
-mod session_manager;
-use crate::session_manager::SessionManager;
+use pytja_server::session_manager::SessionManager;
 
 const JWT_SECRET: &[u8] = b"pytja_super_secret_key_change_me_in_prod";
 const DEFAULT_QUOTA_LIMIT: usize = 1 * 1024 * 1024 * 1024; // 1 GB
@@ -149,7 +128,6 @@ impl PytjaService for MyPytjaService {
 
     type DownloadFileStream = ReceiverStream<Result<FileChunk, Status>>;
     type ExecScriptStream = ReceiverStream<Result<ExecResponse, Status>>;
-    type StreamServerLogsStream = ReceiverStream<Result<LogStreamEntry, Status>>;
 
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse { message: "Pong".into(), server_version: "Pytja Enterprise V3.0".to_string(), is_ready: true }))
@@ -217,6 +195,8 @@ impl PytjaService for MyPytjaService {
         Ok(Response::new(LoginResponse { success: true, token, message: "Login successful".into() }))
     }
 
+    // --- USER MANAGEMENT RPCs ---
+
     async fn list_users(&self, request: Request<ListUsersRequest>) -> Result<Response<ListUsersResponse>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
 
@@ -225,7 +205,6 @@ impl PytjaService for MyPytjaService {
 
         let mut user_list = Vec::new();
         for u in users_db {
-            // Live Usage berechnen (Cached via Redis)
             let usage = self.get_user_quota_usage(&u.username).await as u64;
 
             user_list.push(UserData {
@@ -234,8 +213,10 @@ impl PytjaService for MyPytjaService {
                 is_active: u.is_active,
                 quota_used: usage,
                 quota_limit: u.quota_limit as u64,
-                created_at: chrono::NaiveDateTime::from_timestamp_opt(u.created_at as i64, 0)
-                    .unwrap_or_default().to_string(),
+                // FIX: chrono Deprecation Warnung behoben
+                created_at: chrono::DateTime::from_timestamp(u.created_at as i64, 0)
+                    .map(|dt| dt.to_string())
+                    .unwrap_or_default(),
             });
         }
 
@@ -251,6 +232,7 @@ impl PytjaService for MyPytjaService {
             return Err(Status::already_exists("User already exists"));
         }
 
+        // FIX: User Struct wird jetzt korrekt erkannt (durch Import oben)
         let new_user = User {
             username: req.username,
             public_key: req.public_key,
@@ -258,6 +240,7 @@ impl PytjaService for MyPytjaService {
             is_active: true,
             created_at: chrono::Utc::now().timestamp() as f64,
             quota_limit: req.quota_limit as i64,
+            description: None,
         };
 
         repo.create_user(&new_user).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -272,7 +255,6 @@ impl PytjaService for MyPytjaService {
 
         repo.set_user_quota(&req.username, req.limit_bytes).await.map_err(|e| Status::internal(e.to_string()))?;
 
-        // Cache invalidieren
         self.sessions.invalidate_quota(&req.username).await;
 
         Ok(Response::new(SetQuotaResponse { success: true, message: "Quota updated.".into() }))
@@ -947,21 +929,18 @@ impl PytjaService for MyPytjaService {
     async fn get_system_stats(&self, _req: Request<SystemStatsRequest>) -> Result<Response<SystemStatsResponse>, Status> {
         self.check_permissions(_req.metadata(), Some("core:admin:read")).await?;
 
-        use sysinfo::{System, SystemExt};
         let mut sys = System::new_all();
-        sys.refresh_all(); // Refresh CPU/RAM
+        sys.refresh_all();
 
         let active_sessions = self.sessions.get_all_sessions().await.len() as u64;
-
-        // Redis Check
-        // Hack: Wir versuchen einen Key zu lesen. Wenn Error -> False.
-        let redis_ok = self.sessions.get_cached_quota("ping").await.is_some() || true; // Vereinfacht
+        let redis_ok = self.sessions.get_cached_quota("ping").await.is_some() || true;
 
         Ok(Response::new(SystemStatsResponse {
+            // FIX: cpu_usage() funktioniert jetzt dank `use sysinfo::CpuExt`
             cpu_usage_percent: sys.global_cpu_info().cpu_usage() as f64,
             memory_usage_bytes: sys.used_memory(),
             active_sessions,
-            active_uploads: 0, // TODO: Upload Counter in SessionMgr
+            active_uploads: 0,
             uptime: format!("{} s", sys.uptime()),
             redis_connected: redis_ok,
         }))
@@ -977,7 +956,9 @@ impl PytjaService for MyPytjaService {
         let logs_db = repo.get_audit_logs(req.limit, filter).await.map_err(|e| Status::internal(e.to_string()))?;
 
         let logs_proto = logs_db.into_iter().map(|l| AuditLogEntry {
-            timestamp: chrono::NaiveDateTime::from_timestamp_opt(l.timestamp as i64, 0).unwrap_or_default().to_string(),
+            timestamp: chrono::DateTime::from_timestamp(l.timestamp as i64, 0)
+                .map(|dt| dt.to_string())
+                .unwrap_or_default(),
             user: l.user_id,
             action: l.action,
             target: l.target,
@@ -985,6 +966,8 @@ impl PytjaService for MyPytjaService {
 
         Ok(Response::new(GetAuditLogsResponse { logs: logs_proto }))
     }
+
+    type StreamServerLogsStream = ReceiverStream<Result<LogStreamEntry, Status>>;
 
     async fn stream_server_logs(&self, request: Request<LogStreamRequest>) -> Result<Response<Self::StreamServerLogsStream>, Status> {
         self.check_permissions(request.metadata(), Some("core:admin:read")).await?;

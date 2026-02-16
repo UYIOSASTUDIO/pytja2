@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
+use sqlx::FromRow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Role {
@@ -7,18 +8,17 @@ pub struct Role {
     pub permissions: Vec<String>, // z.B. ["core:fs:read", "core:upload"]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct User {
     pub username: String,
     pub public_key: Vec<u8>,
-    pub description: Option<String>,
-
     pub role: String,
-
     pub is_active: bool,
-    pub created_at: String,
+    pub created_at: f64,
     #[sqlx(default)]
     pub quota_limit: i64,
+    #[sqlx(default)]
+    pub description: Option<String>, // Feld description hinzugefügt
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ pub struct AuditLogEntry {
 }
 
 // Ergänze AuditLog Model falls noch nicht da:
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AuditLog {
     pub id: i64,
     pub user_id: String,
