@@ -44,3 +44,5 @@ jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 dirs = "6.0.0"
 ed25519-dalek = "2.2.0"
 directories = "5.0"
+
+dialoguer = "0.10"
