@@ -54,7 +54,7 @@ impl AppConfig {
         let s = Config::builder()
             .set_default("server.host", "127.0.0.1")?
             .set_default("server.port", 50051)?
-            .set_default("database.primary_url", "sqlite://primary.db")?
+            .set_default("database.primary_url", "sqlite://pytja.db")?
             .set_default("storage.storage_type", "local")?
             .set_default("storage.local_path", "./data_storage")?
             .set_default("storage.s3_bucket", "")?
