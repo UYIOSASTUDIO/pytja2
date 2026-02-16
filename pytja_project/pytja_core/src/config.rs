@@ -46,10 +46,24 @@ impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
 
-        // FIX: Wir nutzen jetzt immer lokale Pfade als Default, um Permission-Fehler
-        // in /etc/ zu vermeiden, wenn man nicht als Root läuft.
-        let default_mounts = "mounts.json".to_string();
-        let default_logs = "logs".to_string();
+        // Enterprise Lösung: Pfade dynamisch anhand des OS ermitteln
+        let (default_mounts, default_logs, default_storage) = if let Some(proj_dirs) = ProjectDirs::from("com", "pytja", "server") {
+            let data_dir = proj_dirs.data_dir();
+            let config_dir = proj_dirs.config_dir();
+
+            // Ordner erstellen, falls nicht existent (wichtig!)
+            let _ = std::fs::create_dir_all(data_dir);
+            let _ = std::fs::create_dir_all(config_dir);
+
+            (
+                data_dir.join("mounts.json").to_string_lossy().to_string(),
+                data_dir.join("logs").to_string_lossy().to_string(),
+                data_dir.join("storage").to_string_lossy().to_string()
+            )
+        } else {
+            // Fallback auf lokal, falls OS-Pfade nicht ermittelbar (sehr unwahrscheinlich)
+            ("mounts.json".to_string(), "logs".to_string(), "data_storage".to_string())
+        };
 
         let s = Config::builder()
             .set_default("server.host", "127.0.0.1")?

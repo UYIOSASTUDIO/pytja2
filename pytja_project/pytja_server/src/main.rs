@@ -125,10 +125,20 @@ impl MyPytjaService {
     }
 
     async fn get_user_quota_usage(&self, username: &str) -> usize {
-        // WICHTIG: .await hinzugefügt
+        // 1. FAST PATH: Redis Cache fragen
+        if let Some(bytes) = self.sessions.get_cached_quota(username).await {
+            return bytes as usize;
+        }
+
+        // 2. SLOW PATH: SQL SUM() Query (nur wenn Cache leer/abgelaufen)
         if let Some(primary) = self.manager.get_repo("primary").await {
-            primary.get_total_usage(username).await.unwrap_or(0)
-        } else { 0 }
+            let usage = primary.get_total_usage(username).await.unwrap_or(0);
+
+            // Cache für 1 Stunde befüllen (Self-Healing)
+            self.sessions.set_cached_quota(username, usage as u64).await;
+            return usage;
+        }
+        0
     }
 }
 
@@ -246,21 +256,54 @@ impl PytjaService for MyPytjaService {
             None => return Err(Status::invalid_argument("Empty stream")),
         };
 
+        // --- LOCK CHECK ---
+        if !self.sessions.try_lock_file(&metadata.path, &claims.sub).await {
+            return Err(Status::aborted("File is currently busy/locked by another process."));
+        }
+        // --- END LOCK CHECK ---
+
         let limit: usize = env::var("PYTJA_QUOTA_LIMIT").unwrap_or_else(|_| DEFAULT_QUOTA_LIMIT.to_string()).parse().unwrap_or(DEFAULT_QUOTA_LIMIT);
         let current_usage = self.get_user_quota_usage(&claims.sub).await;
-        if current_usage >= limit { return Err(Status::resource_exhausted("Quota exceeded")); }
+        if current_usage >= limit {
+            self.sessions.unlock_file(&metadata.path, &claims.sub).await; // Unlock vor Return
+            return Err(Status::resource_exhausted("Quota exceeded"));
+        }
 
-        let (repo, relative_path) = self.resolve_repo(&metadata.path).await?;
+        let (repo, relative_path) = match self.resolve_repo(&metadata.path).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.unlock_file(&metadata.path, &claims.sub).await;
+                return Err(e);
+            }
+        };
+
+        self.sessions.init_upload(&claims.sub, &metadata.path).await;
 
         let mut upload_session_bytes = 0;
+        let mut last_redis_update = 0;
+
+        let session_manager = self.sessions.clone();
+        let owner_clone = claims.sub.clone();
+        let path_clone = metadata.path.clone();
+
         let byte_stream = stream.map(move |item| {
             match item {
                 Ok(req) => match req.data {
                     Some(UploadData::Chunk(data)) => {
-                        if current_usage + upload_session_bytes + data.len() > limit {
+                        let len = data.len();
+                        if current_usage + upload_session_bytes + len > limit {
                             return Err(PytjaError::QuotaExceeded { current: current_usage + upload_session_bytes, limit });
                         }
-                        upload_session_bytes += data.len();
+                        upload_session_bytes += len;
+
+                        if upload_session_bytes - last_redis_update > 5 * 1024 * 1024 {
+                            let sm = session_manager.clone();
+                            let o = owner_clone.clone();
+                            let p = path_clone.clone();
+                            let delta = upload_session_bytes - last_redis_update;
+                            tokio::spawn(async move { sm.update_upload_progress(&o, &p, delta).await; });
+                            last_redis_update = upload_session_bytes;
+                        }
                         Ok(Bytes::from(data))
                     },
                     _ => Ok(Bytes::new()),
@@ -270,8 +313,18 @@ impl PytjaService for MyPytjaService {
         });
 
         let pinned_stream = Box::pin(byte_stream);
-        let blob_id = self.storage.put(&metadata.path, pinned_stream).await
-            .map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
+        let result = self.storage.put(&metadata.path, pinned_stream).await;
+
+        // Cleanup
+        if result.is_ok() {
+            self.sessions.complete_upload(&claims.sub, &metadata.path).await;
+        }
+
+        // --- UNLOCK ---
+        self.sessions.unlock_file(&metadata.path, &claims.sub).await;
+        // --- END UNLOCK ---
+
+        let blob_id = result.map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
 
         let path_obj = std::path::Path::new(&relative_path);
         let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
@@ -284,6 +337,9 @@ impl PytjaService for MyPytjaService {
         };
 
         repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        // QUOTA UPDATE:
+        self.sessions.update_quota(&claims.sub, upload_session_bytes as i64).await;
 
         if let Some(primary) = self.manager.get_repo("primary").await {
             let _ = primary.log_action(&claims.sub, "UPLOAD", &metadata.path).await;
@@ -331,7 +387,19 @@ impl PytjaService for MyPytjaService {
     async fn create_node(&self, request: Request<CreateNodeRequest>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path).await?;
+
+        // Lock
+        if !self.sessions.try_lock_file(&req.path, &claims.sub).await {
+            return Err(Status::aborted("File/Path is busy."));
+        }
+
+        let (repo, relative_path) = match self.resolve_repo(&req.path).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.unlock_file(&req.path, &claims.sub).await;
+                return Err(e);
+            }
+        };
 
         let path_obj = std::path::Path::new(&relative_path);
         let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
@@ -343,7 +411,15 @@ impl PytjaService for MyPytjaService {
             permissions: 0, created_at: chrono::Utc::now().timestamp() as f64, blob_id: None,
         };
 
-        repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
+        let res = repo.save_node(&node).await;
+
+        // Unlock
+        self.sessions.unlock_file(&req.path, &claims.sub).await;
+
+        res.map_err(|e| Status::internal(e.to_string()))?;
+
+        self.sessions.update_quota(&claims.sub, req.content.len() as i64).await;
+
         if let Some(primary) = self.manager.get_repo("primary").await {
             let _ = primary.log_action(&claims.sub, "CREATE", &req.path).await;
         }
@@ -369,26 +445,160 @@ impl PytjaService for MyPytjaService {
     async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
-        let (repo, relative_path) = self.resolve_repo(&req.path).await?;
+
+        if !self.sessions.try_lock_file(&req.path, &claims.sub).await {
+            return Err(Status::aborted("File is busy."));
+        }
+
+        let (repo, relative_path) = match self.resolve_repo(&req.path).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.unlock_file(&req.path, &claims.sub).await;
+                return Err(e);
+            }
+        };
 
         if let Some(primary) = self.manager.get_repo("primary").await {
             let _ = primary.log_action(&claims.sub, "DELETE", &req.path).await;
         }
-        repo.delete_node_recursive(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let res = repo.delete_node_recursive(&relative_path).await;
+
+        self.sessions.unlock_file(&req.path, &claims.sub).await;
+
+        res.map_err(|e| Status::internal(e.to_string()))?;
+        self.sessions.invalidate_quota(&claims.sub).await;
         Ok(Response::new(ActionResponse { success: true, message: "Deleted".into() }))
     }
 
     async fn move_node(&self, request: Request<MoveNodeRequest>) -> Result<Response<ActionResponse>, Status> {
         let claims = self.check_permissions(request.metadata(), Some("core:fs:write")).await?;
         let req = request.into_inner();
-        let (repo, src_rel) = self.resolve_repo(&req.source_path).await?;
-        let (_, dst_rel) = self.resolve_repo(&req.dest_path).await?;
 
-        repo.move_path(&src_rel, &dst_rel).await.map_err(|e| Status::internal(e.to_string()))?;
-        if let Some(primary) = self.manager.get_repo("primary").await {
-            let _ = primary.log_action(&claims.sub, "MOVE", &format!("{}->{}", req.source_path, req.dest_path)).await;
+        // 1. Distributed Locking (Deadlock Prevention: Source first, then Dest)
+        if !self.sessions.try_lock_file(&req.source_path, &claims.sub).await {
+            return Err(Status::aborted("Source file is busy/locked."));
         }
-        Ok(Response::new(ActionResponse { success: true, message: "Moved".into() }))
+        if !self.sessions.try_lock_file(&req.dest_path, &claims.sub).await {
+            self.sessions.unlock_file(&req.source_path, &claims.sub).await; // Rollback Source
+            return Err(Status::aborted("Destination file is busy/locked."));
+        }
+
+        // Helper für sauberes Unlocking im Fehlerfall (RAII Pattern Emulation)
+        // Wir nutzen hier manuelle Unlocks in Error-Branches, da wir keine Destructors haben.
+
+        // 2. Resolve Repositories
+        let (repo_src, src_rel) = match self.resolve_repo(&req.source_path).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.sessions.unlock_file(&req.source_path, &claims.sub).await;
+                self.sessions.unlock_file(&req.dest_path, &claims.sub).await;
+                return Err(e);
+            }
+        };
+
+        let (repo_dst, dst_rel) = match self.resolve_repo(&req.dest_path).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.sessions.unlock_file(&req.source_path, &claims.sub).await;
+                self.sessions.unlock_file(&req.dest_path, &claims.sub).await;
+                return Err(e);
+            }
+        };
+
+        // 3. Ausführungs-Logik: Native Move vs. Cross-Repo Move
+        let move_result = if Arc::ptr_eq(&repo_src, &repo_dst) {
+            // A) FAST PATH: Selbes Repository (SQL Rename)
+            // Das ist atomar und performant.
+            repo_src.move_path(&src_rel, &dst_rel).await
+                .map_err(|e| Status::internal(e.to_string()))
+        } else {
+            // B) SLOW PATH: Cross-Repository Move (Copy + Delete)
+            // Hier müssen wir Daten physisch bewegen.
+
+            // B1. Source Node lesen
+            let src_node = match repo_src.get_node(&src_rel).await {
+                Ok(Some(n)) => n,
+                Ok(None) => Err(Status::not_found("Source file not found")),
+                Err(e) => Err(Status::internal(format!("Source DB Error: {}", e))),
+            };
+
+            match src_node {
+                Ok(node) => {
+                    if node.is_folder {
+                        // Rekursives Verschieben über DB-Grenzen hinweg ist komplex.
+                        // Für V1 blockieren wir das, um Dateninkonsistenz zu vermeiden.
+                        Err(Status::unimplemented("Cross-mount folder move not supported yet. Move files individually."))
+                    } else {
+                        // B2. Blob Handling (Enterprise Safe Copy)
+                        // Wenn es ein Blob ist, müssen wir ihn kopieren, damit er eine NEUE ID bekommt.
+                        // Würden wir nur die ID kopieren, würde das Löschen der Source den Blob löschen -> Datenverlust am Ziel!
+                        let new_blob_id = if let Some(old_id) = node.blob_id {
+                            match self.storage.get(&old_id).await {
+                                Ok(stream) => {
+                                    // Wir nutzen den Dest-Pfad als neuen Storage Key
+                                    match self.storage.put(&req.dest_path, stream).await {
+                                        Ok(new_id) => Some(new_id),
+                                        Err(e) => return Err(Status::internal(format!("Storage Write Error: {}", e))),
+                                    }
+                                },
+                                Err(e) => return Err(Status::internal(format!("Storage Read Error: {}", e))),
+                            }
+                        } else {
+                            None
+                        };
+
+                        // B3. Node am Ziel erstellen
+                        let path_obj = std::path::Path::new(&dst_rel);
+                        let name = path_obj.file_name().unwrap_or_default().to_str().unwrap_or("").to_string();
+
+                        let new_node = FileNode {
+                            path: dst_rel.clone(),
+                            name,
+                            owner: claims.sub.clone(), // Der Mover wird zum Owner
+                            is_folder: false,
+                            size: node.size,
+                            content: node.content, // Vec Copy (bei Blobs ist das leer)
+                            blob_id: new_blob_id,
+                            lock_pass: node.lock_pass,
+                            permissions: node.permissions,
+                            created_at: chrono::Utc::now().timestamp() as f64,
+                        };
+
+                        if let Err(e) = repo_dst.save_node(&new_node).await {
+                            Err(Status::internal(format!("Target DB Save Error: {}", e)))
+                        } else {
+                            // B4. Source Löschen (Erst wenn Save erfolgreich war!)
+                            if let Err(e) = repo_src.delete_node_recursive(&src_rel).await {
+                                // Kritischer Zustand: Ziel existiert, Quelle konnte nicht gelöscht werden.
+                                // Wir loggen das als Warnung, aber geben OK zurück, da die Daten sicher sind.
+                                tracing::error!("CRITICAL: Duplicate file created during move. Source delete failed: {}", e);
+                                Ok(())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    }
+                },
+                Err(e) => Err(e)
+            }
+        };
+
+        // 4. Locks freigeben (Always execute)
+        self.sessions.unlock_file(&req.source_path, &claims.sub).await;
+        self.sessions.unlock_file(&req.dest_path, &claims.sub).await;
+
+        // 5. Audit Log & Response
+        match move_result {
+            Ok(_) => {
+                self.sessions.invalidate_quota(&claims.sub).await;
+                if let Some(primary) = self.manager.get_repo("primary").await {
+                    let _ = primary.log_action(&claims.sub, "MOVE", &format!("{}->{}", req.source_path, req.dest_path)).await;
+                }
+                Ok(Response::new(ActionResponse { success: true, message: "Moved successfully".into() }))
+            },
+            Err(e) => Err(e)
+        }
     }
 
     async fn copy_node(&self, request: Request<CopyNodeRequest>) -> Result<Response<ActionResponse>, Status> {
@@ -409,6 +619,7 @@ impl PytjaService for MyPytjaService {
         };
 
         repo.save_node(&new_node).await.map_err(|e| Status::internal(e.to_string()))?;
+        self.sessions.update_quota(&claims.sub, new_node.size as i64).await;
         if let Some(primary) = self.manager.get_repo("primary").await {
             let _ = primary.log_action(&claims.sub, "COPY", &format!("{}->{}", req.source_path, req.dest_path)).await;
         }

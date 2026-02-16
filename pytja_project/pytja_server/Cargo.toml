@@ -16,7 +16,6 @@ pytja_core = { path = "../pytja_core" }
 
 # Utilities
 chrono = "0.4"
-uuid = { version = "1.0", features = ["v4"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 jsonwebtoken = "9.2" # Oder deine Version
@@ -30,3 +29,5 @@ redis = { version = "0.24", features = ["tokio-comp", "json"] }
 clap = { version = "4.4", features = ["derive"] }
 
 tracing-subscriber = "0.3"
+uuid = { version = "1.4", features = ["v4", "fast-rng", "macro-diagnostics"] }
+base64 = "0.21"
