@@ -44,7 +44,6 @@ impl AdminClient {
             username: username.to_string(),
         });
 
-        // FIX: Expliziter Typ für Response
         let challenge_resp: pytja::ChallengeResponse = self.client.get_challenge(challenge_req).await?.into_inner();
 
         if !challenge_resp.user_exists {
@@ -54,13 +53,18 @@ impl AdminClient {
         use base64::{Engine as _, engine::general_purpose};
         let priv_bytes = general_purpose::STANDARD.decode(priv_key_b64)?;
         let signing_key = SigningKey::from_bytes(&priv_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?);
+
+        // 1. Signieren (Ergibt Bytes)
         let signature = signing_key.sign(challenge_resp.challenge.as_bytes());
         let signature_bytes = signature.to_bytes().to_vec();
+
+        // 2. FIX: Bytes zu Base64 String konvertieren für Proto
+        let signature_str = general_purpose::STANDARD.encode(signature_bytes);
 
         let login_req = Request::new(pytja::LoginRequest {
             username: username.to_string(),
             challenge: challenge_resp.challenge,
-            signature: signature_bytes, // FIX: Vec<u8> ist korrekt laut Proto
+            signature: signature_str, // Jetzt String, wie erwartet
         });
 
         let login_resp: pytja::LoginResponse = self.client.login(login_req).await?.into_inner();

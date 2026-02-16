@@ -4,15 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Wir binden unsere eigene Library ein
-pytja_core = { path = "../pytja_core" }
-
-# Externe Tools für Input und Validierung
+tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 colored = "2.0"
-rpassword = "7.0"
-regex = "1.5"
+# Wir nutzen dialoguer für Passwörter, das ist robuster als rpassword
+dialoguer = "0.10"
 chrono = "0.4"
-tokio = { version = "1.0", features = ["full"] }
-uuid = { version = "1.0", features = ["v4"] }
-hex = "0.4"
+
+# Core & Crypto
+pytja_core = { path = "../pytja_core" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.21"
+
+# Verschlüsselung (Für den Private Key auf dem USB Stick)
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
