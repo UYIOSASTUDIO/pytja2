@@ -55,6 +55,7 @@ use std::env;
 use std::collections::HashSet;
 use tracing::{info, warn, error};
 use jsonwebtoken::{encode, Header, EncodingKey};
+use dotenv::dotenv;
 
 const JWT_SECRET: &[u8] = b"pytja_super_secret_key_change_me_in_prod";
 const DEFAULT_QUOTA_LIMIT: usize = 1 * 1024 * 1024 * 1024; // 1 GB
@@ -331,16 +332,14 @@ impl PytjaService for MyPytjaService {
             None => return Err(Status::invalid_argument("Empty stream")),
         };
 
-        // --- LOCK CHECK ---
         if !self.sessions.try_lock_file(&metadata.path, &claims.sub).await {
-            return Err(Status::aborted("File is currently busy/locked by another process."));
+            return Err(Status::aborted("File is busy."));
         }
-        // --- END LOCK CHECK ---
 
         let limit: usize = env::var("PYTJA_QUOTA_LIMIT").unwrap_or_else(|_| DEFAULT_QUOTA_LIMIT.to_string()).parse().unwrap_or(DEFAULT_QUOTA_LIMIT);
         let current_usage = self.get_user_quota_usage(&claims.sub).await;
         if current_usage >= limit {
-            self.sessions.unlock_file(&metadata.path, &claims.sub).await; // Unlock vor Return
+            self.sessions.unlock_file(&metadata.path, &claims.sub).await;
             return Err(Status::resource_exhausted("Quota exceeded"));
         }
 
@@ -356,7 +355,6 @@ impl PytjaService for MyPytjaService {
 
         let mut upload_session_bytes = 0;
         let mut last_redis_update = 0;
-
         let session_manager = self.sessions.clone();
         let owner_clone = claims.sub.clone();
         let path_clone = metadata.path.clone();
@@ -370,7 +368,6 @@ impl PytjaService for MyPytjaService {
                             return Err(PytjaError::QuotaExceeded { current: current_usage + upload_session_bytes, limit });
                         }
                         upload_session_bytes += len;
-
                         if upload_session_bytes - last_redis_update > 5 * 1024 * 1024 {
                             let sm = session_manager.clone();
                             let o = owner_clone.clone();
@@ -387,17 +384,15 @@ impl PytjaService for MyPytjaService {
             }
         });
 
+        // FIX: Absoluten Pfad verhindern! Wir entfernen den führenden Slash.
+        // Aus "/bild.png" wird "bild.png", das korrekt an ./data/blobs angehängt wird.
+        let storage_path = metadata.path.trim_start_matches('/').to_string();
+
         let pinned_stream = Box::pin(byte_stream);
-        let result = self.storage.put(&metadata.path, pinned_stream).await;
+        let result = self.storage.put(&storage_path, pinned_stream).await; // FIX: storage_path nutzen
 
-        // Cleanup
-        if result.is_ok() {
-            self.sessions.complete_upload(&claims.sub, &metadata.path).await;
-        }
-
-        // --- UNLOCK ---
+        if result.is_ok() { self.sessions.complete_upload(&claims.sub, &metadata.path).await; }
         self.sessions.unlock_file(&metadata.path, &claims.sub).await;
-        // --- END UNLOCK ---
 
         let blob_id = result.map_err(|e| Status::internal(format!("Storage Error: {}", e)))?;
 
@@ -412,13 +407,8 @@ impl PytjaService for MyPytjaService {
         };
 
         repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
-
-        // QUOTA UPDATE:
         self.sessions.update_quota(&claims.sub, upload_session_bytes as i64).await;
-
-        if let Some(primary) = self.manager.get_repo("primary").await {
-            let _ = primary.log_action(&claims.sub, "UPLOAD", &metadata.path).await;
-        }
+        if let Some(primary) = self.manager.get_repo("primary").await { let _ = primary.log_action(&claims.sub, "UPLOAD", &metadata.path).await; }
 
         Ok(Response::new(ActionResponse { success: true, message: "Upload complete".into() }))
     }
@@ -1016,11 +1006,12 @@ impl PytjaService for MyPytjaService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Config laden (Critical Path: Muss als erstes passieren)
+    // 1. Config & ENV (Critical fix for paths)
+    dotenv().ok(); // <--- DIESE ZEILE IST WICHTIG!
+
     let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");
 
     // 2. Telemetry initialisieren
-    // Wir nutzen den Pfad aus der Config. Der _guard muss im Scope bleiben, damit Logs geflushed werden.
     let _guard = pytja_core::telemetry::init_telemetry(&config.paths.logs_dir, "pytja_server.log");
 
     info!("Pytja Server Enterprise Edition starting up...");
