@@ -215,10 +215,12 @@ impl PytjaRepository for SqliteDriver {
             .bind(path).fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
 
         if let Some(row) = row {
-            // FIX: Robusteres Lesen der blob_id (leere Strings werden zu None)
+            // FIX: Robuste Deserialisierung für blob_id UND lock_pass
             let blob_id: Option<String> = row.try_get::<Option<String>, _>("blob_id")
-                .unwrap_or(None)
-                .filter(|s| !s.is_empty());
+                .unwrap_or(None).filter(|s| !s.is_empty());
+
+            let lock_pass: Option<String> = row.try_get::<Option<String>, _>("lock_pass")
+                .unwrap_or(None).filter(|s| !s.is_empty());
 
             Ok(Some(FileNode {
                 path: row.try_get("path").unwrap_or_default(),
@@ -226,9 +228,9 @@ impl PytjaRepository for SqliteDriver {
                 owner: row.try_get("owner").unwrap_or_default(),
                 is_folder: row.try_get("is_folder").unwrap_or(false),
                 content: row.try_get("content").unwrap_or_default(),
-                blob_id, // Nutzen der gefilterten ID
+                blob_id,
                 size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
-                lock_pass: row.try_get("lock_pass").ok(),
+                lock_pass, // Hier nutzen wir das gefilterte Ergebnis
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
             }))
@@ -248,10 +250,12 @@ impl PytjaRepository for SqliteDriver {
             let relative = p.strip_prefix(path).unwrap_or(&p).trim_start_matches('/');
             if relative.contains('/') { continue; }
 
-            // FIX: Auch hier robust lesen
+            // FIX: Auch hier Filterung anwenden
             let blob_id: Option<String> = row.try_get::<Option<String>, _>("blob_id")
-                .unwrap_or(None)
-                .filter(|s| !s.is_empty());
+                .unwrap_or(None).filter(|s| !s.is_empty());
+
+            let lock_pass: Option<String> = row.try_get::<Option<String>, _>("lock_pass")
+                .unwrap_or(None).filter(|s| !s.is_empty());
 
             nodes.push(FileNode {
                 path: p,
@@ -261,7 +265,7 @@ impl PytjaRepository for SqliteDriver {
                 content: vec![],
                 blob_id,
                 size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
-                lock_pass: row.try_get("lock_pass").ok(),
+                lock_pass,
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
             });

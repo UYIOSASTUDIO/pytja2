@@ -37,10 +37,6 @@ pub trait PytjaRepository: Send + Sync {
     async fn create_role(&self, role: &Role) -> Result<(), PytjaError>;
     async fn update_role_permissions(&self, name: &str, permissions: Vec<String>) -> Result<(), PytjaError>;
     async fn list_roles(&self) -> Result<Vec<Role>, PytjaError>;
-
-    // Audit
     async fn log_action(&self, user: &str, action: &str, target: &str) -> Result<(), PytjaError>;
-
-    // NEU: Nur diese Signatur ist korrekt
     async fn get_audit_logs(&self, limit: u32, user_filter: Option<String>) -> Result<Vec<AuditLog>, PytjaError>;
 }

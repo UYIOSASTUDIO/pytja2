@@ -96,19 +96,17 @@ impl Terminal {
         Ok(())
     }
 
-    // Zentrale Verteiler-Funktion
     async fn dispatch_command(&mut self, cmd_input: &str) -> bool {
         let parts: Vec<&str> = cmd_input.split_whitespace().collect();
         if parts.is_empty() { return true; }
         let cmd = parts[0];
-        let args = parts[1..].to_vec(); // Als Vec<&str> übergeben
+        let args = parts[1..].to_vec();
 
         match cmd {
-            "exit" => self.handle_exit(),
+            "exit" => return self.handle_exit(), // Gibt explizit false zurück
             "help" => self.handle_help(),
             "clear" => self.print_banner(),
             "whoami" => println!("{}", self.user_id.green().bold()),
-
             "ls" | "ll" => self.handle_ls(args).await,
             "cd" => self.handle_cd(args).await,
             "mkdir" => self.handle_mkdir(args).await,
@@ -118,21 +116,17 @@ impl Terminal {
             "rm" => self.handle_rm(args).await,
             "nano" => self.handle_nano(args).await,
             "cat" => self.handle_cat(args).await,
-
             "upload" => self.handle_upload(args).await,
             "download" => self.handle_download(args).await,
             "exec" => self.handle_exec(args).await,
-
             "chmod" => self.handle_chmod(args).await,
             "chown" => self.handle_chown(args).await,
             "lock" => self.handle_lock(args).await,
-
             "tree" => self.handle_tree(args).await,
             "stat" => self.handle_stat(args).await,
             "find" => self.handle_find(args).await,
             "grep" => self.handle_grep(args).await,
             "du" => self.handle_du(args).await,
-
             _ => {
                 if self.plugin_manager.has_command(cmd) {
                     println!("Executing Plugin: {}", cmd);
@@ -144,8 +138,7 @@ impl Terminal {
                 }
             }
         }
-
-        if cmd == "exit" { false } else { true }
+        true // Standardmäßig weiterlaufen
     }
 
     // --- COMMAND HANDLERS ---
@@ -255,23 +248,13 @@ impl Terminal {
             }
         };
 
-        // 2. Check: Existiert der Ordner? Ist er gelockt?
         match self.client.stat_node(&new_path).await {
-            Ok(stat) => {
-                if !stat.exists {
-                    println!("{} Directory not found.", "Error:".red());
-                    return;
-                }
-                if !stat.is_folder {
-                    println!("{} Not a directory.", "Error:".red());
-                    return;
-                }
-                if stat.is_locked {
-                    let _ = self.ask_password("Locked Directory. Enter Password (optional check): ");
-                }
-                // Update local state and VFS
-                self.current_path = new_path.clone();
-                self.vfs.lock().await.current_path = new_path;
+            Ok((exists, is_folder, is_locked)) => {
+                if !exists { println!("{} Directory not found.", "Error:".red()); return; }
+                if !is_folder { println!("{} Not a directory.", "Error:".red()); return; }
+                if is_locked { let _ = self.ask_password("Locked Directory. Enter Password: "); }
+                self.current_path = new_path;
+                self.vfs.lock().await.current_path = self.current_path.clone();
             },
             Err(e) => println!("{} {}", "Server Error:".red(), e),
         }
@@ -453,60 +436,45 @@ impl Terminal {
     }
 
     async fn handle_download(&self, args: Vec<&str>) {
-        if args.len() < 2 { println!("Usage: download <remote_path> <local_path>"); return; }
-        let remote_path = args[0];
-        let local_path_str = args[1];
-        let local_path = Path::new(local_path_str);
+        if args.len() < 2 { println!("Usage: download <remote> <local>"); return; }
+        let full_remote = self.resolve_path(args[0]).await;
+        let local_path = Path::new(args[1]);
 
-        // Resolve absolute remote path
-        let full_remote = self.resolve_path(remote_path).await;
-
+        // FIX: Tuple Destructuring
         match self.client.stat_node(&full_remote).await {
-            Ok(stat) => {
-                if !stat.exists {
-                    println!("{} Remote path not found.", "Error:".red());
-                    return;
-                }
-
-                if stat.is_folder {
-                    println!("Initiating Recursive Download: {} -> {}", full_remote, local_path_str);
-                    let mut stack = vec![(full_remote.clone(), local_path.to_path_buf())];
-                    std::fs::create_dir_all(local_path).unwrap_or(());
-
-                    let mut count = 0;
-                    while let Some((r_curr, l_curr)) = stack.pop() {
-                        match self.client.list_files(&r_curr).await {
-                            Ok(files) => {
-                                for file in files {
-                                    let child_remote = if r_curr == "/" { format!("/{}", file.name) } else { format!("{}/{}", r_curr, file.name) };
-                                    let child_local = l_curr.join(&file.name);
-
-                                    if file.is_folder {
-                                        std::fs::create_dir_all(&child_local).unwrap_or(());
-                                        stack.push((child_remote, child_local));
-                                    } else {
-                                        print!("Downloading {}... ", file.name);
-                                        match self.client.download_file(&child_remote, child_local.to_str().unwrap(), None).await {
-                                            Ok(_) => println!("{}", "OK".green()),
-                                            Err(_) => println!("{}", "FAIL".red()), // Simplified
-                                        }
-                                        count += 1;
+            Ok((exists, is_folder, _)) => {
+                if !exists { println!("Remote path not found."); return; }
+                if is_folder {
+                    println!("Recursive Download: {} -> {}", full_remote, local_path.display());
+                    std::fs::create_dir_all(local_path).ok();
+                    let mut stack = vec![(full_remote, local_path.to_path_buf())];
+                    while let Some((r, l)) = stack.pop() {
+                        if let Ok(files) = self.client.list_files(&r).await {
+                            for f in files {
+                                let c_r = if r == "/" { format!("/{}", f.name) } else { format!("{}/{}", r, f.name) };
+                                let c_l = l.join(&f.name);
+                                if f.is_folder {
+                                    std::fs::create_dir_all(&c_l).ok();
+                                    stack.push((c_r, c_l));
+                                } else {
+                                    print!("Downloading {}... ", f.name);
+                                    match self.client.download_file(&c_r, c_l.to_str().unwrap(), None).await {
+                                        Ok(_) => println!("{}", "OK".green()),
+                                        Err(_) => println!("{}", "FAIL".red()),
                                     }
                                 }
-                            },
-                            Err(e) => println!("Failed to list {}: {}", r_curr, e),
+                            }
                         }
                     }
-                    println!("Finished. {} files.", count);
                 } else {
-                    println!("Downloading: {} -> {}", full_remote, local_path_str);
-                    match self.client.download_file(&full_remote, local_path_str, None).await {
-                        Ok(msg) => println!("{}", msg.green()),
-                        Err(e) => println!("{} {}", "Download Error:".red(), e),
+                    println!("Downloading {}...", full_remote);
+                    match self.client.download_file(&full_remote, local_path.to_str().unwrap(), None).await {
+                        Ok(_) => println!("{}", "Done.".green()),
+                        Err(e) => println!("{}", e.to_string().red()),
                     }
                 }
             },
-            Err(e) => println!("{} {}", "Stat Error:".red(), e),
+            Err(e) => println!("Error: {}", e),
         }
     }
 
@@ -570,6 +538,8 @@ impl Terminal {
     async fn handle_stat(&self, args: Vec<&str>) {
         if args.is_empty() { return; }
         let full_path = self.resolve_path(args[0]).await;
+
+        // FIX: Tuple Destructuring
         match self.client.stat_node(&full_path).await {
             Ok((exists, is_folder, is_locked)) => {
                 println!("{}", "--- NODE STATUS ---".yellow());

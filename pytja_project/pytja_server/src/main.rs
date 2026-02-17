@@ -408,7 +408,7 @@ impl PytjaService for MyPytjaService {
             path: relative_path, name, owner: metadata.owner, is_folder: false,
             content: vec![], blob_id: Some(blob_id), size: upload_session_bytes,
             lock_pass: if metadata.lock_password.is_empty() { None } else { Some(metadata.lock_password) },
-            permissions: 0, created_at: chrono::Utc::now().timestamp() as f64,
+            permissions: 2, created_at: chrono::Utc::now().timestamp() as f64,
         };
 
         repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -481,7 +481,7 @@ impl PytjaService for MyPytjaService {
             path: relative_path.clone(), name, owner: req.owner, is_folder: req.is_folder,
             size: content_len, content: req.content,
             lock_pass: if req.lock_password.is_empty() { None } else { Some(req.lock_password) },
-            permissions: 0, created_at: chrono::Utc::now().timestamp() as f64, blob_id: None,
+            permissions: 2, created_at: chrono::Utc::now().timestamp() as f64, blob_id: None,
         };
 
         let res = repo.save_node(&node).await;
