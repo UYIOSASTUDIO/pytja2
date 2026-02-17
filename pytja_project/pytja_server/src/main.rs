@@ -384,12 +384,17 @@ impl PytjaService for MyPytjaService {
             }
         });
 
-        // FIX: Absoluten Pfad verhindern! Wir entfernen den führenden Slash.
-        // Aus "/bild.png" wird "bild.png", das korrekt an ./data/blobs angehängt wird.
-        let storage_path = metadata.path.trim_start_matches('/').to_string();
+        // 1. Pfad säubern (WICHTIG gegen os error 30)
+        let clean_path = metadata.path.trim_start_matches('/');
+        if clean_path.is_empty() || clean_path.ends_with('/') {
+            self.sessions.unlock_file(&metadata.path, &claims.sub).await;
+            return Err(Status::invalid_argument("Invalid filename (cannot be empty or root)"));
+        }
+        let storage_path = clean_path.to_string();
 
+        // 2. Stream pinnen und speichern
         let pinned_stream = Box::pin(byte_stream);
-        let result = self.storage.put(&storage_path, pinned_stream).await; // FIX: storage_path nutzen
+        let result = self.storage.put(&storage_path, pinned_stream).await;
 
         if result.is_ok() { self.sessions.complete_upload(&claims.sub, &metadata.path).await; }
         self.sessions.unlock_file(&metadata.path, &claims.sub).await;
