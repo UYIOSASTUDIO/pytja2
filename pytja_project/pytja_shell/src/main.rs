@@ -1,15 +1,16 @@
 use anyhow::Result;
-use pytja_core::crypto::CryptoService;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use colored::*;
-use rpassword::read_password;
 use std::io::{self, Write};
 use std::fs;
 use std::path::Path;
 // NEU: Für den Ladebalken
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
+
+// Krypto für Handshake (Signieren)
+use pytja_core::crypto::CryptoService;
 
 // Module einbinden
 mod terminal;
@@ -22,6 +23,8 @@ use crate::terminal::Terminal;
 use crate::vfs::VirtualFileSystem;
 use crate::plugins::PluginManager;
 use crate::network_client::PytjaClient;
+// FIX: Identity nutzen
+use crate::identity::Identity;
 
 const DB_PATH: &str = "pytja_local_cache.db";
 const IDENTITY_DIR: &str = "usb_drive";
@@ -35,8 +38,8 @@ async fn main() -> Result<()> {
 
     // 2. Identity Load (Simulation eines Hardware-Keys)
     let mut key_file: Option<String> = None;
-    let mut username = String::new();
 
+    // Suche nach .pytja Datei
     if let Ok(entries) = fs::read_dir(IDENTITY_DIR) {
         for entry in entries {
             if let Ok(entry) = entry {
@@ -44,7 +47,6 @@ async fn main() -> Result<()> {
                 if let Some(ext) = path.extension() {
                     if ext == "pytja" {
                         key_file = Some(path.to_string_lossy().to_string());
-                        username = path.file_stem().unwrap().to_string_lossy().to_string();
                         break;
                     }
                 }
@@ -59,35 +61,26 @@ async fn main() -> Result<()> {
     }
 
     let key_path = key_file.unwrap();
-    println!("Identity detected: {} ({})", username.cyan().bold(), key_path);
 
-    // 3. Password Prompt
-    print!("Enter Identity Password: ");
-    io::stdout().flush()?;
-    let password = read_password()?;
+    // FIX: Neue Identity Klasse verwenden (die kennt das V2 Format)
+    let identity = match Identity::load(&key_path) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("{} {}", "LOGIN FAILED:".red().bold(), e);
+            return Ok(());
+        }
+    };
 
-    // --- START VISUAL FEEDBACK (SPINNER) ---
-    // Wir starten den Spinner HIER, weil jetzt die Arbeit beginnt
+    let username = identity.username.clone();
+    let signing_key = identity.keypair; // Keypair ist jetzt direkt verfügbar
+
+    // --- VISUAL FEEDBACK START ---
     let pb = ProgressBar::new_spinner();
     pb.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} {msg}")
         .unwrap());
-    pb.set_message("Decrypting Identity...");
+    pb.set_message("Identity Unlocked. Establishing Uplink...");
     pb.enable_steady_tick(Duration::from_millis(100));
-
-    let encrypted_pem = fs::read_to_string(&key_path)?;
-
-    // Versuche den Key zu entschlüsseln
-    let signing_key = match CryptoService::decrypt_private_key_local(&encrypted_pem, &password) {
-        Ok(k) => {
-            pb.set_message("Identity Unlocked. Establishing Uplink...");
-            k
-        },
-        Err(_) => {
-            pb.finish_with_message("DECRYPTION FAILED.".red().to_string());
-            return Ok(());
-        }
-    };
 
     // 4. Server Handshake & Login
     let mut client = PytjaClient::new("127.0.0.1:50051", signing_key.clone(), username.clone());
@@ -123,7 +116,6 @@ async fn main() -> Result<()> {
 
     if login_resp.success {
         client.set_token(&login_resp.token);
-        // ERFOLG: Spinner beenden
         pb.finish_with_message("ACCESS GRANTED.".green().bold().to_string());
     } else {
         pb.finish_with_message(format!("Login Denied: {}", login_resp.message).red().to_string());
