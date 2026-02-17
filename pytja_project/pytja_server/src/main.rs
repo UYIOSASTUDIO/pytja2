@@ -511,9 +511,29 @@ impl PytjaService for MyPytjaService {
         if let Some(pass) = node.lock_pass {
             if pass != req.password { return Err(Status::permission_denied("File is locked")); }
         }
-        if node.blob_id.is_some() { return Err(Status::failed_precondition("File stored as blob. Use download.")); }
 
-        Ok(Response::new(ReadFileResponse { success: true, message: "Read success".into(), content: node.content }))
+        // FIX: Professionelles Handling von Blobs für 'cat'
+        let content = if let Some(blob_id) = node.blob_id {
+            // Limitierung für Performance/Sicherheit: Keine riesigen Dateien in den RAM laden
+            if node.size > 5 * 1024 * 1024 { // 5 MB Limit
+                return Err(Status::failed_precondition("File too large for cat (Blob). Use download command."));
+            }
+
+            // Blob aus Storage streamen und in RAM sammeln
+            let mut stream = self.storage.get(&blob_id).await
+                .map_err(|e| Status::internal(format!("Storage Read Error: {}", e)))?;
+
+            let mut buffer = Vec::with_capacity(node.size);
+            while let Some(chunk_res) = stream.next().await {
+                let chunk = chunk_res.map_err(|e| Status::internal(e.to_string()))?;
+                buffer.extend_from_slice(&chunk);
+            }
+            buffer
+        } else {
+            node.content
+        };
+
+        Ok(Response::new(ReadFileResponse { success: true, message: "Read success".into(), content }))
     }
 
     async fn delete_node(&self, request: Request<DeleteNodeRequest>) -> Result<Response<ActionResponse>, Status> {
