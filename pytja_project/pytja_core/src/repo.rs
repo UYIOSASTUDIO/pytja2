@@ -22,6 +22,9 @@ pub trait PytjaRepository: Send + Sync {
     async fn save_node(&self, node: &FileNode) -> Result<(), PytjaError>;
     async fn get_node(&self, path: &str) -> Result<Option<FileNode>, PytjaError>;
     async fn list_directory(&self, path: &str) -> Result<Vec<FileNode>, PytjaError>;
+    async fn list_recursive(&self, path: &str) -> Result<Vec<FileNode>, PytjaError> {
+        self.list_directory(path).await
+    }
     async fn delete_node_recursive(&self, path: &str) -> Result<(), PytjaError>;
     async fn move_path(&self, src: &str, dst: &str) -> Result<(), PytjaError>;
     async fn update_metadata(&self, path: &str, lock_pass: Option<String>, owner: Option<String>) -> Result<(), PytjaError>;

@@ -767,13 +767,51 @@ impl PytjaService for MyPytjaService {
         self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, rel_path) = self.resolve_repo(&req.root_path).await?;
-        let all_nodes = repo.list_directory(&rel_path).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        // 1. Daten holen (Rekursiv aus DB)
+        let mut all_nodes = repo.list_recursive(&rel_path).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        // 2. Sortieren (Wichtig für korrekte Baum-Optik: Ordnerstruktur)
+        all_nodes.sort_by(|a, b| a.path.cmp(&b.path));
 
         let mut output = String::new();
-        for node in all_nodes {
-            let marker = if node.is_folder { "[DIR]" } else { "[FILE]" };
-            output.push_str(&format!("{} {}\n", marker, node.path));
+        // Header (Startpunkt)
+        output.push_str(&format!("{}\n", req.root_path));
+
+        // 3. Baum generieren
+        // Basis-Tiefe ermitteln (wie viele Slashes hat der Startordner?)
+        let base_depth = if rel_path == "/" { 0 } else { rel_path.matches('/').count() };
+
+        let total_dirs = all_nodes.iter().filter(|n| n.is_folder).count();
+        let total_files = all_nodes.iter().filter(|n| !n.is_folder).count();
+
+        if all_nodes.is_empty() {
+            output.push_str("(empty)\n");
         }
+
+        for node in all_nodes {
+            // Root selbst nicht anzeigen
+            if node.path == rel_path || (rel_path == "/" && node.path.is_empty()) { continue; }
+
+            // Tiefe berechnen
+            let depth = node.path.matches('/').count();
+            let relative_depth = if depth >= base_depth { depth - base_depth } else { 0 };
+
+            // Einrückung: 4 Leerzeichen pro Ebene
+            let indent = "    ".repeat(relative_depth.saturating_sub(1));
+
+            // Präfix (Einfache Version, für perfekte '└──' Logik bräuchte man einen komplexeren Tree-Walker)
+            let prefix = if relative_depth > 0 { "└── " } else { "├── " };
+
+            // Metadaten Marker
+            let type_marker = if node.is_folder { "[DIR]" } else { "" };
+            let lock_marker = if node.lock_pass.is_some() { "🔒" } else { "" };
+
+            output.push_str(&format!("{}{}{}{} {}\n", indent, prefix, node.name, type_marker, lock_marker));
+        }
+
+        output.push_str(&format!("\n{} directories, {} files\n", total_dirs, total_files));
+
         Ok(Response::new(TreeResponse { tree_output: output }))
     }
 
