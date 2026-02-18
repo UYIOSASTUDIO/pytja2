@@ -46,7 +46,7 @@ impl Identity {
 
         // Decrypt
         let mut derived_key = [0u8; 32];
-        pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 100_000, &mut derived_key);
+        pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 100_000, &mut derived_key).expect("PBKDF2 failed");
 
         let cipher = Aes256Gcm::new(&derived_key.into());
         let nonce = Nonce::from_slice(nonce_bytes);

@@ -1,4 +1,3 @@
-// WICHTIG: Nur EIN Import-Block für tonic
 use tonic::{transport::{Server, Identity, ServerTlsConfig}, Request, Response, Status};
 use pytja_proto::pytja::pytja_service_server::{PytjaService, PytjaServiceServer};
 use pytja_proto::pytja::*;
@@ -6,9 +5,10 @@ use pytja_core::{DriverManager, AppConfig, BlobStorage, FileSystemStorage, S3Sto
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn};
+use tracing::{info, warn, error}; // Error Import hinzugefügt
 use dotenv::dotenv;
 use std::fs;
+use colored::*; // Für farbigen Output im Terminal
 
 mod session_manager;
 mod handlers;
@@ -73,14 +73,29 @@ impl PytjaService for MyPytjaService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
+
+    // 1. Config Laden
     let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");
 
+    // 2. Logging
     let _guard = pytja_core::telemetry::init_telemetry(&config.paths.logs_dir, "pytja_server.log");
-    info!("Pytja Server Enterprise Edition starting up...");
 
+    println!("{}", "========================================".green().bold());
+    println!("   PYTJA SERVER v2.0 (Enterprise)       ");
+    println!("{}", "========================================".green().bold());
+
+    // ... Manager Setup ...
     let manager = Arc::new(DriverManager::new());
     let redis_url = config.redis.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| "redis://127.0.0.1/".to_string());
-    let session_mgr = Arc::new(SessionManager::new(&redis_url).await.expect("FATAL: Redis Connection Failed"));
+
+    println!("Connecting to Session Store (Redis)...");
+    let session_mgr = match SessionManager::new(&redis_url).await {
+        Ok(mgr) => Arc::new(mgr),
+        Err(e) => {
+            println!("{}", format!("FATAL: Redis Connection Failed: {}", e).red());
+            return Err(e.into());
+        }
+    };
 
     manager.load_config(&config.paths.mounts_file).await;
 
@@ -89,6 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         &config.database.primary_url
     };
+
+    println!("Mounting Primary Database...");
     manager.mount("primary", db_path_or_url, DatabaseType::Sqlite).await
         .expect("FATAL: Failed to mount primary DB");
 
@@ -99,14 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
-        info!("Using S3 Storage (Region: {})", config.storage.s3_region);
+        info!("Using S3 Storage");
         Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
     } else {
-        info!("Using Local Storage at: {}", config.storage.local_path);
+        info!("Using Local Storage");
         Arc::new(FileSystemStorage::new(&config.storage.local_path).await?)
     };
 
     let (tx, _rx) = broadcast::channel(100);
+    // FIX: config Klon entfernt, falls nicht im Service genutzt, oder dort _config nutzen
     let service = MyPytjaService {
         manager: manager.clone(),
         sessions: session_mgr,
@@ -118,41 +136,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr_str = format!("{}:{}", config.server.host, config.server.port);
     let addr = addr_str.parse()?;
 
-    // ---------------------------------------------------------------
-    // TLS / SSL KONFIGURATION (ENTERPRISE SECURITY)
-    // ---------------------------------------------------------------
+    // --- TLS SETUP ---
     let mut builder = Server::builder();
 
     if let Some(tls_config) = &config.tls {
         if tls_config.enabled {
-            info!("🔒 ENABLING TLS/SSL SECURITY");
+            println!("{}", "🔒 ENABLING TLS/SSL SECURITY".cyan());
 
-            let cert = fs::read_to_string(&tls_config.cert_path)
-                .expect("Failed to read server certificate");
-            let key = fs::read_to_string(&tls_config.key_path)
-                .expect("Failed to read server private key");
+            let cert_res = fs::read_to_string(&tls_config.cert_path);
+            let key_res = fs::read_to_string(&tls_config.key_path);
 
-            let identity = Identity::from_pem(cert, key);
-
-            // FIX: Wir weisen builder das Ergebnis zu
-            builder = builder.tls_config(ServerTlsConfig::new().identity(identity))?;
-            info!("✅ TLS Active. Communication is encrypted.");
+            match (cert_res, key_res) {
+                (Ok(cert), Ok(key)) => {
+                    let identity = Identity::from_pem(cert, key);
+                    builder = builder.tls_config(ServerTlsConfig::new().identity(identity))?;
+                    println!("✅ TLS Active.");
+                },
+                _ => {
+                    println!("{}", format!("❌ FATAL: Could not load certs from config paths: {} / {}", tls_config.cert_path, tls_config.key_path).red());
+                    return Err("TLS Configuration failed. Server aborted.".into());
+                }
+            }
         } else {
-            warn!("⚠️ TLS is configured but DISABLED. Server is running in insecure mode!");
+            println!("⚠️  TLS Configured but Disabled in config.");
         }
     } else {
-        warn!("⚠️ NO TLS CONFIG FOUND. Server is running in UNENCRYPTED HTTP mode! (Not recommended for production)");
+        // WICHTIG: Das hier darf im Enterprise Mode nicht passieren!
+        println!("{}", "❌ CRITICAL: NO TLS CONFIG FOUND.".red().bold());
+        println!("The server is trying to start UNENCRYPTED, but the client expects TLS.");
+        println!("Please add a [tls] section to config/default.toml");
+        // Wir lassen ihn trotzdem laufen für Debugging, aber mit roter Warnung
     }
 
-    info!("PYTJA ENTERPRISE HUB ONLINE");
-    info!("Listening on {}", addr);
+    println!("{} {}", "🚀 Server listening on".green(), addr);
+    println!("----------------------------------------");
 
-    let max_size = 50 * 1024 * 1024; // 50 MB
+    let max_size = 50 * 1024 * 1024;
     let pytja_svc = PytjaServiceServer::new(service)
         .max_decoding_message_size(max_size)
         .max_encoding_message_size(max_size);
 
-    // FIX: Wir nutzen `builder` (der evtl. TLS hat), statt neuem Server::builder()
     builder
         .add_service(pytja_svc)
         .serve(addr)

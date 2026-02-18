@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use pytja_core::{
     PytjaRepository, DriverManager, DatabaseType, FileNode, PytjaError
 };
