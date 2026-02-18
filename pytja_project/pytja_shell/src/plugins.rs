@@ -7,7 +7,7 @@ use wasmer::{Module, Store, Instance};
 use wasmer_wasi::WasiState;
 use serde::{Deserialize, Serialize};
 use colored::*;
-use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
+use dialoguer::{Confirm, theme::ColorfulTheme};
 
 // --- DATA STRUCTURES ---
 
@@ -41,7 +41,6 @@ pub struct PluginManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PermissionDb {
-    // Key: Plugin Name, Value: Liste der ERLAUBTEN Permissions
     pub granted: HashMap<String, HashSet<Permission>>,
 }
 
@@ -49,8 +48,8 @@ pub struct PermissionDb {
 
 pub struct PluginManager {
     plugin_dir: PathBuf,
-    modules: HashMap<String, Module>, // Cache für Code
-    manifests: HashMap<String, PluginManifest>, // Cache für Metadaten
+    modules: HashMap<String, Module>,
+    manifests: HashMap<String, PluginManifest>,
     store: Store,
     db_path: PathBuf,
     permissions_db: PermissionDb,
@@ -60,7 +59,6 @@ impl PluginManager {
     pub fn new<P: AsRef<Path>>(plugin_dir: P, data_dir: P) -> Self {
         let db_path = data_dir.as_ref().join("plugin_permissions.json");
 
-        // DB laden oder leer erstellen
         let permissions_db = if db_path.exists() {
             let content = fs::read_to_string(&db_path).unwrap_or_default();
             serde_json::from_str(&content).unwrap_or_default()
@@ -78,7 +76,6 @@ impl PluginManager {
         }
     }
 
-    /// Schritt 1: Lädt Plugins, prüft Permissions und fragt den User (Interaktiv)
     pub fn load_and_verify_plugins(&mut self) -> Result<()> {
         if !self.plugin_dir.exists() {
             fs::create_dir_all(&self.plugin_dir)?;
@@ -86,23 +83,18 @@ impl PluginManager {
 
         let mut new_plugins: Vec<PluginManifest> = Vec::new();
 
-        // 1. Scannen
         for entry in fs::read_dir(&self.plugin_dir)? {
             let entry = entry?;
             let path = entry.path();
 
-            // Wir suchen nach .wasm Files
             if path.extension().map_or(false, |ext| ext == "wasm") {
                 let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-
-                // Manifest suchen (plugin.wasm -> plugin.json)
                 let manifest_path = path.with_extension("json");
 
                 let manifest: PluginManifest = if manifest_path.exists() {
                     let content = fs::read_to_string(&manifest_path)?;
                     serde_json::from_str(&content).context(format!("Invalid manifest for {}", stem))?
                 } else {
-                    // Default Manifest wenn keines da ist (Safe default: Keine Rechte)
                     PluginManifest {
                         name: stem.clone(),
                         version: "0.0.0".into(),
@@ -111,16 +103,13 @@ impl PluginManager {
                     }
                 };
 
-                // WASM Kompilieren
                 match self.compile_module(&path) {
                     Ok(module) => {
                         self.modules.insert(manifest.name.clone(), module);
 
-                        // Check ob wir diesen Plugin + Permissions schon kennen
                         if !self.permissions_db.granted.contains_key(&manifest.name) {
                             new_plugins.push(manifest.clone());
                         } else {
-                            // Check ob NEUE Permissions dazugekommen sind (Version Upgrade)
                             let granted = self.permissions_db.granted.get(&manifest.name).unwrap();
                             let has_new_perms = manifest.permissions.iter().any(|p| !granted.contains(p));
                             if has_new_perms {
@@ -134,7 +123,6 @@ impl PluginManager {
             }
         }
 
-        // 2. User Abfrage für NEUE Plugins (Bulk Process)
         if !new_plugins.is_empty() {
             self.interactive_permission_grant(new_plugins)?;
         }
@@ -142,7 +130,6 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Interaktive CLI UI für Permission Granting
     fn interactive_permission_grant(&mut self, plugins: Vec<PluginManifest>) -> Result<()> {
         println!("\n{}", "🔒 SECURITY ALERT: NEW PLUGINS DETECTED".yellow().bold());
         println!("The following plugins are requesting permissions. Review them carefully.\n");
@@ -158,7 +145,6 @@ impl PluginManager {
             }
         }
 
-        // A) Low Risk Bulk Approval
         if !low_risk.is_empty() {
             println!("{}", "--- Standard Plugins (Safe to verify) ---".cyan());
             for p in &low_risk {
@@ -172,19 +158,17 @@ impl PluginManager {
                 .interact()?
             {
                 for p in low_risk {
-                    let set: HashSet<Permission> = p.permissions.into_iter().collect();
-                    self.permissions_db.granted.insert(p.name, set);
+                    let set: HashSet<Permission> = p.permissions.iter().cloned().collect();
+                    self.permissions_db.granted.insert(p.name.clone(), set);
                 }
             } else {
                 println!("{}", "⚠️  Plugins denied. They may not function correctly.".red());
-                // Wir speichern leere Sets, damit nicht jedes Mal gefragt wird, aber Zugriff verweigert ist
                 for p in low_risk {
-                    self.permissions_db.granted.insert(p.name, HashSet::new());
+                    self.permissions_db.granted.insert(p.name.clone(), HashSet::new());
                 }
             }
         }
 
-        // B) High Risk Approval (Explizit!)
         if !high_risk.is_empty() {
             println!("\n{}", "--- 🛡️  ELEVATED PRIVILEGES REQUESTED (ADMIN/ROOT) ---".red().bold());
             println!("These plugins requested full system access or network control.");
@@ -199,17 +183,16 @@ impl PluginManager {
                     .default(false)
                     .interact()?
                 {
-                    let set: HashSet<Permission> = p.permissions.into_iter().collect();
-                    self.permissions_db.granted.insert(p.name, set);
+                    let set: HashSet<Permission> = p.permissions.iter().cloned().collect();
+                    self.permissions_db.granted.insert(p.name.clone(), set);
                     println!("✅ Authorized.");
                 } else {
                     println!("❌ Denied.");
-                    self.permissions_db.granted.insert(p.name, HashSet::new());
+                    self.permissions_db.granted.insert(p.name.clone(), HashSet::new());
                 }
             }
         }
 
-        // 3. Speichern
         let json = serde_json::to_string_pretty(&self.permissions_db)?;
         fs::write(&self.db_path, json)?;
         println!("\nSecurity Policy updated.\n");
@@ -231,7 +214,6 @@ impl PluginManager {
         self.modules.keys().cloned().collect()
     }
 
-    // Execution mit Permission Enforcement
     #[instrument(skip(self, _vfs))]
     pub fn execute(
         &mut self,
@@ -245,30 +227,23 @@ impl PluginManager {
 
         info!("Executing Plugin '{}' with rights: {:?}", cmd, permissions);
 
-        // --- SANDBOX BUILDING BASED ON PERMISSIONS ---
+        // FIX: Kein Chaining beim Konstruktor, um E0716 zu vermeiden!
         let mut builder = WasiState::new(cmd);
+
+        // Jetzt sicher konfigurieren:
         builder.args(&args);
 
-        // 1. Filesystem Access
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
-            // Mapping: Host "." -> Plugin "." (für einfaches CWD)
-            // In Enterprise V2 würde man hier virtuelle Volumes mappen!
-            // Für V1 erlauben wir Zugriff auf den aktuellen Ordner des Prozesses (Vorsicht!)
-            // Sicherer: Ein Temp Ordner pro Plugin.
             builder.map_dir(".", ".")?;
         }
 
-        // 2. Env Vars
         if permissions.contains(&Permission::Env) || permissions.contains(&Permission::Admin) {
-            builder.inherit_env();
+            builder.envs(std::env::vars());
         }
 
-        // Admin bekommt alles (Inherit stdio, etc.)
-        if permissions.contains(&Permission::Admin) {
-            // Hier könnte man noch mehr Host-Funktionen freischalten
-        }
+        // Finalize konsumiert den Builder
+        let mut wasi_env = builder.finalize(&mut self.store)?;
 
-        let wasi_env = builder.finalize(&mut self.store)?;
         let import_object = wasi_env.import_object(&mut self.store, &module)?;
         let instance = Instance::new(&mut self.store, &module, &import_object)?;
 
