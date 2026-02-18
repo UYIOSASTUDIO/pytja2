@@ -5,10 +5,10 @@ use pytja_core::{DriverManager, AppConfig, BlobStorage, FileSystemStorage, S3Sto
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn, error}; // Error Import hinzugefügt
+use tracing::info; // Cleanup: warn und error entfernt, da wir println für Startup nutzen
 use dotenv::dotenv;
 use std::fs;
-use colored::*; // Für farbigen Output im Terminal
+use colored::*;
 
 mod session_manager;
 mod handlers;
@@ -115,16 +115,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!("FATAL: Primary DB lost immediately after mount!");
     }
 
+    // FIX: Storage Initialisierung mit korrekter Option-Behandlung
     let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
-        info!("Using S3 Storage");
-        Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
+        // Wir erzwingen Bucket/Region Existenz, wenn Typ=S3 ist
+        let bucket = config.storage.s3_bucket.as_deref()
+            .expect("CRITICAL: 'storage.s3_bucket' is required in config when storage_type='s3'");
+        let region = config.storage.s3_region.as_deref()
+            .unwrap_or("us-east-1");
+
+        info!("Using S3 Storage (Bucket: {}, Region: {})", bucket, region);
+        Arc::new(S3Storage::new(bucket, region).await)
     } else {
-        info!("Using Local Storage");
+        info!("Using Local Storage at: {}", config.storage.local_path);
         Arc::new(FileSystemStorage::new(&config.storage.local_path).await?)
     };
 
     let (tx, _rx) = broadcast::channel(100);
-    // FIX: config Klon entfernt, falls nicht im Service genutzt, oder dort _config nutzen
     let service = MyPytjaService {
         manager: manager.clone(),
         sessions: session_mgr,
@@ -161,11 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("⚠️  TLS Configured but Disabled in config.");
         }
     } else {
-        // WICHTIG: Das hier darf im Enterprise Mode nicht passieren!
         println!("{}", "❌ CRITICAL: NO TLS CONFIG FOUND.".red().bold());
         println!("The server is trying to start UNENCRYPTED, but the client expects TLS.");
         println!("Please add a [tls] section to config/default.toml");
-        // Wir lassen ihn trotzdem laufen für Debugging, aber mit roter Warnung
     }
 
     println!("{} {}", "🚀 Server listening on".green(), addr);

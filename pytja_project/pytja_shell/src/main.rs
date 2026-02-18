@@ -78,16 +78,20 @@ async fn main() -> Result<()> {
     pb.set_message("Connecting to Enterprise Server...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
+    // ZERTIFIKAT SUCHEN & DEBUGGING
     let possible_paths = vec![
-        PathBuf::from("server.crt"),
-        PathBuf::from("certs/server.crt"),
-        PathBuf::from("../certs/server.crt"),
+        PathBuf::from("server.crt"),          // Prio 1: Lokal
+        PathBuf::from("certs/server.crt"),    // Prio 2: Projekt-Struktur
+        PathBuf::from("../certs/server.crt"), // Prio 3: Fallback
     ];
 
     let mut ca_cert = None;
+    let mut loaded_path = String::new();
+
     for p in possible_paths {
         if p.exists() {
             ca_cert = Some(fs::read_to_string(&p).unwrap());
+            loaded_path = p.to_string_lossy().to_string();
             break;
         }
     }
@@ -96,18 +100,24 @@ async fn main() -> Result<()> {
         pb.finish_and_clear();
         println!("{}", "SECURITY ERROR: 'server.crt' not found.".red().bold());
         return Ok(());
+    } else {
+        // FEEDBACK: Wir sagen dem User, welches Cert wir nutzen
+        pb.println(format!("{} Security: Loaded CA from {}", "✔".green(), loaded_path.cyan()));
     }
 
-    // FIX: HTTPS URL
+    // SERVER URL
     let server_url = "https://localhost:50051".to_string();
     let key_bytes = signing_key.to_bytes().to_vec();
 
-    let client = match PytjaClient::connect(server_url, key_bytes, username.clone(), ca_cert).await {
+    // Connect mit Detail-Error
+    let client = match PytjaClient::connect(server_url.clone(), key_bytes, username.clone(), ca_cert).await {
         Ok(c) => c,
         Err(e) => {
             pb.finish_and_clear();
             println!("{}", "CONNECTION FAILED".red().bold());
-            println!("Error: {}", e);
+            // WICHTIG: {:?} gibt den technischen Grund (z.B. 'UnknownIssuer') aus
+            println!("Error Details: {:?}", e);
+            println!("Target: {}", server_url);
             return Ok(());
         }
     };
