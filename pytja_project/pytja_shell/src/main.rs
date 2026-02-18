@@ -160,18 +160,21 @@ async fn main() -> Result<()> {
     // 5. PLUGIN SYSTEM
     // ---------------------------------------------------------
     info!("Initializing Plugin System...");
-    // println!("Loading WASM Plugins..."); // Optional, Log reicht meist
-    let mut plugin_manager = PluginManager::new("./plugins");
 
-    if Path::new("./plugins").exists() {
-        if let Err(e) = plugin_manager.load_plugins("./plugins") {
-            warn!("Plugin loading issue: {:?}", e);
-            println!("Plugin Warning: {}", e);
-        }
-    } else {
-        let _ = fs::create_dir_all("./plugins");
+    // Wir nutzen das Verzeichnis der Identität oder ein lokales data/ Verzeichnis für die DB
+    let data_dir = Path::new("data");
+    if !data_dir.exists() { fs::create_dir_all(data_dir)?; }
+
+    let mut plugin_manager = PluginManager::new("./plugins", "data");
+
+    // Hier passiert der Magic Moment: User wird gefragt (nur einmal!)
+    if let Err(e) = plugin_manager.load_and_verify_plugins() {
+        error!("Plugin Security Check failed: {:?}", e);
+        println!("{} {}", "PLUGIN ERROR:".red(), e);
+        // Wir starten trotzdem, aber evtl. ohne Plugins
     }
-    info!("Plugins loaded count: {}", plugin_manager.list_functions().len());
+
+    info!("Plugins ready: {}", plugin_manager.list_functions().len());
 
     // ---------------------------------------------------------
     // 6. VIRTUAL FILESYSTEM & TERMINAL

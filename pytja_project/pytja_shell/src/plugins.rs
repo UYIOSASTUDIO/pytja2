@@ -1,147 +1,279 @@
-use extism::{Plugin, Manifest, Wasm, Function, ValType, UserData, Val};
-use anyhow::{Result, anyhow};
-use std::path::Path;
+use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use crate::vfs::VirtualFileSystem;
-use serde_json::Value;
-use pytja_core::PytjaRepository;
+use std::path::{Path, PathBuf};
+use tracing::{info, warn, error, instrument};
+use wasmer::{Module, Store, Instance};
+use wasmer_wasi::WasiState;
+use serde::{Deserialize, Serialize};
+use colored::*;
+use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
+
+// --- DATA STRUCTURES ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Permission {
+    #[serde(rename = "fs_read")]
+    FsRead,
+    #[serde(rename = "fs_write")]
+    FsWrite,
+    #[serde(rename = "network")]
+    Network,
+    #[serde(rename = "env")]
+    Env,
+    #[serde(rename = "admin")]
+    Admin, // "Root" Zugriff
+}
+
+impl Permission {
+    fn is_high_risk(&self) -> bool {
+        matches!(self, Permission::Admin | Permission::Network | Permission::FsWrite)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginManifest {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub permissions: Vec<Permission>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PermissionDb {
+    // Key: Plugin Name, Value: Liste der ERLAUBTEN Permissions
+    pub granted: HashMap<String, HashSet<Permission>>,
+}
+
+// --- MANAGER ---
 
 pub struct PluginManager {
-    loaded_plugins: HashMap<String, Vec<u8>>,
-    plugin_dir: String,
+    plugin_dir: PathBuf,
+    modules: HashMap<String, Module>, // Cache für Code
+    manifests: HashMap<String, PluginManifest>, // Cache für Metadaten
+    store: Store,
+    db_path: PathBuf,
+    permissions_db: PermissionDb,
 }
 
 impl PluginManager {
-    pub fn new(plugin_dir: &str) -> Self {
-        if !Path::new(plugin_dir).exists() { let _ = fs::create_dir_all(plugin_dir); }
+    pub fn new<P: AsRef<Path>>(plugin_dir: P, data_dir: P) -> Self {
+        let db_path = data_dir.as_ref().join("plugin_permissions.json");
+
+        // DB laden oder leer erstellen
+        let permissions_db = if db_path.exists() {
+            let content = fs::read_to_string(&db_path).unwrap_or_default();
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            PermissionDb::default()
+        };
+
         Self {
-            loaded_plugins: HashMap::new(),
-            plugin_dir: plugin_dir.to_string(),
+            plugin_dir: plugin_dir.as_ref().to_path_buf(),
+            modules: HashMap::new(),
+            manifests: HashMap::new(),
+            store: Store::default(),
+            db_path,
+            permissions_db,
         }
     }
 
-    pub fn scan_and_load(&mut self) -> Result<String> {
-        let mut count = 0;
-        self.loaded_plugins.clear();
+    /// Schritt 1: Lädt Plugins, prüft Permissions und fragt den User (Interaktiv)
+    pub fn load_and_verify_plugins(&mut self) -> Result<()> {
+        if !self.plugin_dir.exists() {
+            fs::create_dir_all(&self.plugin_dir)?;
+        }
 
-        if let Ok(entries) = fs::read_dir(&self.plugin_dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            if let Ok(bytes) = fs::read(&path) {
-                                self.loaded_plugins.insert(stem.to_string(), bytes);
-                                count += 1;
+        let mut new_plugins: Vec<PluginManifest> = Vec::new();
+
+        // 1. Scannen
+        for entry in fs::read_dir(&self.plugin_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Wir suchen nach .wasm Files
+            if path.extension().map_or(false, |ext| ext == "wasm") {
+                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+
+                // Manifest suchen (plugin.wasm -> plugin.json)
+                let manifest_path = path.with_extension("json");
+
+                let manifest: PluginManifest = if manifest_path.exists() {
+                    let content = fs::read_to_string(&manifest_path)?;
+                    serde_json::from_str(&content).context(format!("Invalid manifest for {}", stem))?
+                } else {
+                    // Default Manifest wenn keines da ist (Safe default: Keine Rechte)
+                    PluginManifest {
+                        name: stem.clone(),
+                        version: "0.0.0".into(),
+                        description: "No manifest provided".into(),
+                        permissions: vec![],
+                    }
+                };
+
+                // WASM Kompilieren
+                match self.compile_module(&path) {
+                    Ok(module) => {
+                        self.modules.insert(manifest.name.clone(), module);
+
+                        // Check ob wir diesen Plugin + Permissions schon kennen
+                        if !self.permissions_db.granted.contains_key(&manifest.name) {
+                            new_plugins.push(manifest.clone());
+                        } else {
+                            // Check ob NEUE Permissions dazugekommen sind (Version Upgrade)
+                            let granted = self.permissions_db.granted.get(&manifest.name).unwrap();
+                            let has_new_perms = manifest.permissions.iter().any(|p| !granted.contains(p));
+                            if has_new_perms {
+                                new_plugins.push(manifest.clone());
                             }
                         }
-                    }
+                        self.manifests.insert(manifest.name.clone(), manifest);
+                    },
+                    Err(e) => error!("Failed to compile {}: {}", stem, e),
                 }
             }
         }
-        Ok(format!("Loaded {} plugins.", count))
+
+        // 2. User Abfrage für NEUE Plugins (Bulk Process)
+        if !new_plugins.is_empty() {
+            self.interactive_permission_grant(new_plugins)?;
+        }
+
+        Ok(())
     }
 
-    // Wrapper für Kompatibilität mit main.rs
-    pub fn load_plugins(&mut self, _dir: &str) -> Result<()> {
-        self.scan_and_load().map(|_| ())
+    /// Interaktive CLI UI für Permission Granting
+    fn interactive_permission_grant(&mut self, plugins: Vec<PluginManifest>) -> Result<()> {
+        println!("\n{}", "🔒 SECURITY ALERT: NEW PLUGINS DETECTED".yellow().bold());
+        println!("The following plugins are requesting permissions. Review them carefully.\n");
+
+        let mut low_risk = Vec::new();
+        let mut high_risk = Vec::new();
+
+        for p in plugins {
+            if p.permissions.iter().any(|perm| perm.is_high_risk()) {
+                high_risk.push(p);
+            } else {
+                low_risk.push(p);
+            }
+        }
+
+        // A) Low Risk Bulk Approval
+        if !low_risk.is_empty() {
+            println!("{}", "--- Standard Plugins (Safe to verify) ---".cyan());
+            for p in &low_risk {
+                let perms_str = if p.permissions.is_empty() { "None".to_string() } else { format!("{:?}", p.permissions) };
+                println!("• {} (v{}): {}", p.name.bold(), p.version, perms_str.dimmed());
+            }
+
+            if Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Grant permissions to these standard plugins?")
+                .default(true)
+                .interact()?
+            {
+                for p in low_risk {
+                    let set: HashSet<Permission> = p.permissions.into_iter().collect();
+                    self.permissions_db.granted.insert(p.name, set);
+                }
+            } else {
+                println!("{}", "⚠️  Plugins denied. They may not function correctly.".red());
+                // Wir speichern leere Sets, damit nicht jedes Mal gefragt wird, aber Zugriff verweigert ist
+                for p in low_risk {
+                    self.permissions_db.granted.insert(p.name, HashSet::new());
+                }
+            }
+        }
+
+        // B) High Risk Approval (Explizit!)
+        if !high_risk.is_empty() {
+            println!("\n{}", "--- 🛡️  ELEVATED PRIVILEGES REQUESTED (ADMIN/ROOT) ---".red().bold());
+            println!("These plugins requested full system access or network control.");
+
+            for p in &high_risk {
+                println!("\nPlugin: {}", p.name.bold().red());
+                println!("Description: {}", p.description);
+                println!("Requested: {:?}", p.permissions);
+
+                if Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!("AUTHORIZE '{}' with Admin Rights?", p.name))
+                    .default(false)
+                    .interact()?
+                {
+                    let set: HashSet<Permission> = p.permissions.into_iter().collect();
+                    self.permissions_db.granted.insert(p.name, set);
+                    println!("✅ Authorized.");
+                } else {
+                    println!("❌ Denied.");
+                    self.permissions_db.granted.insert(p.name, HashSet::new());
+                }
+            }
+        }
+
+        // 3. Speichern
+        let json = serde_json::to_string_pretty(&self.permissions_db)?;
+        fs::write(&self.db_path, json)?;
+        println!("\nSecurity Policy updated.\n");
+
+        Ok(())
+    }
+
+    fn compile_module(&self, path: &Path) -> Result<Module> {
+        let wasm_bytes = fs::read(path).context("Failed to read wasm file")?;
+        let module = Module::new(&self.store, wasm_bytes)?;
+        Ok(module)
     }
 
     pub fn has_command(&self, cmd: &str) -> bool {
-        self.loaded_plugins.contains_key(cmd)
+        self.modules.contains_key(cmd)
     }
 
     pub fn list_functions(&self) -> Vec<String> {
-        self.loaded_plugins.keys().cloned().collect()
+        self.modules.keys().cloned().collect()
     }
 
-    pub fn execute(&self, cmd: &str, args: Vec<&str>, vfs_arc: Arc<Mutex<VirtualFileSystem>>) -> Result<String> {
-        let wasm_bytes = self.loaded_plugins.get(cmd).ok_or(anyhow!("Plugin not found"))?;
-        let manifest = Manifest::new([Wasm::data(wasm_bytes.clone())]);
+    // Execution mit Permission Enforcement
+    #[instrument(skip(self, _vfs))]
+    pub fn execute(
+        &mut self,
+        cmd: &str,
+        args: Vec<&str>,
+        _vfs: std::sync::Arc<tokio::sync::Mutex<crate::vfs::VirtualFileSystem>>
+    ) -> Result<()> {
+        let module = self.modules.get(cmd).context("Plugin not found")?;
+        let permissions = self.permissions_db.granted.get(cmd)
+            .cloned().unwrap_or_default();
 
-        // Host Function: print
-        let f_print = Function::new("host_print", [ValType::I64], [], UserData::new(()),
-                                    move |plugin, inputs, _, _| {
-                                        let msg = plugin.memory_get_val::<String>(&inputs[0])?;
-                                        println!("{}", msg);
-                                        Ok(())
-                                    },
-        );
+        info!("Executing Plugin '{}' with rights: {:?}", cmd, permissions);
 
-        // Host Function: get_file (liest aus VFS DB)
-        let vfs_clone_read = vfs_arc.clone();
-        let f_get_file = Function::new("host_get_file", [ValType::I64, ValType::I64], [ValType::I64], UserData::new(()),
-                                       move |plugin, inputs, outputs, _| {
-                                           let filename = plugin.memory_get_val::<String>(&inputs[0])?;
+        // --- SANDBOX BUILDING BASED ON PERMISSIONS ---
+        let mut builder = WasiState::new(cmd);
+        builder.args(&args);
 
-                                           let result_json = tokio::runtime::Handle::current().block_on(async {
-                                               let vfs = vfs_clone_read.lock().await;
-                                               let full_path = vfs.resolve_path(&filename);
+        // 1. Filesystem Access
+        if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
+            // Mapping: Host "." -> Plugin "." (für einfaches CWD)
+            // In Enterprise V2 würde man hier virtuelle Volumes mappen!
+            // Für V1 erlauben wir Zugriff auf den aktuellen Ordner des Prozesses (Vorsicht!)
+            // Sicherer: Ein Temp Ordner pro Plugin.
+            builder.map_dir(".", ".")?;
+        }
 
-                                               // FIX: async get_db().await statt db()
-                                               if let Some(db) = vfs.get_db().await {
-                                                   match db.get_node(&full_path).await {
-                                                       Ok(Some(mut node)) => {
-                                                           // Content leeren für Metadaten-Transfer (Performance)
-                                                           node.content = vec![];
-                                                           serde_json::to_string(&node).unwrap_or("{}".to_string())
-                                                       },
-                                                       _ => "{}".to_string()
-                                                   }
-                                               } else {
-                                                   "{}".to_string()
-                                               }
-                                           });
+        // 2. Env Vars
+        if permissions.contains(&Permission::Env) || permissions.contains(&Permission::Admin) {
+            builder.inherit_env();
+        }
 
-                                           let bytes = result_json.as_bytes();
-                                           let memory_handle = plugin.memory_alloc(bytes.len() as u64)?;
-                                           let dest_slice = plugin.memory_bytes_mut(memory_handle)?;
-                                           dest_slice.copy_from_slice(bytes);
-                                           outputs[0] = Val::I64(memory_handle.offset() as i64);
-                                           Ok(())
-                                       }
-        );
+        // Admin bekommt alles (Inherit stdio, etc.)
+        if permissions.contains(&Permission::Admin) {
+            // Hier könnte man noch mehr Host-Funktionen freischalten
+        }
 
-        // Host Function: update_file (Metadata update)
-        let vfs_clone_write = vfs_arc.clone();
-        let f_update = Function::new("host_update_file", [ValType::I64, ValType::I64], [], UserData::new(()),
-                                     move |plugin, inputs, _, _| {
-                                         let filename = plugin.memory_get_val::<String>(&inputs[0])?;
-                                         let json_data = plugin.memory_get_val::<String>(&inputs[1])?;
+        let wasi_env = builder.finalize(&mut self.store)?;
+        let import_object = wasi_env.import_object(&mut self.store, &module)?;
+        let instance = Instance::new(&mut self.store, &module, &import_object)?;
 
-                                         tokio::runtime::Handle::current().block_on(async {
-                                             let vfs = vfs_clone_write.lock().await;
-                                             let full_path = vfs.resolve_path(&filename);
+        wasi_env.initialize(&mut self.store, &instance)?;
 
-                                             // FIX: async get_db().await statt db()
-                                             if let Some(db) = vfs.get_db().await {
-                                                 if let Ok(Some(node)) = db.get_node(&full_path).await {
-                                                     if node.owner != vfs.user_id {
-                                                         println!("Security Block: Plugin tried to edit file owned by {}", node.owner);
-                                                         return;
-                                                     }
-                                                     if let Ok(new_vals) = serde_json::from_str::<Value>(&json_data) {
-                                                         // Lock Password aktualisieren falls angefordert
-                                                         if let Some(lock_pass_val) = new_vals.get("lock_pass") {
-                                                             let lock_pass = lock_pass_val.as_str().map(|s| s.to_string());
-                                                             let _ = db.update_metadata(&full_path, lock_pass, None).await;
-                                                         }
-                                                     }
-                                                 }
-                                             }
-                                         });
-                                         Ok(())
-                                     }
-        );
-
-        let mut plugin = Plugin::new(&manifest, [f_print, f_get_file, f_update], true)?;
-
-        let args_json = serde_json::to_string(&args)?;
-        let result = plugin.call::<&str, String>("run", &args_json)?;
-
-        Ok(result)
+        Ok(())
     }
 }

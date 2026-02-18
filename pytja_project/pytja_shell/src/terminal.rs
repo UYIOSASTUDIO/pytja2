@@ -129,10 +129,12 @@ impl Terminal {
             "grep" => self.handle_grep(args).await,
             "du" => self.handle_du(args).await,
             _ => {
+                // Plugin Check
                 if self.plugin_manager.has_command(cmd) {
-                    println!("Executing Plugin: {}", cmd);
+                    println!("🚀 Launching Plugin: {}", cmd.cyan());
+
                     if let Err(e) = self.plugin_manager.execute(cmd, args, self.vfs.clone()) {
-                        println!("Plugin Error: {}", e);
+                        self.handle_error("Plugin Crash", e);
                     }
                 } else {
                     println!("Command not found: {}", cmd);
