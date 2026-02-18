@@ -32,7 +32,7 @@ tokio = { version = "1.0", features = ["full"] }
 indicatif = "0.17"
 tracing = "0.1"
 hex = "0.4"
-tonic = "0.10"       # Der Client
+tonic = { version = "0.10", features = ["tls", "tls-roots"] }
 prost = "0.12"       # Das Datenformat
 pytja_proto = { path = "../pytja_proto" } # Unser Vertrag
 http = "0.2"         # Wichtig für URL Parsing

@@ -13,37 +13,58 @@ use ed25519_dalek::SigningKey;
 use pytja_core::crypto::CryptoService; // Falls signing benötigt wird, sonst optional hier
 use std::str::FromStr;
 
+#[derive(Clone)]
 pub struct PytjaClient {
-    url: String,
-    signing_key: SigningKey,
+    client: Arc<Mutex<PytjaServiceClient<Channel>>>,
+    token: Arc<Mutex<Option<String>>>,
+    signing_key: Vec<u8>,
     username: String,
-    token: Option<String>,
 }
 
 impl PytjaClient {
-    pub fn new(url: &str, signing_key: SigningKey, username: String) -> Self {
-        Self {
-            url: url.to_string(),
+    /// Verbindet sich mit dem Server.
+    /// `server_url`: z.B. "https://127.0.0.1:50051" (Wichtig: https://)
+    /// `ca_cert_pem`: Optionaler Inhalt des CA Zertifikats (für Self-Signed wichtig)
+    pub async fn connect(server_url: String, signing_key: Vec<u8>, username: String, ca_cert_pem: Option<String>) -> Result<Self> {
+        let mut endpoint = Channel::from_shared(server_url.clone())
+            .context("Invalid Server URL")?;
+
+        // TLS Konfiguration
+        if server_url.starts_with("https") {
+            let mut tls = ClientTlsConfig::new()
+                .domain_name("localhost"); // WICHTIG: Muss zum CN im Zertifikat passen!
+
+            if let Some(pem) = ca_cert_pem {
+                let ca = Certificate::from_pem(pem);
+                tls = tls.ca_certificate(ca);
+            }
+
+            endpoint = endpoint.tls_config(tls)?;
+        }
+
+        let channel = endpoint.connect().await
+            .context(format!("Failed to connect to {}", server_url))?;
+
+        Ok(Self {
+            client: Arc::new(Mutex::new(PytjaServiceClient::new(channel))),
+            token: Arc::new(Mutex::new(None)),
             signing_key,
             username,
-            token: None,
-        }
+        })
+    }
+
+    // Wrapper, um den alten `new` Konstruktor kompatibel zu halten (optional, aber connect ist besser)
+    pub fn new(url: &str, key: Vec<u8>, user: String) -> Self {
+        // Warnung: Das hier ist synchron und blockiert nicht, aber wir können TLS hier schwer konfigurieren.
+        // Besser connect() nutzen. Wir lassen es als Fallback crashen oder nutzen block_on (böse).
+        // BESSER: Wir entfernen `new` und zwingen main.rs `connect` zu nutzen.
+        panic!("Please use PytjaClient::connect() instead of new() for async TLS support.");
     }
 
     /// Setzt das Session Token manuell (wird von main.rs nach Login aufgerufen)
-    pub fn set_token(&mut self, token: &str) {
-        self.token = Some(token.to_string());
-    }
-
-    async fn raw_connect(&self) -> Result<PytjaServiceClient<tonic::transport::Channel>> {
-        // Sicherstellen, dass http:// davor steht
-        let dst = if self.url.starts_with("http") {
-            self.url.clone()
-        } else {
-            format!("http://{}", self.url)
-        };
-        let client = PytjaServiceClient::connect(dst).await?;
-        Ok(client)
+    pub fn set_token(&self, t: &str) {
+        let mut lock = self.token.blocking_lock(); // Im Sync Kontext okay, sonst .lock().await
+        *lock = Some(t.to_string());
     }
 
     fn auth_req<T>(&self, msg: T) -> tonic::Request<T> {
@@ -60,7 +81,7 @@ impl PytjaClient {
     // --- AUTH METHODS (Public für main.rs) ---
 
     pub async fn get_challenge(&self, username: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = ChallengeRequest { username: username.to_string() };
         let resp = client.get_challenge(req).await?.into_inner();
         if !resp.user_exists {
@@ -69,21 +90,21 @@ impl PytjaClient {
         Ok(resp.challenge)
     }
 
-    pub async fn login(&self, username: &str, challenge: &str, signature: &str) -> Result<pytja_proto::pytja::LoginResponse> {
-        let mut client = self.raw_connect().await?;
+    pub async fn login(&self, username: &str, challenge: &str, signature: &[u8]) -> Result<LoginResponse, Status> {
         let req = LoginRequest {
             username: username.to_string(),
             challenge: challenge.to_string(),
-            signature: signature.to_string(),
+            signature: signature.to_vec(),
         };
-        let resp = client.login(req).await?.into_inner();
-        Ok(resp)
+        let mut client = self.client.lock().await;
+        let resp = client.login(req).await?;
+        Ok(resp.into_inner())
     }
 
     // --- FILE OPERATIONS ---
 
     pub async fn check_uplink(&self) -> Result<bool> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = tonic::Request::new(PingRequest { message: "Ping".into() });
         match client.ping(req).await {
             Ok(r) => {
@@ -95,14 +116,14 @@ impl PytjaClient {
     }
 
     pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let request = self.auth_req(ListRequest { path: path.to_string(), auth_token: "".into() });
         let response = client.list_directory(request).await?;
         Ok(response.into_inner().files)
     }
 
     pub async fn create_node(&self, path: &str, is_folder: bool, content: Vec<u8>, lock_pass: Option<String>, owner: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let request = self.auth_req(CreateNodeRequest {
             path: path.to_string(), is_folder, content, lock_password: lock_pass.unwrap_or_default(), owner: owner.to_string(),
         });
@@ -111,84 +132,84 @@ impl PytjaClient {
     }
 
     pub async fn read_file(&self, path: &str, password: Option<String>) -> Result<(Vec<u8>, String)> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(ReadFileRequest { path: path.to_string(), password: password.unwrap_or_default() });
         let resp = client.read_file(req).await?.into_inner();
         if resp.success { Ok((resp.content, resp.message)) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn delete_node(&self, path: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(DeleteNodeRequest { path: path.to_string() });
         let resp = client.delete_node(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn move_node(&self, src: &str, dst: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(MoveNodeRequest { source_path: src.to_string(), dest_path: dst.to_string() });
         let resp = client.move_node(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn copy_node(&self, src: &str, dst: &str, owner: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(CopyNodeRequest { source_path: src.to_string(), dest_path: dst.to_string(), owner: owner.to_string() });
         let resp = client.copy_node(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn change_mode(&self, path: &str, perms: u32) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(ChangeModeRequest { path: path.to_string(), permissions: perms });
         let resp = client.change_mode(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn chown_node(&self, path: &str, owner: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(ChownRequest { path: path.to_string(), new_owner: owner.to_string() });
         let resp = client.chown_node(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn lock_node(&self, path: &str, password: Option<String>) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(LockRequest { path: path.to_string(), password: password.unwrap_or_default() });
         let resp = client.lock_node(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
 
     pub async fn get_usage(&self, owner: &str) -> Result<u64> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(UsageRequest { owner: owner.to_string() });
         let resp = client.get_usage(req).await?.into_inner();
         Ok(resp.bytes)
     }
 
     pub async fn find_node(&self, pattern: &str) -> Result<Vec<String>> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(FindRequest { pattern: pattern.to_string() });
         let resp = client.find_node(req).await?.into_inner();
         Ok(resp.paths)
     }
 
     pub async fn grep_node(&self, pattern: &str) -> Result<Vec<String>> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(GrepRequest { pattern: pattern.to_string() });
         let resp = client.grep_node(req).await?.into_inner();
         Ok(resp.matches)
     }
 
     pub async fn stat_node(&self, path: &str) -> Result<(bool, bool, bool)> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(StatRequest { path: path.to_string() });
         let resp = client.stat_node(req).await?.into_inner();
         Ok((resp.exists, resp.is_folder, resp.is_locked))
     }
 
     pub async fn get_tree(&self, root_path: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?; // Verbindung aufbauen
+        let mut client = self.client.lock().await; // Verbindung aufbauen
         let req = self.auth_req(TreeRequest { root_path: root_path.to_string() });
         let resp = client.get_tree(req).await?.into_inner(); // Lokale Variable 'client' nutzen
         Ok(resp.tree_output)
@@ -196,7 +217,7 @@ impl PytjaClient {
 
     // UPLOAD (Streaming)
     pub async fn upload_file(&self, local_path: &str, remote_path: &str, lock: Option<String>, owner: &str) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let content = std::fs::read(local_path)?;
 
         let meta = FileMetadata {
@@ -219,7 +240,7 @@ impl PytjaClient {
 
     // DOWNLOAD
     pub async fn download_file(&self, remote_path: &str, local_path: &str, password: Option<String>) -> Result<String> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(DownloadRequest { path: remote_path.to_string(), password: password.unwrap_or_default() });
 
         let mut stream = client.download_file(req).await?.into_inner();
@@ -236,7 +257,7 @@ impl PytjaClient {
 
     // EXEC
     pub async fn exec_script(&self, path: &str) -> Result<()> {
-        let mut client = self.raw_connect().await?;
+        let mut client = self.client.lock().await;
         let req = self.auth_req(ExecRequest { script_path: path.to_string(), args: vec![] });
 
         let mut stream = client.exec_script(req).await?.into_inner();

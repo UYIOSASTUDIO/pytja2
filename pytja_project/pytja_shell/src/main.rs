@@ -112,7 +112,25 @@ async fn main() -> Result<()> {
     pb.set_message("Identity Unlocked. Establishing Uplink...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    let mut client = PytjaClient::new("127.0.0.1:50051", signing_key.clone(), username.clone());
+    let ca_cert_path = Path::new("server.crt"); // Oder usb_drive/server.crt
+    let ca_cert = if ca_cert_path.exists() {
+        Some(fs::read_to_string(ca_cert_path).unwrap())
+    } else {
+        warn!("No server.crt found. Connecting insecurely implies trusting system CAs.");
+        None
+    };
+
+    // WICHTIG: https:// davor setzen!
+    let server_url = "https://127.0.0.1:50051".to_string();
+
+    let mut client = match PytjaClient::connect(server_url, signing_key.clone(), username.clone(), ca_cert).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Connection failed: {:?}", e);
+            pb.finish_with_message("Connection Failed".red().to_string());
+            return Ok(());
+        }
+    };
 
     // Uplink Check
     if let Ok(true) = client.check_uplink().await {

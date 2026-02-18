@@ -40,6 +40,14 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub redis: Option<RedisConfig>,
     pub paths: PathsConfig,
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 impl AppConfig {

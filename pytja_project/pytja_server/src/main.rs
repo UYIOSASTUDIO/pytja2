@@ -7,6 +7,8 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use dotenv::dotenv;
+use tonic::transport::{Server, Identity, ServerTlsConfig}; // NEU: Tls Imports
+use std::fs; // NEU: Für File Read
 
 // Module einbinden
 mod session_manager;
@@ -195,6 +197,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr_str = format!("{}:{}", config.server.host, config.server.port);
     let addr = addr_str.parse()?;
+    let mut builder = Server::builder();
+
+    if let Some(tls_config) = &config.tls {
+        if tls_config.enabled {
+            info!("🔒 ENABLING TLS/SSL SECURITY");
+            info!("Loading Cert: {}", tls_config.cert_path);
+            info!("Loading Key:  {}", tls_config.key_path);
+
+            let cert = fs::read_to_string(&tls_config.cert_path)
+                .expect("Failed to read server certificate");
+            let key = fs::read_to_string(&tls_config.key_path)
+                .expect("Failed to read server private key");
+
+            let identity = Identity::from_pem(cert, key);
+
+            // Enterprise TlsConfig: Wir erzwingen TLS 1.2 oder 1.3
+            builder = builder.tls_config(ServerTlsConfig::new().identity(identity))?;
+            info!("✅ TLS Active. Communication is encrypted.");
+        } else {
+            warn!("⚠️ TLS is configured but DISABLED. Server is running in insecure mode!");
+        }
+    } else {
+        warn!("⚠️ NO TLS CONFIG FOUND. Server is running in UNENCRYPTED HTTP mode! (Not recommended for production)");
+    }
+
     info!("PYTJA ENTERPRISE HUB ONLINE");
     info!("Listening on {}", addr);
 

@@ -1,0 +1,33 @@
+# --- SERVER KONFIGURATION ---
+[server]
+host = "0.0.0.0"   # Hört auf alle Interfaces (wichtig für Docker/Netzwerk)
+port = 50051       # Standard gRPC Port
+
+# --- DATENBANK (Primary) ---
+[database]
+# Für Entwicklung nutzen wir SQLite (Datei wird im Root erstellt)
+primary_url = "sqlite://pytja_system.db"
+
+# --- REDIS (Session Cache) ---
+[redis]
+url = "redis://127.0.0.1/"
+
+# --- STORAGE (Dateispeicher) ---
+[storage]
+# Wähle "fs" (FileSystem) oder "s3"
+storage_type = "fs"
+local_path = "storage_blobs"  # Hier landen die hochgeladenen Dateien
+# s3_bucket = "mein-bucket"   # Nur nötig wenn storage_type = "s3"
+# s3_region = "eu-central-1"
+
+# --- PFADE ---
+[paths]
+logs_dir = "logs"             # Hier landen Server-Logs
+mounts_file = "mounts.json"   # Konfiguration für zusätzliche DB-Mounts
+
+# --- SICHERHEIT (TLS/SSL) ---
+# Das ist der neue Block für die Verschlüsselung
+[tls]
+enabled = true
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
