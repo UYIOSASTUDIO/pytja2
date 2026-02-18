@@ -1,6 +1,6 @@
 use pytja_proto::pytja::pytja_service_client::PytjaServiceClient;
 use pytja_proto::pytja::*;
-use pytja_proto::pytja::upload_request::Data; // Wichtig für Upload Enums
+use pytja_proto::pytja::upload_request::Data;
 use tonic::transport::{Channel, ClientTlsConfig, Certificate};
 use tonic::{Request, Status};
 use std::sync::Arc;
@@ -8,13 +8,12 @@ use tokio::sync::Mutex;
 use anyhow::{Result, anyhow, Context};
 use colored::*;
 use std::str::FromStr;
-use futures_util::StreamExt; // Für next() bei Streams
-use std::fs; // Für File IO
+use futures_util::StreamExt;
+use std::fs;
 use std::path::Path;
 
 #[derive(Clone)]
 pub struct PytjaClient {
-    // Thread-safe Client Wrapper mit Mutex für asynchronen Zugriff
     client: Arc<Mutex<PytjaServiceClient<Channel>>>,
     token: Arc<Mutex<Option<String>>>,
     pub signing_key: Vec<u8>,
@@ -22,22 +21,18 @@ pub struct PytjaClient {
 }
 
 impl PytjaClient {
-    /// Verbindet sich mit dem Server (TLS Support).
-    /// `server_url`: z.B. "https://127.0.0.1:50051"
+    /// Baut eine TLS-gesicherte Verbindung zum Enterprise Server auf.
     pub async fn connect(server_url: String, signing_key: Vec<u8>, username: String, ca_cert_pem: Option<String>) -> Result<Self> {
         let mut endpoint = Channel::from_shared(server_url.clone())
             .context("Invalid Server URL")?;
 
-        // TLS Konfiguration
+        // TLS Konfiguration (Enterprise Grade Security)
         if server_url.starts_with("https") {
-            let mut tls = ClientTlsConfig::new()
-                .domain_name("localhost"); // Muss zum CN im Zertifikat passen!
-
+            let mut tls = ClientTlsConfig::new().domain_name("localhost");
             if let Some(pem) = ca_cert_pem {
                 let ca = Certificate::from_pem(pem);
                 tls = tls.ca_certificate(ca);
             }
-
             endpoint = endpoint.tls_config(tls)?;
         }
 
@@ -52,9 +47,8 @@ impl PytjaClient {
         })
     }
 
-    // Deprecated Helper (nutze connect stattdessen)
     pub fn new(_url: &str, _key: Vec<u8>, _user: String) -> Self {
-        panic!("Please use PytjaClient::connect() instead of new() for async TLS support.");
+        panic!("Legacy constructor removed. Use PytjaClient::connect() with TLS support.");
     }
 
     pub async fn set_token(&self, t: &str) {
@@ -62,13 +56,11 @@ impl PytjaClient {
         *lock = Some(t.to_string());
     }
 
-    // Helper: Baut einen Request und fügt (falls vorhanden) das Auth-Token hinzu
+    // Auth-Header Injection Helper
     async fn auth_req<T>(&self, msg: T) -> Request<T> {
         let mut req = Request::new(msg);
         let lock = self.token.lock().await;
-
         if let Some(token) = &*lock {
-            // Wir nutzen standardmäßig "Bearer <token>"
             let val = format!("Bearer {}", token);
             if let Ok(meta) = tonic::metadata::MetadataValue::from_str(&val) {
                 req.metadata_mut().insert("authorization", meta);
@@ -77,20 +69,7 @@ impl PytjaClient {
         req
     }
 
-    // --- API METHODS ---
-
-    pub async fn check_uplink(&self) -> Result<bool> {
-        let mut client = self.client.lock().await;
-        // Ping braucht oft kein Auth, aber sicherheitshalber okay ohne
-        let req = Request::new(PingRequest { message: "Ping".into() });
-        match client.ping(req).await {
-            Ok(r) => {
-                println!(" [+] Server: {}", r.into_inner().server_version.cyan());
-                Ok(true)
-            },
-            Err(_) => Ok(false),
-        }
-    }
+    // --- AUTHENTICATION ---
 
     pub async fn get_challenge(&self, username: &str) -> Result<String> {
         let mut client = self.client.lock().await;
@@ -102,16 +81,29 @@ impl PytjaClient {
         Ok(resp.challenge)
     }
 
-    pub async fn login(&self, username: &str, challenge: &str, signature: &[u8]) -> Result<LoginResponse, Status> {
+    pub async fn login(&self, username: &str, challenge: &str, signature: String) -> Result<LoginResponse, Status> {
         let mut client = self.client.lock().await;
         let req = Request::new(LoginRequest {
             username: username.to_string(),
             challenge: challenge.to_string(),
-            signature: signature.to_vec(),
+            signature, // String direkt übergeben
         });
         let resp = client.login(req).await?.into_inner();
         Ok(resp)
     }
+
+    pub async fn check_uplink(&self) -> Result<bool> {
+        let mut client = self.client.lock().await;
+        match client.ping(Request::new(PingRequest { message: "Ping".into() })).await {
+            Ok(r) => {
+                println!(" [+] Server: {}", r.into_inner().server_version.cyan());
+                Ok(true)
+            },
+            Err(_) => Ok(false),
+        }
+    }
+
+    // --- FILESYSTEM OPERATIONS ---
 
     pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>> {
         let mut client = self.client.lock().await;
@@ -159,11 +151,7 @@ impl PytjaClient {
 
     pub async fn copy_node(&self, src: &str, dst: &str, owner: &str) -> Result<String> {
         let mut client = self.client.lock().await;
-        let req = self.auth_req(CopyNodeRequest {
-            source_path: src.to_string(),
-            dest_path: dst.to_string(),
-            owner: owner.to_string()
-        }).await;
+        let req = self.auth_req(CopyNodeRequest { source_path: src.to_string(), dest_path: dst.to_string(), owner: owner.to_string() }).await;
         let resp = client.copy_node(req).await?.into_inner();
         if resp.success { Ok(resp.message) } else { Err(anyhow!(resp.message)) }
     }
@@ -224,55 +212,34 @@ impl PytjaClient {
         Ok(resp.tree_output)
     }
 
-    // --- STREAMING METHODS ---
+    // --- STREAMING UPLOAD ---
 
     pub async fn upload_file(&self, local_path: &str, remote_path: &str, lock: Option<String>, owner: &str) -> Result<String> {
-        // Wir lesen die Datei sequentiell (nicht alles in RAM laden für große Dateien)
-        // Aber hier ist eine einfache Implementierung mit Chunks
-
         let path = Path::new(local_path);
-        if !path.exists() {
-            return Err(anyhow!("File not found: {}", local_path));
-        }
+        if !path.exists() { return Err(anyhow!("File not found")); }
 
-        // Metadata Payload
-        let metadata = UploadMetadata { // FIX: Struct Name muss stimmen
+        let metadata = pytja_proto::pytja::FileMetadata {
             path: remote_path.to_string(),
             owner: owner.to_string(),
             lock_password: lock.unwrap_or_default(),
             is_folder: false,
         };
 
-        // Stream Generator
-        // Wir klonen local_path String, damit der Stream ihn besitzen kann
         let file_path = local_path.to_string();
 
         let outbound = async_stream::stream! {
-            // 1. Metadata senden
-            yield UploadRequest {
-                data: Some(Data::Metadata(metadata))
-            };
+            yield UploadRequest { data: Some(Data::Metadata(metadata)) };
 
-            // 2. Chunks lesen und senden
-            // Wir nutzen std::fs hier synchron für Einfachheit, besser wäre tokio::fs
-            // Für Performance: Blockgröße 64KB
+            // Chunked Reading
             if let Ok(content) = fs::read(&file_path) {
                 for chunk in content.chunks(64 * 1024) {
-                    yield UploadRequest {
-                        data: Some(Data::Chunk(chunk.to_vec()))
-                    };
+                    yield UploadRequest { data: Some(Data::Chunk(chunk.to_vec())) };
                 }
             }
         };
 
-        let mut client = self.client.lock().await;
-        // Token in Stream-Request injecten ist tricky, da Stream ein Iterator ist.
-        // Die Metadata muss am Server geprüft werden oder wir nutzen `tonic::Request::new(outbound)`
-        // und setzen Metadata da drauf.
-
+        // Streaming Request manuell bauen (auth_req geht nicht für Streams direkt)
         let mut request = Request::new(outbound);
-
-        // Token injecten
         let lock = self.token.lock().await;
         if let Some(token) = &*lock {
             let val = format!("Bearer {}", token);
@@ -281,9 +248,12 @@ impl PytjaClient {
             }
         }
 
+        let mut client = self.client.lock().await;
         let response = client.upload_file(request).await?.into_inner();
         if response.success { Ok(response.message) } else { Err(anyhow!(response.message)) }
     }
+
+    // --- DOWNLOAD ---
 
     pub async fn download_file(&self, remote_path: &str, local_path: &str, password: Option<String>) -> Result<String> {
         let mut client = self.client.lock().await;
@@ -294,22 +264,21 @@ impl PytjaClient {
 
         let mut stream = client.download_file(req).await?.into_inner();
 
-        // Datei öffnen/erstellen
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::File::create(local_path).await
             .context("Failed to create local file")?;
 
         let mut total_bytes = 0;
-
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.context("Stream error")?;
             file.write_all(&chunk.content).await?;
             total_bytes += chunk.content.len();
         }
-
         file.flush().await?;
         Ok(format!("Downloaded {} bytes to {}", total_bytes, local_path))
     }
+
+    // --- EXEC ---
 
     pub async fn exec_script(&self, path: &str) -> Result<()> {
         let mut client = self.client.lock().await;
