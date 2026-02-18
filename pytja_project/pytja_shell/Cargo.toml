@@ -47,3 +47,5 @@ directories = "5.0"
 
 dialoguer = "0.10"
 walkdir = "2.4"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"

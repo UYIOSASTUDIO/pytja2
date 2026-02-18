@@ -17,6 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use directories::ProjectDirs;
 use walkdir::WalkDir;
 use std::path::Path;
+use tracing::{info, warn, error};
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
@@ -275,7 +276,7 @@ impl Terminal {
         let full_path = self.resolve_path(name).await;
         match self.client.create_node(&full_path, true, vec![], lock_pass, &self.user_id).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -302,7 +303,7 @@ impl Terminal {
 
         match self.client.create_node(&full_path, false, content_bytes, lock_pass, &self.user_id).await {
             Ok(_) => println!("{}", "File created.".green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -313,7 +314,7 @@ impl Terminal {
 
         match self.client.copy_node(&src_path, &dst_path, &self.user_id).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -324,7 +325,7 @@ impl Terminal {
 
         match self.client.move_node(&src_path, &dst_path).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -334,7 +335,7 @@ impl Terminal {
 
         match self.client.delete_node(&full_path).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -352,7 +353,7 @@ impl Terminal {
         drop(vfs_guard);
 
         if let Err(e) = self.vfs.lock().await.edit_file(args[0]).await {
-            println!("{}", e.to_string().red());
+            self.handle_error("Context", e);
         }
     }
 
@@ -370,67 +371,69 @@ impl Terminal {
                         Err(e2) => println!("{}", e2.to_string().red()),
                     }
                 } else {
-                    println!("{}", e.to_string().red());
+                    self.handle_error("Context", e);
                 }
             }
         }
     }
 
     async fn handle_upload(&self, args: Vec<&str>) {
-        if args.is_empty() { println!("Usage: upload <local_path> [remote_path]"); return; }
-        let local_path_str = args[0];
-        let local_path = Path::new(local_path_str);
+        if args.is_empty() { println!("Usage: upload <local> [remote]"); return; }
+        let local_path = Path::new(args[0]);
 
         if !local_path.exists() {
-            println!("{} Local path does not exist.", "Error:".red());
+            self.handle_error("Upload Error", "Local path does not exist");
             return;
         }
 
-        let remote_base = if args.len() > 1 {
-            args[1].to_string()
-        } else {
-            let name = local_path.file_name().unwrap().to_string_lossy();
+        let remote_base = if args.len() > 1 { args[1].to_string() } else {
+            let name = local_path.file_name().unwrap_or_default().to_string_lossy();
             if self.current_path == "/" { format!("/{}", name) } else { format!("{}/{}", self.current_path, name) }
         };
 
+        info!("Starting upload: {:?} -> {}", local_path, remote_base);
+
         if local_path.is_dir() {
-            println!("Initiating Recursive Upload: {} -> {}", local_path_str, remote_base);
-            let _ = self.client.create_node(&remote_base, true, vec![], None, &self.user_id).await; // Mkdir remote root
+            println!("Recursive Upload: {} -> {}", local_path.display(), remote_base);
+            // Root erstellen
+            if let Err(e) = self.client.create_node(&remote_base, true, vec![], None, &self.user_id).await {
+                self.handle_error("Mkdir Remote Root", e);
+            }
 
-            let walker = WalkDir::new(local_path);
-            let mut count = 0;
-
-            for entry in walker.into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(local_path).into_iter().filter_map(|e| e.ok()) {
                 let path = entry.path();
-                if path == local_path { continue; } // Skip root dir itself
+                if path == local_path { continue; }
 
-                let relative = path.strip_prefix(local_path).unwrap();
-                let remote_target = format!("{}/{}", remote_base, relative.to_string_lossy()).replace("//", "/");
+                let rel = path.strip_prefix(local_path).unwrap();
+                let remote = format!("{}/{}", remote_base, rel.to_string_lossy()).replace("//", "/");
 
                 if path.is_dir() {
-                    let _ = self.client.create_node(&remote_target, true, vec![], None, &self.user_id).await;
-                } else {
-                    print!("Uploading {}... ", relative.to_string_lossy());
-                    match self.client.upload_file(path.to_str().unwrap(), &remote_target, None, &self.user_id).await {
-                        Ok(_) => println!("{}", "OK".green()),
-                        Err(e) => println!("{} {}", "FAIL".red(), e),
+                    if let Err(e) = self.client.create_node(&remote, true, vec![], None, &self.user_id).await {
+                        // Bei rekursiven Fehlern nur warnen, nicht abbrechen? Oder loggen.
+                        warn!("Failed to create dir {}: {}", remote, e);
+                        println!("{} {} ({})", "SKIP".yellow(), remote, e);
                     }
-                    count += 1;
+                } else {
+                    print!("Uploading {}... ", rel.to_string_lossy());
+                    match self.client.upload_file(path.to_str().unwrap(), &remote, None, &self.user_id).await {
+                        Ok(_) => println!("{}", "OK".green()),
+                        Err(e) => {
+                            println!("{}", "FAIL".red());
+                            error!("Upload failed for {}: {:?}", remote, e);
+                        }
+                    }
                 }
             }
-            println!("Recursive upload finished. {} files processed.", count);
         } else {
-            println!("Uploading: {} -> {}", local_path_str, remote_base);
-            // Lock handling for upload command
-            let mut lock_pass = None;
-            if args.contains(&"-lock") {
-                let p = self.ask_password("Set Upload Password: ");
-                if !p.is_empty() { lock_pass = Some(p); }
-            }
+            let lock_pass = if args.contains(&"-lock") { Some(self.ask_password("Set Password: ")) } else { None };
+            println!("Uploading {}...", local_path.display());
 
-            match self.client.upload_file(local_path_str, &remote_base, lock_pass, &self.user_id).await {
-                Ok(_) => println!("{}", "Upload complete.".green()),
-                Err(e) => println!("{} {}", "Upload failed:".red(), e),
+            match self.client.upload_file(local_path.to_str().unwrap(), &remote_base, lock_pass, &self.user_id).await {
+                Ok(_) => {
+                    info!("Upload success: {}", remote_base);
+                    println!("{}", "Upload complete.".green());
+                },
+                Err(e) => self.handle_error("Upload failed", e),
             }
         }
     }
@@ -440,41 +443,56 @@ impl Terminal {
         let full_remote = self.resolve_path(args[0]).await;
         let local_path = Path::new(args[1]);
 
-        // FIX: Tuple Destructuring
+        info!("Starting download: {} -> {:?}", full_remote, local_path);
+
         match self.client.stat_node(&full_remote).await {
             Ok((exists, is_folder, _)) => {
-                if !exists { println!("Remote path not found."); return; }
+                if !exists {
+                    self.handle_error("Download", "Remote path not found");
+                    return;
+                }
+
                 if is_folder {
                     println!("Recursive Download: {} -> {}", full_remote, local_path.display());
-                    std::fs::create_dir_all(local_path).ok();
+                    if let Err(e) = std::fs::create_dir_all(local_path) {
+                        self.handle_error("Local FS Error", e);
+                        return;
+                    }
+
                     let mut stack = vec![(full_remote, local_path.to_path_buf())];
                     while let Some((r, l)) = stack.pop() {
-                        if let Ok(files) = self.client.list_files(&r).await {
-                            for f in files {
-                                let c_r = if r == "/" { format!("/{}", f.name) } else { format!("{}/{}", r, f.name) };
-                                let c_l = l.join(&f.name);
-                                if f.is_folder {
-                                    std::fs::create_dir_all(&c_l).ok();
-                                    stack.push((c_r, c_l));
-                                } else {
-                                    print!("Downloading {}... ", f.name);
-                                    match self.client.download_file(&c_r, c_l.to_str().unwrap(), None).await {
-                                        Ok(_) => println!("{}", "OK".green()),
-                                        Err(_) => println!("{}", "FAIL".red()),
+                        match self.client.list_files(&r).await {
+                            Ok(files) => {
+                                for f in files {
+                                    let c_r = if r == "/" { format!("/{}", f.name) } else { format!("{}/{}", r, f.name) };
+                                    let c_l = l.join(&f.name);
+                                    if f.is_folder {
+                                        std::fs::create_dir_all(&c_l).ok();
+                                        stack.push((c_r, c_l));
+                                    } else {
+                                        print!("Downloading {}... ", f.name);
+                                        match self.client.download_file(&c_r, c_l.to_str().unwrap(), None).await {
+                                            Ok(_) => println!("{}", "OK".green()),
+                                            Err(e) => {
+                                                println!("{}", "FAIL".red());
+                                                error!("Download fail {}: {:?}", c_r, e);
+                                            }
+                                        }
                                     }
                                 }
-                            }
+                            },
+                            Err(e) => self.handle_error(&format!("List {}", r), e),
                         }
                     }
                 } else {
                     println!("Downloading {}...", full_remote);
                     match self.client.download_file(&full_remote, local_path.to_str().unwrap(), None).await {
                         Ok(_) => println!("{}", "Done.".green()),
-                        Err(e) => println!("{}", e.to_string().red()),
+                        Err(e) => self.handle_error("Download failed", e),
                     }
                 }
             },
-            Err(e) => println!("Error: {}", e),
+            Err(e) => self.handle_error("Stat failed", e),
         }
     }
 
@@ -483,7 +501,7 @@ impl Terminal {
         let path = self.resolve_path(args[0]).await;
         println!("{}", "[!] EXECUTING REMOTE KERNEL...".yellow());
         if let Err(e) = self.client.exec_script(&path).await {
-            println!("{}", e.to_string().red());
+            self.handle_error("Context", e);
         }
     }
 
@@ -496,7 +514,7 @@ impl Terminal {
         if perm_val < 0 || perm_val > 2 { println!("Invalid mode."); return; }
         match self.client.change_mode(&path, perm_val as u32).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -505,7 +523,7 @@ impl Terminal {
         let path = self.resolve_path(args[1]).await;
         match self.client.chown_node(&path, args[0]).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -520,7 +538,7 @@ impl Terminal {
         let password_opt = if p1.is_empty() { None } else { Some(p1) };
         match self.client.lock_node(&path, password_opt).await {
             Ok(msg) => println!("{}", msg.green()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -531,7 +549,7 @@ impl Terminal {
         let full_path = self.resolve_path(path).await;
         match self.client.get_tree(&full_path).await {
             Ok(tree) => println!("{}", tree.cyan()),
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -548,7 +566,7 @@ impl Terminal {
                 println!("Type:   {}", if is_folder { "Directory" } else { "File" });
                 println!("Locked: {}", if is_locked { "YES" } else { "NO" });
             },
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -559,7 +577,7 @@ impl Terminal {
                 println!("Found {} matches:", paths.len());
                 for p in paths { println!(" - {}", p.cyan()); }
             },
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -570,7 +588,7 @@ impl Terminal {
                 println!("Found content in {} files:", matches.len());
                 for m in matches { println!(" - {}", m.green()); }
             },
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -580,7 +598,7 @@ impl Terminal {
                 let mb = bytes as f64 / 1024.0 / 1024.0;
                 println!("Usage: {:.2} MB", mb);
             },
-            Err(e) => println!("{}", e.to_string().red()),
+            Err(e) => self.handle_error("Context", e),
         }
     }
 
@@ -649,5 +667,13 @@ impl Terminal {
         } else {
             "Unknown".to_string()
         }
+    }
+
+    fn handle_error(&self, context: &str, e: impl std::fmt::Display + std::fmt::Debug) {
+        // 1. Loggen für den Admin/Developer (mit Stacktrace/Debug Info wenn verfügbar)
+        error!(target: "shell", "{}: {:?}", context, e);
+
+        // 2. Anzeigen für den User (Rot, kurz, verständlich)
+        println!("{} {}", format!("{}:", context).red().bold(), e);
     }
 }
