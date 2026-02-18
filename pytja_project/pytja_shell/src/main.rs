@@ -123,6 +123,8 @@ async fn main() -> Result<()> {
     // WICHTIG: https:// davor setzen!
     let server_url = "https://127.0.0.1:50051".to_string();
 
+    let key_bytes = signing_key.to_bytes().to_vec();
+
     let mut client = match PytjaClient::connect(server_url, signing_key.clone(), username.clone(), ca_cert).await {
         Ok(c) => c,
         Err(e) => {
@@ -154,6 +156,8 @@ async fn main() -> Result<()> {
     };
 
     let signature = CryptoService::sign_message(&signing_key, challenge.as_bytes());
+
+    let sig_bytes = signature.to_bytes().to_vec();
 
     let login_resp = match client.login(&username, &challenge, &signature).await {
         Ok(r) => r,

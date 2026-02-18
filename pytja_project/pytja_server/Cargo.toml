@@ -6,7 +6,7 @@ default-run = "pytja_server"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-tonic = "0.10"
+tonic = { version = "0.10", features = ["tls"] }
 prost = "0.12"
 colored = "2.0"
 
