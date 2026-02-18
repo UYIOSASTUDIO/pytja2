@@ -5,7 +5,6 @@ use crate::handlers::service::MyPytjaService;
 use sysinfo::{CpuExt, SystemExt, System};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use std::time::Duration;
 
 impl MyPytjaService {
 

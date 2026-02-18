@@ -3,7 +3,7 @@ use pytja_proto::pytja::pytja_service_server::{PytjaService, PytjaServiceServer}
 use pytja_proto::pytja::*; // Alle Proto-Typen importieren
 use pytja_core::{DriverManager, AppConfig, BlobStorage, FileSystemStorage, S3Storage, drivers::DatabaseType};
 use std::sync::Arc;
-use tokio::sync::{mpsc, broadcast};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 use dotenv::dotenv;
@@ -147,27 +147,20 @@ impl PytjaService for MyPytjaService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Load ENV & Config
     dotenv().ok();
     let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");
 
-    // 2. Init Telemetry
     let _guard = pytja_core::telemetry::init_telemetry(&config.paths.logs_dir, "pytja_server.log");
     info!("Pytja Server Enterprise Edition starting up...");
     info!("Configuration loaded. Host: {}:{}", config.server.host, config.server.port);
 
-    // 3. Driver Manager (Core System)
     let manager = Arc::new(DriverManager::new());
-
-    // 4. Redis Session Manager
     let redis_url = config.redis.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| "redis://127.0.0.1/".to_string());
     info!("Connecting to Redis at {}", redis_url);
     let session_mgr = Arc::new(SessionManager::new(&redis_url).await.expect("FATAL: Redis Connection Failed"));
 
-    // 5. Load Mounts
     manager.load_config(&config.paths.mounts_file).await;
 
-    // 6. Mount Primary Database
     let db_path_or_url = if config.database.primary_url.starts_with("sqlite://") {
         config.database.primary_url.strip_prefix("sqlite://").unwrap()
     } else {
@@ -183,7 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!("FATAL: Primary DB lost immediately after mount!");
     }
 
-    // 7. Blob Storage Setup
     let storage: Arc<dyn BlobStorage> = if config.storage.storage_type == "s3" {
         info!("Using S3 Storage (Region: {})", config.storage.s3_region);
         Arc::new(S3Storage::new(&config.storage.s3_bucket, &config.storage.s3_region).await)
@@ -192,10 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(FileSystemStorage::new(&config.storage.local_path).await?)
     };
 
-    // 8. Broadcast Channel for Logs
     let (tx, _rx) = broadcast::channel(100);
-
-    // 9. Service Construction
     let service = MyPytjaService {
         manager: manager.clone(),
         sessions: session_mgr,
@@ -204,14 +193,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_broadcast: tx.clone(),
     };
 
-    // 10. Start gRPC Server
     let addr_str = format!("{}:{}", config.server.host, config.server.port);
     let addr = addr_str.parse()?;
     info!("PYTJA ENTERPRISE HUB ONLINE");
     info!("Listening on {}", addr);
 
+    // FIX: Limits werden HIER am Service gesetzt, nicht am Server Builder
+    let max_size = 50 * 1024 * 1024; // 50 MB
+    let pytja_svc = PytjaServiceServer::new(service)
+        .max_decoding_message_size(max_size)
+        .max_encoding_message_size(max_size);
+
     Server::builder()
-        .add_service(PytjaServiceServer::new(service))
+        .add_service(pytja_svc)
         .serve(addr)
         .await?;
 

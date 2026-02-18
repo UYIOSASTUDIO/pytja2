@@ -18,7 +18,7 @@ impl FileSystemStorage {
     }
 
     // Helper: Macht Pfade sicher (entfernt /, ./, ..)
-    fn sanitize_path(&self, path: &str) -> Result<std::path::PathBuf, PytjaError> {
+    pub(crate) fn sanitize_path(&self, path: &str) -> Result<std::path::PathBuf, PytjaError> {
         let clean_path = path
             .trim_start_matches('/')
             .trim_start_matches("./")
@@ -94,5 +94,46 @@ impl BlobStorage for FileSystemStorage {
             fs::remove_file(full_path).await.map_err(|e| PytjaError::System(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::fs;
+
+    #[tokio::test]
+    async fn test_path_sanitization_security() {
+        let temp_dir = std::env::temp_dir().join("pytja_test_blobs");
+        let _ = fs::remove_dir_all(&temp_dir).await; // Cleanup pre
+
+        let storage = FileSystemStorage::new(temp_dir.to_str().unwrap()).await.unwrap();
+
+        // 1. Normaler Fall (Muss gehen)
+        let safe = storage.sanitize_path("test.png");
+        assert!(safe.is_ok());
+        assert!(safe.unwrap().ends_with("pytja_test_blobs/test.png"));
+
+        // 2. Attack: Directory Traversal (Muss blockiert werden)
+        let attack1 = storage.sanitize_path("../etc/passwd");
+        assert!(attack1.is_err(), "Travesal ../ failed to block");
+
+        // 3. Attack: Absolute Paths (Muss relativiert werden)
+        let attack2 = storage.sanitize_path("/var/log/syslog");
+        // sanitize_path trimmt '/' am Anfang, also wird es zu "var/log/syslog" im Blob Ordner.
+        // Das ist sicher, solange es im Blob Ordner bleibt.
+        assert!(safe_path_check(&storage, "/root/secret"), "Absolute path escaping detected");
+
+        // 4. Attack: Null Bytes (Optional, Rust Strings sind meist null-safe, aber gut zu testen)
+        // Rust PathBuf mag keine Null-Bytes in manchen OS Calls, aber sanitize_path nimmt &str.
+
+        let _ = fs::remove_dir_all(&temp_dir).await; // Cleanup post
+    }
+
+    fn safe_path_check(storage: &FileSystemStorage, input: &str) -> bool {
+        match storage.sanitize_path(input) {
+            Ok(p) => p.starts_with(&storage.base_path),
+            Err(_) => true, // Error ist auch sicher (blockiert)
+        }
     }
 }
