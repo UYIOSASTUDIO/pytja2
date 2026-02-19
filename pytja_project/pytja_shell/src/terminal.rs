@@ -363,6 +363,25 @@ impl Terminal {
         if args.is_empty() { println!("Usage: cat <name>"); return; }
         let full_path = self.resolve_path(args[0]).await;
 
+        // NEU: Vor dem Lesen prüfen, ob es sich um ein Verzeichnis handelt
+        match self.client.stat_node(&full_path).await {
+            Ok((exists, is_folder, _)) => {
+                if !exists {
+                    println!("cat: {}: No such file or directory", args[0]);
+                    return;
+                }
+                if is_folder {
+                    println!("cat: {}: Is a directory", args[0].blue());
+                    return;
+                }
+            },
+            Err(e) => {
+                self.handle_error("File Check Failed", e);
+                return;
+            }
+        }
+
+        // Wenn wir hier ankommen, ist es eine Datei. Wir können sie lesen.
         match self.client.read_file(&full_path, None).await {
             Ok((content, _)) => self.print_file_content(&content),
             Err(e) => {

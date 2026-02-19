@@ -113,7 +113,7 @@ async fn add_permission_wizard(client: &mut AdminClient) -> anyhow::Result<()> {
     }
     println!("  C. Custom Input\n");
 
-    let perm_input: String = Input::with_theme(&ColorfulTheme::default())
+    let _perm_input: String = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("Enter Permission (Type exact string or custom)")
         .interact_text()?;
 

@@ -147,8 +147,8 @@ async fn manage_quota(client: &mut AdminClient) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ban_kick_menu(client: &mut AdminClient) -> anyhow::Result<()> {
-    let username: String = Input::with_theme(&ColorfulTheme::default())
+async fn ban_kick_menu(_client: &mut AdminClient) -> anyhow::Result<()> {
+    let _username: String = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("Target Username")
         .interact_text()?;
 

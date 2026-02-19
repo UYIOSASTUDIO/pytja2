@@ -2,12 +2,13 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use colored::*;
+use std::io::{self, Write};
 use std::fs;
-use std::path::PathBuf; // Path entfernt
+use std::path::PathBuf;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-use tracing::{info, error}; // warn entfernt
+use tracing::{info, error};
 use tracing_subscriber;
 use tracing_appender;
 
@@ -30,37 +31,61 @@ const IDENTITY_DIR: &str = "usb_drive";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Logging Setup
+    // 1. Logging Setup (File only)
     let file_appender = tracing_appender::rolling::daily("logs", "pytja_shell.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt().with_writer(non_blocking).with_ansi(false).init();
 
+    // 2. UI Start
     print!("\x1B[2J\x1B[1;1H");
     println!("{}", "PYTJA SHELL v2.0 (Enterprise Client)".green().bold());
     println!("========================================");
 
-    // Identity Laden
-    let mut key_file: Option<String> = None;
+    // 3. Identity Laden & Multi-Account Selection
+    let mut available_keys = Vec::new();
     if let Ok(entries) = fs::read_dir(IDENTITY_DIR) {
-        for entry in entries {
-            if let Ok(e) = entry {
-                let path = e.path();
-                if path.extension().map_or(false, |ext| ext == "pytja") {
-                    key_file = Some(path.to_string_lossy().to_string());
-                    break;
-                }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "pytja") {
+                available_keys.push(path.to_string_lossy().to_string());
             }
         }
     }
 
-    if key_file.is_none() {
+    if available_keys.is_empty() {
         println!("{}", "NO IDENTITY FOUND!".red().bold());
+        println!("Please place a .pytja file in the '{}' directory.", IDENTITY_DIR);
         return Ok(());
     }
 
-    let key_path = key_file.unwrap();
-    println!("Identity loaded: {}", key_path.cyan());
+    // MULTI-ACCOUNT AUSWAHL
+    let key_path = if available_keys.len() == 1 {
+        available_keys[0].clone()
+    } else {
+        println!("{}", "Multiple identities found. Please select an account:".cyan().bold());
+        for (i, key) in available_keys.iter().enumerate() {
+            println!("  [{}] {}", i + 1, key.green());
+        }
 
+        let mut selected = String::new();
+        loop {
+            print!("{} ", "Select number:".bold());
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num > 0 && num <= available_keys.len() {
+                    selected = available_keys[num - 1].clone();
+                    break;
+                }
+            }
+            println!("{}", "Invalid selection. Please try again.".red());
+        }
+        selected
+    };
+
+    // Die Identity::load Funktion gibt selbst aus, wen sie lädt.
     let identity = match Identity::load(&key_path) {
         Ok(id) => id,
         Err(e) => {
@@ -72,26 +97,27 @@ async fn main() -> Result<()> {
     let username = identity.username.clone();
     let signing_key = identity.keypair.clone();
 
-    // Connection
+    // 4. Connection Setup (Mit Spinner)
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
-    pb.set_message("Connecting to Enterprise Server...");
-    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_style(ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈✔")
+        .template("{spinner:.green} {msg}")
+        .unwrap());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.set_message("Locating Security Certificates...");
 
-    // ZERTIFIKAT SUCHEN & DEBUGGING
     let possible_paths = vec![
-        PathBuf::from("server.crt"),          // Prio 1: Lokal
-        PathBuf::from("certs/server.crt"),    // Prio 2: Projekt-Struktur
-        PathBuf::from("../certs/server.crt"), // Prio 3: Fallback
+        PathBuf::from("server.crt"),
+        PathBuf::from("certs/server.crt"),
+        PathBuf::from("../certs/server.crt"),
     ];
 
     let mut ca_cert = None;
-    let mut loaded_path = String::new();
-
+    let mut cert_path_str = String::new();
     for p in possible_paths {
         if p.exists() {
             ca_cert = Some(fs::read_to_string(&p).unwrap());
-            loaded_path = p.to_string_lossy().to_string();
+            cert_path_str = p.to_string_lossy().to_string();
             break;
         }
     }
@@ -101,37 +127,38 @@ async fn main() -> Result<()> {
         println!("{}", "SECURITY ERROR: 'server.crt' not found.".red().bold());
         return Ok(());
     } else {
-        // FEEDBACK: Wir sagen dem User, welches Cert wir nutzen
-        pb.println(format!("{} Security: Loaded CA from {}", "✔".green(), loaded_path.cyan()));
+        pb.println(format!("{} Security: Loaded CA from {}", "✔".green(), cert_path_str.cyan()));
     }
 
-    // SERVER URL
+    pb.set_message("Connecting to Enterprise Server...");
+
     let server_url = "https://localhost:50051".to_string();
     let key_bytes = signing_key.to_bytes().to_vec();
 
-    // Connect mit Detail-Error
-    let client = match PytjaClient::connect(server_url.clone(), key_bytes, username.clone(), ca_cert).await {
+    let client = match PytjaClient::connect(server_url, key_bytes, username.clone(), ca_cert).await {
         Ok(c) => c,
         Err(e) => {
             pb.finish_and_clear();
             println!("{}", "CONNECTION FAILED".red().bold());
-            // WICHTIG: {:?} gibt den technischen Grund (z.B. 'UnknownIssuer') aus
-            println!("Error Details: {:?}", e);
-            println!("Target: {}", server_url);
+            println!("Error: {}", e);
             return Ok(());
         }
     };
 
-    if let Ok(true) = client.check_uplink().await {
-        // ok
-    } else {
-        pb.finish_and_clear();
-        println!("{}", "SERVER UNREACHABLE".red().bold());
-        return Ok(());
+    // Uplink Check
+    match client.check_uplink().await {
+        Ok((true, version)) => {
+            pb.println(format!("{} Server Uplink Established: {}", "✔".green(), version.cyan()));
+        },
+        _ => {
+            pb.finish_and_clear();
+            println!("{}", "SERVER UNREACHABLE".red().bold());
+            return Ok(());
+        }
     }
 
-    // Auth
     pb.set_message("Authenticating...");
+    tokio::time::sleep(Duration::from_millis(300)).await; // Kleines Delay für UX
 
     let challenge = match client.get_challenge(&username).await {
         Ok(c) => c,

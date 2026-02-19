@@ -8,6 +8,8 @@ use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use pbkdf2::pbkdf2;
 use hmac::Hmac;
 use sha2::Sha256;
+use tonic::transport::{ClientTlsConfig, Certificate};
+use std::path::PathBuf;
 
 pub struct AdminClient {
     pub client: PytjaServiceClient<Channel>,
@@ -17,7 +19,39 @@ pub struct AdminClient {
 
 impl AdminClient {
     pub async fn connect(url: String) -> anyhow::Result<Self> {
-        let client = PytjaServiceClient::connect(url).await?;
+        let mut endpoint = Channel::from_shared(url.clone())?;
+
+        // TLS Integration für Enterprise Sicherheit
+        if url.starts_with("https") {
+            let possible_paths = vec![
+                PathBuf::from("server.crt"),
+                PathBuf::from("certs/server.crt"),
+                PathBuf::from("../certs/server.crt"),
+            ];
+
+            let mut ca_cert = None;
+            for p in possible_paths {
+                if p.exists() {
+                    ca_cert = Some(fs::read_to_string(&p)?);
+                    break;
+                }
+            }
+
+            if let Some(pem) = ca_cert {
+                let ca = Certificate::from_pem(pem);
+                let tls = ClientTlsConfig::new()
+                    .domain_name("localhost") // Muss zum Server Cert CN passen
+                    .ca_certificate(ca);
+
+                endpoint = endpoint.tls_config(tls)?;
+            } else {
+                return Err(anyhow::anyhow!("TLS Certificate 'server.crt' not found. Cannot secure connection."));
+            }
+        }
+
+        let channel = endpoint.connect().await?;
+        let client = PytjaServiceClient::new(channel);
+
         Ok(Self { client, token: String::new(), username: String::new() })
     }
 

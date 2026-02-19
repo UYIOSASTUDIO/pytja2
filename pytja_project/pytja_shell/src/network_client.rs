@@ -92,14 +92,14 @@ impl PytjaClient {
         Ok(resp)
     }
 
-    pub async fn check_uplink(&self) -> Result<bool> {
+    pub async fn check_uplink(&self) -> Result<(bool, String)> {
         let mut client = self.client.lock().await;
         match client.ping(Request::new(PingRequest { message: "Ping".into() })).await {
             Ok(r) => {
-                println!(" [+] Server: {}", r.into_inner().server_version.cyan());
-                Ok(true)
+                // Wir printen hier NICHTS mehr, um die Shell-Animation nicht zu stören
+                Ok((true, r.into_inner().server_version))
             },
-            Err(_) => Ok(false),
+            Err(_) => Ok((false, "".to_string())),
         }
     }
 
