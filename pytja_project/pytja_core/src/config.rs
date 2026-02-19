@@ -79,7 +79,7 @@ impl AppConfig {
             // 2. Hardcoded Defaults (Falls Config-Datei fehlt oder unvollständig ist)
             .set_default("server.host", "0.0.0.0")?
             .set_default("server.port", 50051)?
-            .set_default("database.primary_url", "sqlite://pytja_system.db")?
+            .set_default("database.primary_url", "sqlite://pytja.db")?
 
             .set_default("storage.storage_type", "fs")?
             .set_default("storage.local_path", default_storage)?

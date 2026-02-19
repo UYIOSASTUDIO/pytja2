@@ -6,7 +6,7 @@ port = 50051       # Standard gRPC Port
 # --- DATENBANK (Primary) ---
 [database]
 # Für Entwicklung nutzen wir SQLite (Datei wird im Root erstellt)
-primary_url = "sqlite://pytja_system.db"
+primary_url = "sqlite://pytja.db"
 
 # --- REDIS (Session Cache) ---
 [redis]
