@@ -68,6 +68,11 @@ impl PytjaService for MyPytjaService {
     async fn get_mounts(&self, r: Request<GetMountsRequest>) -> Result<Response<GetMountsResponse>, Status> { self.get_mounts_impl(r).await }
     async fn add_mount(&self, r: Request<AddMountRequest>) -> Result<Response<AdminActionResponse>, Status> { self.add_mount_impl(r).await }
     async fn remove_mount(&self, r: Request<RemoveMountRequest>) -> Result<Response<AdminActionResponse>, Status> { self.remove_mount_impl(r).await }
+
+    // --- INVITE SYSTEM ---
+    async fn generate_invite_code(&self, r: Request<GenerateInviteRequest>) -> Result<Response<GenerateInviteResponse>, Status> { self.generate_invite_code_impl(r).await }
+    async fn revoke_invite_code(&self, r: Request<RevokeInviteRequest>) -> Result<Response<AdminActionResponse>, Status> { self.revoke_invite_code_impl(r).await }
+    async fn list_invite_codes(&self, r: Request<ListInvitesRequest>) -> Result<Response<ListInvitesResponse>, Status> { self.list_invite_codes_impl(r).await }
 }
 
 #[tokio::main]

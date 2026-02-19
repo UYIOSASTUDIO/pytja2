@@ -237,4 +237,139 @@ impl PytjaRepository for PostgresDriver {
     async fn get_audit_logs(&self, _limit: u32, _filter: Option<String>) -> Result<Vec<AuditLog>, PytjaError> {
         Err(PytjaError::System("Postgres: audit logs not implemented".into()))
     }
+
+    // --- INVITE SYSTEM IMPLEMENTATION ---
+    async fn create_invite(&self, code: &str, role: &str, max_uses: u32, quota_limit: u64, creator: &str) -> Result<(), PytjaError> {
+        sqlx::query("INSERT INTO invite_codes (code, role, max_uses, quota_limit, created_by) VALUES ($1, $2, $3, $4, $5)")
+            .bind(code).bind(role).bind(max_uses as i32).bind(quota_limit as i64).bind(creator)
+            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_invite(&self, code: &str) -> Result<Option<(String, u64, u32, u32)>, PytjaError> {
+        let row = sqlx::query("SELECT role, quota_limit, max_uses, used_count FROM invite_codes WHERE code = $1")
+            .bind(code).fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        if let Some(r) = row {
+            use sqlx::Row;
+            Ok(Some((
+                r.try_get("role").unwrap_or_default(),
+                r.try_get::<i64, _>("quota_limit").unwrap_or(0) as u64,
+                r.try_get::<i32, _>("max_uses").unwrap_or(0) as u32,
+                r.try_get::<i32, _>("used_count").unwrap_or(0) as u32,
+            )))
+        } else { Ok(None) }
+    }
+
+    async fn increment_invite_use(&self, code: &str) -> Result<(), PytjaError> {
+        sqlx::query("UPDATE invite_codes SET used_count = used_count + 1 WHERE code = $1")
+            .bind(code).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn revoke_invite(&self, code: &str) -> Result<(), PytjaError> {
+        sqlx::query("DELETE FROM invite_codes WHERE code = $1")
+            .bind(code).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_invites(&self) -> Result<Vec<(String, String, u32, u32, String, String)>, PytjaError> {
+        let rows = sqlx::query("SELECT * FROM invite_codes ORDER BY created_at DESC")
+            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| {
+            use sqlx::Row;
+            let created_at: String = match r.try_get::<String, _>("created_at") {
+                Ok(s) => s,
+                Err(_) => "unknown".to_string()
+            };
+            (
+                r.try_get("code").unwrap_or_default(),
+                r.try_get("role").unwrap_or_default(),
+                r.try_get::<i32, _>("max_uses").unwrap_or(0) as u32,
+                r.try_get::<i32, _>("used_count").unwrap_or(0) as u32,
+                r.try_get("created_by").unwrap_or_default(),
+                created_at
+            )
+        }).collect())
+    }
+
+    // --- SECURE QUERY PUSHDOWN (RBAC) ---
+    async fn list_directory_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError> {
+        let search = format!("{}/%", path.trim_end_matches('/'));
+        let is_admin = role == "admin";
+
+        // Postgres nutzt $1, $2 und echte Booleans (true) statt 1
+        let rows = sqlx::query("SELECT * FROM file_nodes WHERE path LIKE $1 AND ($2 = true OR permissions > 0 OR owner = $3)")
+            .bind(&search).bind(is_admin).bind(username)
+            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            use sqlx::Row;
+            let p: String = row.try_get("path").unwrap_or_default();
+            let relative = p.strip_prefix(path).unwrap_or(&p).trim_start_matches('/');
+            if relative.contains('/') { continue; }
+
+            nodes.push(FileNode {
+                path: p,
+                name: row.try_get("name").unwrap_or_default(),
+                owner: row.try_get("owner").unwrap_or_default(),
+                is_folder: row.try_get("is_folder").unwrap_or(false),
+                content: vec![],
+                blob_id: row.try_get::<Option<String>, _>("blob_id").unwrap_or(None).filter(|s| !s.is_empty()),
+                size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
+                lock_pass: row.try_get::<Option<String>, _>("lock_pass").unwrap_or(None).filter(|s| !s.is_empty()),
+                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
+                created_at: row.try_get::<f64, _>("created_at").unwrap_or(0.0),
+            });
+        }
+        Ok(nodes)
+    }
+
+    async fn list_recursive_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError> {
+        let is_admin = role == "admin";
+        let search_pattern = format!("{}/%", path.trim_end_matches('/'));
+
+        let mut query_str = "SELECT * FROM file_nodes WHERE path LIKE $1 AND ($2 = true OR permissions > 0 OR owner = $3)";
+        if path == "/" {
+            query_str = "SELECT * FROM file_nodes WHERE ($1 = true OR permissions > 0 OR owner = $2)";
+        }
+
+        let mut query = sqlx::query(query_str);
+        if path != "/" {
+            query = query.bind(&search_pattern).bind(is_admin).bind(username);
+        } else {
+            query = query.bind(is_admin).bind(username);
+        }
+
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            use sqlx::Row;
+            nodes.push(FileNode {
+                path: row.try_get("path").unwrap_or_default(),
+                name: row.try_get("name").unwrap_or_default(),
+                owner: row.try_get("owner").unwrap_or_default(),
+                is_folder: row.try_get("is_folder").unwrap_or(false),
+                content: vec![],
+                blob_id: None,
+                size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
+                lock_pass: None,
+                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
+                created_at: row.try_get::<f64, _>("created_at").unwrap_or(0.0),
+            });
+        }
+        Ok(nodes)
+    }
+
+    async fn get_node_secure(&self, path: &str, username: &str, role: &str) -> Result<Option<FileNode>, PytjaError> {
+        let node = self.get_node(path).await?;
+        if let Some(n) = node {
+            if role != "admin" && n.permissions == 0 && n.owner != username {
+                return Ok(None);
+            }
+            return Ok(Some(n));
+        }
+        Ok(None)
+    }
 }

@@ -42,4 +42,17 @@ pub trait PytjaRepository: Send + Sync {
     async fn list_roles(&self) -> Result<Vec<Role>, PytjaError>;
     async fn log_action(&self, user: &str, action: &str, target: &str) -> Result<(), PytjaError>;
     async fn get_audit_logs(&self, limit: u32, user_filter: Option<String>) -> Result<Vec<AuditLog>, PytjaError>;
+    // --- INVITE SYSTEM ---
+    async fn create_invite(&self, code: &str, role: &str, max_uses: u32, quota_limit: u64, creator: &str) -> Result<(), PytjaError>;
+    // Gibt zurück: (role, quota_limit, max_uses, used_count)
+    async fn get_invite(&self, code: &str) -> Result<Option<(String, u64, u32, u32)>, PytjaError>;
+    async fn increment_invite_use(&self, code: &str) -> Result<(), PytjaError>;
+    async fn revoke_invite(&self, code: &str) -> Result<(), PytjaError>;
+    // Gibt zurück: (code, role, max_uses, used_count, created_by, created_at)
+    async fn list_invites(&self) -> Result<Vec<(String, String, u32, u32, String, String)>, PytjaError>;
+
+    // --- SECURE QUERY PUSHDOWN (RBAC auf Datenbank-Ebene) ---
+    async fn list_directory_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError>;
+    async fn list_recursive_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError>;
+    async fn get_node_secure(&self, path: &str, username: &str, role: &str) -> Result<Option<FileNode>, PytjaError>;
 }

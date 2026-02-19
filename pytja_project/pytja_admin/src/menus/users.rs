@@ -1,48 +1,53 @@
 use crate::client::AdminClient;
 use dialoguer::{theme::ColorfulTheme, Select, Input, Confirm};
-use comfy_table::{Table, presets::UTF8_FULL, Cell, Color};
+use comfy_table::{Table, presets::UTF8_FULL, Cell, Color as TColor};
 use console::Term;
-use std::path::Path;
-use std::fs;
-use ed25519_dalek::{SigningKey, Signer}; // KeyGen Library (in Cargo.toml hinzufügen!)
-use rand::rngs::OsRng;
+use colored::*;
 
 pub async fn show(client: &mut AdminClient) -> anyhow::Result<()> {
     loop {
         Term::stdout().clear_screen()?;
-        println!("MODULE: USER & IDENTITY MANAGEMENT");
-        println!("----------------------------------");
+        println!("╔══════════════════════════════════════════╗");
+        println!("║      USER & IDENTITY MANAGEMENT          ║");
+        println!("╚══════════════════════════════════════════╝");
+        println!("💡 Tip: Press 'Esc' or 'q' in any menu to cancel instantly.\n");
 
         let items = vec![
-            "1. List All Users (Live Status)",
-            "2. Create New User (Generate Identity)",
-            "3. Manage User Quota",
-            "4. Ban / Kick User",
-            "5. Back to Main Menu"
+            "1. List All Users (Table View)",
+            "2. Edit User (Change Role, Quota, Ban)",
+            "3. Generate Invite Code (Onboarding)",
+            "4. List Active Invite Codes",
+            "5. Revoke Invite Code",
+            "0. Back to Main Menu"
         ];
 
+        // FIX: interact_opt() erlaubt Abbruch via ESC/q
         let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Action")
-            .items(&items)
+            .with_prompt("Select Action")
             .default(0)
-            .interact()?;
+            .items(&items)
+            .interact_opt()?;
 
         match selection {
-            0 => list_users(client).await?,
-            1 => create_user_flow(client).await?,
-            2 => manage_quota(client).await?,
-            3 => ban_kick_menu(client).await?,
-            4 => break,
+            Some(0) => list_users_table(client).await?,
+            Some(1) => {
+                if !edit_user(client).await? {
+                    // Wenn false zurückkommt, hat der Admin sich selbst bearbeitet -> Logout
+                    return Err(anyhow::anyhow!("Session invalidated due to own role change. Please restart the admin tool."));
+                }
+            },
+            Some(2) => generate_invite(client).await?,
+            Some(3) => list_invites(client).await?,
+            Some(4) => revoke_invite(client).await?,
+            Some(5) | None => break, // Wenn User ESC/q drückt (None), gehen wir zurück ins Hauptmenü
             _ => {}
         }
-
-        println!("\nPress Enter to continue...");
-        let _ = std::io::stdin().read_line(&mut String::new());
     }
     Ok(())
 }
 
-async fn list_users(client: &mut AdminClient) -> anyhow::Result<()> {
+async fn list_users_table(client: &mut AdminClient) -> anyhow::Result<()> {
+    println!("\nFetching users from server...");
     let users = client.list_users().await?;
 
     let mut table = Table::new();
@@ -50,137 +55,205 @@ async fn list_users(client: &mut AdminClient) -> anyhow::Result<()> {
     table.set_header(vec!["Username", "Role", "Active", "Quota Used", "Quota Limit", "Created At"]);
 
     for u in users {
-        let active_cell = if u.is_active {
-            Cell::new("Yes").fg(Color::Green)
-        } else {
-            Cell::new("Banned").fg(Color::Red)
-        };
-
+        let active_cell = if u.is_active { Cell::new("Yes").fg(TColor::Green) } else { Cell::new("Banned").fg(TColor::Red) };
         let limit_str = if u.quota_limit == 0 { "Default".to_string() } else { format_bytes(u.quota_limit) };
-        let usage_str = format_bytes(u.quota_used);
 
         table.add_row(vec![
             Cell::new(&u.username).add_attribute(comfy_table::Attribute::Bold),
             Cell::new(&u.role),
             active_cell,
-            Cell::new(usage_str),
+            Cell::new(format_bytes(u.quota_used)),
             Cell::new(limit_str),
             Cell::new(&u.created_at),
         ]);
     }
 
     println!("{}", table);
+    println!("\nPress Enter to continue...");
+    let mut _buf = String::new();
+    std::io::stdin().read_line(&mut _buf)?;
     Ok(())
 }
 
-async fn create_user_flow(client: &mut AdminClient) -> anyhow::Result<()> {
-    println!("\n--- CREATE NEW IDENTITY ---");
+// Returnt `bool`: true = weiterlaufen, false = Admin hat sich selbst geändert (Logout)
+async fn edit_user(client: &mut AdminClient) -> anyhow::Result<bool> {
+    let users = client.list_users().await?;
+    if users.is_empty() {
+        println!("{}", "No users found.".yellow());
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        return Ok(true);
+    }
 
-    let username: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Username")
-        .interact_text()?;
+    let user_names: Vec<String> = users.iter().map(|u| u.username.clone()).collect();
 
-    // FIX: Select statt Input für Rollen-Auswahl
-    let roles = vec!["user", "admin", "guest", "auditor"];
-    let role_idx = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Role")
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select User to edit")
         .default(0)
-        .items(&roles)
-        .interact()?;
-    let role = roles[role_idx].to_string();
+        .items(&user_names)
+        .interact_opt()?;
 
-    let quota_gb: u64 = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Quota Limit (GB) - 0 for Server Default")
+    let selected_idx = match selection {
+        Some(idx) => idx,
+        None => return Ok(true), // Abbruch durch ESC/q
+    };
+
+    let selected_user = &users[selected_idx];
+    let action_items = vec!["Change Role", "Change Quota"];
+
+    let action_sel = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!("Action for {}", selected_user.username.cyan()))
         .default(0)
-        .interact_text()?;
+        .items(&action_items)
+        .interact_opt()?;
 
-    // 1. Keys generieren
-    println!("Generating crypto identity for '{}'...", username);
-    let mut csprng = OsRng;
-    let signing_key = SigningKey::generate(&mut csprng);
-    let verifying_key = signing_key.verifying_key();
-    let pub_key_bytes = verifying_key.to_bytes().to_vec();
+    let action_idx = match action_sel {
+        Some(idx) => idx,
+        None => return Ok(true), // Abbruch durch ESC/q
+    };
 
-    // 2. Identity File erstellen
-    let usb_path = Path::new("usb_drive");
-    if !usb_path.exists() { fs::create_dir_all(usb_path)?; }
+    match action_idx {
+        0 => { // Change Role
+            let roles = vec!["admin", "user", "guest"];
+            let role_sel = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select new Role")
+                .default(0)
+                .items(&roles)
+                .interact_opt()?;
 
-    let id_file_path = usb_path.join(format!("{}.pytja", username));
+            let role_idx = match role_sel {
+                Some(idx) => idx,
+                None => return Ok(true), // Abbruch
+            };
 
-    // FIX: Neue Base64 Engine API nutzen (vermeidet Deprecation Warnings)
-    use base64::{Engine as _, engine::general_purpose};
-    let priv_b64 = general_purpose::STANDARD.encode(signing_key.to_bytes());
-    let pub_b64 = general_purpose::STANDARD.encode(&pub_key_bytes);
+            let new_role = roles[role_idx].to_string();
+            client.change_user_role(selected_user.username.clone(), new_role.clone()).await?;
+            println!("✅ {} is now {}.", selected_user.username.green(), new_role.yellow());
 
-    let id_content = format!(
-        "PYTJA-ID-V1\nUSER:{}\nPRIV:{}\nPUB:{}\nROLE:{}",
-        username,
-        priv_b64,
-        pub_b64,
-        role
-    );
-
-    fs::write(&id_file_path, id_content)?;
-    println!("✅ Identity file written to: {:?}", id_file_path);
-
-    // 3. Am Server registrieren
-    println!("Registering on server...");
-    let quota_bytes = quota_gb * 1024 * 1024 * 1024;
-    client.register_user(username.clone(), pub_key_bytes, role, quota_bytes).await?;
-
-    println!("✅ User '{}' successfully registered and active.", username);
-    Ok(())
-}
-
-async fn manage_quota(client: &mut AdminClient) -> anyhow::Result<()> {
-    let username: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Target Username")
-        .interact_text()?;
-
-    let gb: f64 = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("New Limit in GB (0 for unlimited/default)")
-        .interact_text()?;
-
-    let bytes = (gb * 1024.0 * 1024.0 * 1024.0) as u64;
-    client.set_quota(username.clone(), bytes).await?;
-    println!("✅ Quota for '{}' updated to {:.2} GB", username, gb);
-    Ok(())
-}
-
-async fn ban_kick_menu(_client: &mut AdminClient) -> anyhow::Result<()> {
-    let _username: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Target Username")
-        .interact_text()?;
-
-    let action = Select::with_theme(&ColorfulTheme::default())
-        .items(&["Kick Active Sessions", "Ban User (Permanent)", "Unban User"])
-        .default(0)
-        .interact()?;
-
-    match action {
-        0 => {
-            // Kick logic: Get Sessions -> Loop Kick
-            // Vereinfachung: Server sollte "KickAllUserSessions" RPC haben,
-            // aktuell haben wir "KickUser" (SessionID).
-            // Wir lassen das als "TODO: Implement KickAll in Proto"
-            println!("Feature 'Kick All' requires Protocol Update. Use 'List Sessions' -> 'Kick ID'.");
+            // FIX: Warnung und Logout, wenn man sich selbst bearbeitet
+            if selected_user.username == client.username {
+                println!("{}", "\n⚠️ SECURITY LOCKOUT: You changed your own role.".red().bold());
+                println!("Your current session has been terminated to apply the new permissions.");
+                std::thread::sleep(std::time::Duration::from_secs(4));
+                return Ok(false);
+            }
         },
-        1 => {
-            // Ban RPC nutzen
-            // Da wir BanUserRequest in Proto haben...
-            // client.ban_user(username, true).await?;
-            println!("🚫 User Banned.");
-        },
-        2 => {
-            // client.ban_user(username, false).await?;
-            println!("✅ User Unbanned.");
+        1 => { // Change Quota
+            let current_gb = selected_user.quota_limit as f64 / 1024.0 / 1024.0 / 1024.0;
+            let new_quota_str: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!("New Quota Limit in GB (Current: {:.2}, 'q' = cancel)", current_gb))
+                .default(current_gb.to_string())
+                .interact()?;
+
+            if new_quota_str.trim().eq_ignore_ascii_case("q") { return Ok(true); }
+
+            let new_quota_gb: f64 = new_quota_str.parse().unwrap_or(current_gb);
+            let new_quota_bytes = (new_quota_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+            client.set_quota(selected_user.username.clone(), new_quota_bytes).await?;
+            println!("✅ Quota updated.");
         },
         _ => {}
     }
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    Ok(true)
+}
+
+async fn generate_invite(client: &mut AdminClient) -> anyhow::Result<()> {
+    let roles = vec!["admin", "user", "guest"];
+    let role_sel = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Assign Role for this Code")
+        .default(2)
+        .items(&roles)
+        .interact_opt()?;
+
+    let role_idx = match role_sel {
+        Some(idx) => idx,
+        None => return Ok(()), // Abbruch durch ESC/q
+    };
+    let selected_role = roles[role_idx].to_string();
+
+    let max_uses_str: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Maximum Uses (0 = unlimited, 'q' = cancel)")
+        .default("1".to_string())
+        .interact()?;
+
+    if max_uses_str.trim().eq_ignore_ascii_case("q") { return Ok(()); }
+    let max_uses: u32 = max_uses_str.parse().unwrap_or(1);
+
+    let quota_str: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Initial Quota Limit in GB ('q' = cancel)")
+        .default("1.0".to_string())
+        .interact()?;
+
+    if quota_str.trim().eq_ignore_ascii_case("q") { return Ok(()); }
+    let quota_gb: f64 = quota_str.parse().unwrap_or(1.0);
+    let quota_bytes = (quota_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+
+    match client.generate_invite(selected_role.clone(), max_uses, quota_bytes).await {
+        Ok(code) => {
+            println!("\n🎉 {}", "INVITE CODE GENERATED SUCCESSFULLY".green().bold());
+            println!("Share this code with the user: {}", code.cyan().bold());
+            println!("Role: {}, Max Uses: {}", selected_role, max_uses);
+        },
+        Err(e) => println!("❌ {}", format!("Failed: {}", e).red()),
+    }
+
+    println!("\nPress Enter to continue...");
+    let mut _buf = String::new();
+    std::io::stdin().read_line(&mut _buf)?;
     Ok(())
 }
 
-// Helper
+async fn list_invites(client: &mut AdminClient) -> anyhow::Result<()> {
+    println!("\nFetching Invite Codes...");
+    let invites = client.list_invites().await?;
+
+    if invites.is_empty() {
+        println!("{}", "No active invite codes found.".yellow());
+    } else {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL);
+        table.set_header(vec!["Code", "Role", "Uses", "Created By", "Created At"]);
+
+        for inv in invites {
+            let uses_str = if inv.max_uses == 0 { format!("{}/∞", inv.used_count) } else { format!("{}/{}", inv.used_count, inv.max_uses) };
+            table.add_row(vec![
+                Cell::new(&inv.code).fg(TColor::Cyan).add_attribute(comfy_table::Attribute::Bold),
+                Cell::new(&inv.role),
+                Cell::new(uses_str),
+                Cell::new(&inv.created_by),
+                Cell::new(&inv.created_at),
+            ]);
+        }
+        println!("{}", table);
+    }
+
+    println!("\nPress Enter to continue...");
+    let mut _buf = String::new();
+    std::io::stdin().read_line(&mut _buf)?;
+    Ok(())
+}
+
+async fn revoke_invite(client: &mut AdminClient) -> anyhow::Result<()> {
+    let code: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter Invite Code to revoke ('q' to cancel)")
+        .interact()?;
+
+    if code.trim().eq_ignore_ascii_case("q") { return Ok(()); }
+
+    let confirm = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Are you sure?")
+        .interact_opt()?;
+
+    if let Some(true) = confirm {
+        client.revoke_invite(code).await?;
+        println!("✅ {}", "Code revoked.".green());
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    Ok(())
+}
+
 fn format_bytes(b: u64) -> String {
     const UNIT: u64 = 1024;
     if b < UNIT { return format!("{} B", b); }

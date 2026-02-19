@@ -40,6 +40,9 @@ service PytjaService {
     rpc GetSystemStats(SystemStatsRequest) returns (SystemStatsResponse);
     rpc GetAuditLogs(GetAuditLogsRequest) returns (GetAuditLogsResponse);
     rpc StreamServerLogs(LogStreamRequest) returns (stream LogStreamEntry);
+    rpc GenerateInviteCode (GenerateInviteRequest) returns (GenerateInviteResponse);
+    rpc RevokeInviteCode (RevokeInviteRequest) returns (AdminActionResponse);
+    rpc ListInviteCodes (ListInvitesRequest) returns (ListInvitesResponse);
 }
 
 // --- Messages (Datenpakete) ---
@@ -343,12 +346,6 @@ message ListUsersResponse {
     repeated UserData users = 1;
 }
 
-message RegisterUserRequest {
-    string username = 1;
-    bytes public_key = 2; // PEM oder Raw Bytes
-    string role = 3;
-    uint64 quota_limit = 4; // Optional
-}
 message RegisterUserResponse {
     bool success = 1;
     string message = 2;
@@ -397,4 +394,45 @@ message LogStreamEntry {
     string level = 1; // "INFO", "WARN", "ERROR"
     string message = 2;
     string timestamp = 3;
+}
+
+// --- INVITE SYSTEM MESSAGES ---
+
+message RegisterUserRequest {
+    string username = 1;
+    bytes public_key = 2; // PEM oder Raw Bytes
+    string role = 3; // Wird ignoriert, wenn invite_code genutzt wird
+    uint64 quota_limit = 4;
+    string invite_code = 5; // NEU: Der Schlüssel zum Server
+}
+
+message GenerateInviteRequest {
+    string role = 1; // z.B. "guest", "user", "admin"
+    uint32 max_uses = 2; // Wie oft darf der Code genutzt werden? (0 = unendlich)
+    uint64 quota_limit = 3; // Optionales Limit in Bytes für neue User
+}
+
+message GenerateInviteResponse {
+    bool success = 1;
+    string code = 2; // z.B. "PYTJA-GUEST-A1B2"
+    string message = 3;
+}
+
+message RevokeInviteRequest {
+    string code = 1;
+}
+
+message InviteCodeInfo {
+    string code = 1;
+    string role = 2;
+    uint32 max_uses = 3;
+    uint32 used_count = 4;
+    string created_by = 5;
+    string created_at = 6;
+}
+
+message ListInvitesRequest {}
+
+message ListInvitesResponse {
+    repeated InviteCodeInfo invites = 1;
 }

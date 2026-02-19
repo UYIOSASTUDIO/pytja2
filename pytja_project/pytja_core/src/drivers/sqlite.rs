@@ -34,15 +34,28 @@ impl SqliteDriver {
 #[async_trait]
 impl PytjaRepository for SqliteDriver {
     async fn init(&self) -> Result<(), PytjaError> {
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS invite_codes (
+        code TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        max_uses INTEGER NOT NULL DEFAULT 1,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        quota_limit BIGINT NOT NULL DEFAULT 0,
+        created_by TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );"
+        ).execute(&self.pool).await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 public_key BLOB,
-                role TEXT DEFAULT 'guest',
-                is_active BOOLEAN,
-                created_at REAL,
-                quota_limit INTEGER DEFAULT 0,
-                description TEXT
+                role TEXT NOT NULL DEFAULT 'guest',
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                quota_used BIGINT NOT NULL DEFAULT 0,
+                quota_limit BIGINT NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS file_nodes (
                 path TEXT PRIMARY KEY,
@@ -71,6 +84,9 @@ impl PytjaRepository for SqliteDriver {
             .execute(&self.pool)
             .await
             .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        // Performance Index für die korrekte Tabelle 'file_nodes'
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_owner ON file_nodes(owner);").execute(&self.pool).await.ok();
 
         // Init Default Roles if missing
         let count: i32 = sqlx::query_scalar("SELECT COUNT(*) FROM roles")
@@ -345,5 +361,133 @@ impl PytjaRepository for SqliteDriver {
         let query = if let Some(user) = user_filter { query.bind(user) } else { query };
         let result: Vec<AuditLog> = query.fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(result)
+    }
+
+    // --- INVITE SYSTEM IMPLEMENTATION ---
+    async fn create_invite(&self, code: &str, role: &str, max_uses: u32, quota_limit: u64, creator: &str) -> Result<(), PytjaError> {
+        sqlx::query("INSERT INTO invite_codes (code, role, max_uses, quota_limit, created_by) VALUES (?, ?, ?, ?, ?)")
+            .bind(code).bind(role).bind(max_uses).bind(quota_limit as i64).bind(creator)
+            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_invite(&self, code: &str) -> Result<Option<(String, u64, u32, u32)>, PytjaError> {
+        let row = sqlx::query("SELECT role, quota_limit, max_uses, used_count FROM invite_codes WHERE code = ?")
+            .bind(code).fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        if let Some(r) = row {
+            Ok(Some((
+                r.try_get("role").unwrap_or_default(),
+                r.try_get::<i64, _>("quota_limit").unwrap_or(0) as u64,
+                r.try_get::<i32, _>("max_uses").unwrap_or(0) as u32,
+                r.try_get::<i32, _>("used_count").unwrap_or(0) as u32,
+            )))
+        } else { Ok(None) }
+    }
+
+    async fn increment_invite_use(&self, code: &str) -> Result<(), PytjaError> {
+        sqlx::query("UPDATE invite_codes SET used_count = used_count + 1 WHERE code = ?")
+            .bind(code).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn revoke_invite(&self, code: &str) -> Result<(), PytjaError> {
+        sqlx::query("DELETE FROM invite_codes WHERE code = ?")
+            .bind(code).execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_invites(&self) -> Result<Vec<(String, String, u32, u32, String, String)>, PytjaError> {
+        let rows = sqlx::query("SELECT * FROM invite_codes ORDER BY created_at DESC")
+            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| {
+            (
+                r.try_get("code").unwrap_or_default(),
+                r.try_get("role").unwrap_or_default(),
+                r.try_get::<i32, _>("max_uses").unwrap_or(0) as u32,
+                r.try_get::<i32, _>("used_count").unwrap_or(0) as u32,
+                r.try_get("created_by").unwrap_or_default(),
+                r.try_get::<String, _>("created_at").unwrap_or_default()
+            )
+        }).collect())
+    }
+
+    // --- SECURE QUERY PUSHDOWN (RBAC) ---
+    async fn list_directory_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError> {
+        let search = format!("{}/%", path.trim_end_matches('/'));
+        let is_admin = role == "admin";
+
+        // PERFORMANCE MAGIE: Die DB filtert PRIV Dateien (permissions = 0) sofort raus, wenn man nicht Admin oder Owner ist.
+        let rows = sqlx::query("SELECT * FROM file_nodes WHERE path LIKE ? AND (? = 1 OR permissions > 0 OR owner = ?)")
+            .bind(&search).bind(is_admin).bind(username)
+            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            let p: String = row.try_get("path").unwrap_or_default();
+            let relative = p.strip_prefix(path).unwrap_or(&p).trim_start_matches('/');
+            if relative.contains('/') { continue; } // Nur direkte Kinder
+
+            nodes.push(FileNode {
+                path: p,
+                name: row.try_get("name").unwrap_or_default(),
+                owner: row.try_get("owner").unwrap_or_default(),
+                is_folder: row.try_get("is_folder").unwrap_or(false),
+                content: vec![],
+                blob_id: row.try_get::<Option<String>, _>("blob_id").unwrap_or(None).filter(|s| !s.is_empty()),
+                size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
+                lock_pass: row.try_get::<Option<String>, _>("lock_pass").unwrap_or(None).filter(|s| !s.is_empty()),
+                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
+                created_at: row.try_get("created_at").unwrap_or(0.0),
+            });
+        }
+        Ok(nodes)
+    }
+
+    async fn list_recursive_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError> {
+        let is_admin = role == "admin";
+        let search_pattern = format!("{}/%", path.trim_end_matches('/'));
+
+        let mut query_str = "SELECT * FROM file_nodes WHERE path LIKE ? AND (? = 1 OR permissions > 0 OR owner = ?)";
+        if path == "/" {
+            query_str = "SELECT * FROM file_nodes WHERE (? = 1 OR permissions > 0 OR owner = ?)";
+        }
+
+        let mut query = sqlx::query(query_str);
+        if path != "/" {
+            query = query.bind(&search_pattern).bind(is_admin).bind(username);
+        } else {
+            query = query.bind(is_admin).bind(username);
+        }
+
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(FileNode {
+                path: row.try_get("path").unwrap_or_default(),
+                name: row.try_get("name").unwrap_or_default(),
+                owner: row.try_get("owner").unwrap_or_default(),
+                is_folder: row.try_get("is_folder").unwrap_or(false),
+                content: vec![],
+                blob_id: None,
+                size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
+                lock_pass: None,
+                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
+                created_at: row.try_get("created_at").unwrap_or(0.0),
+            });
+        }
+        Ok(nodes)
+    }
+
+    async fn get_node_secure(&self, path: &str, username: &str, role: &str) -> Result<Option<FileNode>, PytjaError> {
+        let node = self.get_node(path).await?;
+        if let Some(n) = node {
+            // ZERO-TRUST: Wenn es PRIV (0) ist und man weder Besitzer noch Admin ist -> 404 Verstecken!
+            if role != "admin" && n.permissions == 0 && n.owner != username {
+                return Ok(None);
+            }
+            return Ok(Some(n));
+        }
+        Ok(None)
     }
 }

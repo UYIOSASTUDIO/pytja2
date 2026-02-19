@@ -141,9 +141,12 @@ impl AdminClient {
     }
 
     pub async fn register_user(&mut self, username: String, pub_key: Vec<u8>, role: String, quota: u64) -> anyhow::Result<()> {
-        // FIX: Variable public_key nutzen
         let req = self.request(pytja::RegisterUserRequest {
-            username, public_key: pub_key, role, quota_limit: quota
+            username,
+            public_key: pub_key,
+            role,
+            quota_limit: quota,
+            invite_code: String::new(), // NEU: Wir senden einen leeren String mit, da diese Admin-Funktion aktuell nicht genutzt wird
         });
         self.client.register_user(req).await?;
         Ok(())
@@ -206,5 +209,40 @@ impl AdminClient {
     pub async fn stream_logs(&mut self) -> anyhow::Result<tonic::Streaming<pytja::LogStreamEntry>> {
         let req = self.request(pytja::LogStreamRequest {});
         Ok(self.client.stream_server_logs(req).await?.into_inner())
+    }
+
+    // --- INVITE SYSTEM ---
+
+    pub async fn generate_invite(&mut self, role: String, max_uses: u32, quota_limit: u64) -> anyhow::Result<String> {
+        let req = self.request(pytja::GenerateInviteRequest {
+            role,
+            max_uses,
+            quota_limit,
+        });
+        let resp = self.client.generate_invite_code(req).await?.into_inner();
+        Ok(resp.code)
+    }
+
+    pub async fn list_invites(&mut self) -> anyhow::Result<Vec<pytja::InviteCodeInfo>> {
+        let req = self.request(pytja::ListInvitesRequest {});
+        let resp = self.client.list_invite_codes(req).await?.into_inner();
+        Ok(resp.invites)
+    }
+
+    pub async fn revoke_invite(&mut self, code: String) -> anyhow::Result<()> {
+        let req = self.request(pytja::RevokeInviteRequest { code });
+        self.client.revoke_invite_code(req).await?;
+        Ok(())
+    }
+
+    // --- USER MANAGEMENT ---
+
+    pub async fn change_user_role(&mut self, username: String, new_role: String) -> anyhow::Result<()> {
+        let req = self.request(pytja::ChangeRoleRequest {
+            username,
+            new_role,
+        });
+        self.client.change_user_role(req).await?;
+        Ok(())
     }
 }

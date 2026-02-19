@@ -14,13 +14,15 @@ impl MyPytjaService {
 
     // --- LIST (LS) ---
     pub async fn list_directory_impl(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
+
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
+
         let req = request.into_inner();
 
         let (repo, relative_path) = self.resolve_repo(&req.path).await?;
-        let mut nodes = repo.list_directory(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?;
 
-        // Wenn Root aufgelistet wird, zeigen wir auch Mountpoints an
+        let mut nodes = repo.list_directory_secure(&relative_path, &claims.sub, &claims.role).await.map_err(|e| Status::internal(e.to_string()))?;
+
         if req.path == "/" || req.path.is_empty() {
             let mounts = self.manager.list_mounts().await;
             for mount_name in mounts {
@@ -250,11 +252,11 @@ impl MyPytjaService {
 
     // --- READ (CAT) ---
     pub async fn read_file_impl(&self, request: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, relative_path) = self.resolve_repo(&req.path).await?;
 
-        let node = repo.get_node(&relative_path).await.map_err(|e| Status::internal(e.to_string()))?
+        let node = repo.get_node_secure(&relative_path, &claims.sub, &claims.role).await.map_err(|e| Status::internal(e.to_string()))?
             .ok_or(Status::not_found("File not found"))?;
 
         if let Some(pass) = node.lock_pass {
@@ -461,12 +463,12 @@ impl MyPytjaService {
 
     // --- TREE ---
     pub async fn get_tree_impl(&self, request: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let req = request.into_inner();
         let (repo, rel_path) = self.resolve_repo(&req.root_path).await?;
 
         // 1. Rekursive Liste holen
-        let mut all_nodes = repo.list_recursive(&rel_path).await.map_err(|e| Status::internal(e.to_string()))?;
+        let mut all_nodes = repo.list_recursive_secure(&rel_path, &claims.sub, &claims.role).await.map_err(|e| Status::internal(e.to_string()))?;
         all_nodes.sort_by(|a, b| a.path.cmp(&b.path));
 
         let mut output = format!("{}\n", req.root_path);

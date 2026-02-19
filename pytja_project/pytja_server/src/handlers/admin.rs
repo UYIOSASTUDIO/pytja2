@@ -32,8 +32,11 @@ impl MyPytjaService {
         Ok(Response::new(ListUsersResponse { users: user_list }))
     }
 
+    // --- REGISTRATION & INVITES ---
+
     pub async fn register_user_impl(&self, request: Request<RegisterUserRequest>) -> Result<Response<RegisterUserResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        // WICHTIG: KEIN self.check_permissions(...) HIER!
+        // Die Registrierung ist öffentlich zugänglich, wird aber durch den Invite-Code gesichert.
         let req = request.into_inner();
         let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
 
@@ -41,18 +44,83 @@ impl MyPytjaService {
             return Err(Status::already_exists("User already exists"));
         }
 
+        // 1. Invite Code Validieren
+        if req.invite_code.is_empty() {
+            return Err(Status::permission_denied("Invite code required for registration."));
+        }
+
+        let invite = repo.get_invite(&req.invite_code).await.map_err(|e| Status::internal(e.to_string()))?;
+        let (assigned_role, assigned_quota) = match invite {
+            Some((role, quota, max_uses, used_count)) => {
+                // Prüfen ob Code aufgebraucht ist
+                if max_uses > 0 && used_count >= max_uses {
+                    return Err(Status::permission_denied("Invite code expired or used maximum number of times."));
+                }
+                (role, quota)
+            },
+            None => return Err(Status::permission_denied("Invalid invite code.")),
+        };
+
+        // 2. User anlegen (mit den Werten aus dem Invite-Code!)
         let new_user = User {
-            username: req.username,
+            username: req.username.clone(),
             public_key: req.public_key,
-            role: req.role,
+            role: assigned_role,
             is_active: true,
             created_at: chrono::Utc::now().timestamp() as f64,
-            quota_limit: req.quota_limit as i64,
+            quota_limit: assigned_quota as i64,
             description: None,
         };
 
         repo.create_user(&new_user).await.map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(RegisterUserResponse { success: true, message: "User registered.".into() }))
+
+        // 3. Code als "genutzt" markieren
+        repo.increment_invite_use(&req.invite_code).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RegisterUserResponse { success: true, message: "Welcome to Pytja. Registration successful.".into() }))
+    }
+
+    pub async fn generate_invite_code_impl(&self, request: Request<GenerateInviteRequest>) -> Result<Response<GenerateInviteResponse>, Status> {
+        let claims = self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+
+        // Simpler Random String (Ohne externe Crates)
+        let timestamp = chrono::Utc::now().timestamp_subsec_nanos();
+        let code = format!("PYTJA-{}-{:X}", req.role.to_uppercase(), timestamp);
+
+        repo.create_invite(&code, &req.role, req.max_uses, req.quota_limit, &claims.sub).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(primary) = self.manager.get_repo("primary").await {
+            let _ = primary.log_action(&claims.sub, "INVITE_GENERATE", &code).await;
+        }
+
+        Ok(Response::new(GenerateInviteResponse { success: true, code, message: "Invite generated".into() }))
+    }
+
+    pub async fn revoke_invite_code_impl(&self, request: Request<RevokeInviteRequest>) -> Result<Response<AdminActionResponse>, Status> {
+        let claims = self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+
+        repo.revoke_invite(&req.code).await.map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(primary) = self.manager.get_repo("primary").await {
+            let _ = primary.log_action(&claims.sub, "INVITE_REVOKE", &req.code).await;
+        }
+        Ok(Response::new(AdminActionResponse { success: true, message: "Invite revoked".into() }))
+    }
+
+    pub async fn list_invite_codes_impl(&self, request: Request<ListInvitesRequest>) -> Result<Response<ListInvitesResponse>, Status> {
+        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+
+        let invites = repo.list_invites().await.map_err(|e| Status::internal(e.to_string()))?;
+        let proto_invites = invites.into_iter().map(|(c, r, m, u, by, at)| InviteCodeInfo {
+            code: c, role: r, max_uses: m, used_count: u, created_by: by, created_at: at
+        }).collect();
+
+        Ok(Response::new(ListInvitesResponse { invites: proto_invites }))
     }
 
     pub async fn set_user_quota_impl(&self, request: Request<SetQuotaRequest>) -> Result<Response<SetQuotaResponse>, Status> {
