@@ -67,7 +67,7 @@ impl PytjaRepository for SqliteDriver {
                 blob_id TEXT,
                 lock_pass TEXT,
                 permissions INTEGER DEFAULT 0,
-                created_at REAL
+                created_at REAL,
                 metadata TEXT
             );
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -85,6 +85,13 @@ impl PytjaRepository for SqliteDriver {
             .execute(&self.pool)
             .await
             .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        // --- ENTERPRISE MIGRATION ---
+        // Falls die Tabelle von vorher existiert, fügen wir die Metadaten-Spalte "on-the-fly" hinzu.
+        // Schlägt geräuschlos fehl, falls die Spalte bereits existiert.
+        let _ = sqlx::query("ALTER TABLE file_nodes ADD COLUMN metadata TEXT;")
+            .execute(&self.pool).await;
+        // ----------------------------
 
         // Performance Index für die korrekte Tabelle 'file_nodes'
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_owner ON file_nodes(owner);").execute(&self.pool).await.ok();

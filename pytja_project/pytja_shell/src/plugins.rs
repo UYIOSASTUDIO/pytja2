@@ -284,17 +284,22 @@ impl PluginManager {
 
                         let local_str = path.to_string_lossy().to_string();
 
-                        // UPLOAD: Wir pushen die Datei direkt live in die entfernte Datenbank
-                        if client.upload_file(&local_str, &remote_path, None, "plugin_system", metadata).await.is_ok() {
-                            synced_files += 1;
-                        } else {
-                            eprintln!("{} Failed to upload {}", "❌".red(), rel_path);
+                        // UPLOAD: Live in die Datenbank.
+                        // FIX: Wir nutzen client.username als echten Owner, damit der Server es akzeptiert!
+                        match client.upload_file(&local_str, &remote_path, None, &client.username, metadata).await {
+                            Ok(_) => {
+                                synced_files += 1;
+                            }
+                            Err(e) => {
+                                // Professionelles Error-Logging für Sandbox-Uploads
+                                eprintln!("{} Failed to upload plugin output '{}': {}", "❌".red(), rel_path, e);
+                            }
                         }
                     }
                 }
 
                 if synced_files > 0 {
-                    println!("{} Synced {} output files (with metadata) to Pytja VFS.", "✔".green(), synced_files);
+                    println!("{} Synced {} output files (with metadata) directly to Pytja Server.", "✔".green(), synced_files);
                 }
             }
         }
