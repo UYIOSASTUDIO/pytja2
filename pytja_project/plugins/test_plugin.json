@@ -1,0 +1,6 @@
+{
+  "name": "test_plugin",
+  "version": "1.0.0",
+  "description": "Tests the Sandbox and Metadata Sidecar Sync",
+  "permissions": ["fs_write"]
+}

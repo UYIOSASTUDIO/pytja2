@@ -68,6 +68,7 @@ impl PytjaRepository for SqliteDriver {
                 lock_pass TEXT,
                 permissions INTEGER DEFAULT 0,
                 created_at REAL
+                metadata TEXT
             );
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,9 +202,9 @@ impl PytjaRepository for SqliteDriver {
 
     // --- FILE SYSTEM ---
     async fn save_node(&self, node: &FileNode) -> Result<(), PytjaError> {
-        sqlx::query("INSERT OR REPLACE INTO file_nodes (path, name, owner, is_folder, size, content, blob_id, lock_pass, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT OR REPLACE INTO file_nodes (path, name, owner, is_folder, size, content, blob_id, lock_pass, permissions, created_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&node.path).bind(&node.name).bind(&node.owner).bind(node.is_folder).bind(node.size as i64)
-            .bind(&node.content).bind(&node.blob_id).bind(&node.lock_pass).bind(node.permissions as i32).bind(node.created_at)
+            .bind(&node.content).bind(&node.blob_id).bind(&node.lock_pass).bind(node.permissions as i32).bind(node.created_at).bind(&node.metadata)
             .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
     }
@@ -227,6 +228,7 @@ impl PytjaRepository for SqliteDriver {
                 lock_pass,
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             }))
         } else { Ok(None) }
     }
@@ -258,6 +260,7 @@ impl PytjaRepository for SqliteDriver {
                 lock_pass,
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             });
         }
         Ok(nodes)
@@ -297,6 +300,7 @@ impl PytjaRepository for SqliteDriver {
                 lock_pass,
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             });
         }
         Ok(nodes)
@@ -438,6 +442,7 @@ impl PytjaRepository for SqliteDriver {
                 lock_pass: row.try_get::<Option<String>, _>("lock_pass").unwrap_or(None).filter(|s| !s.is_empty()),
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             });
         }
         Ok(nodes)
@@ -474,6 +479,7 @@ impl PytjaRepository for SqliteDriver {
                 lock_pass: None,
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             });
         }
         Ok(nodes)
@@ -489,5 +495,30 @@ impl PytjaRepository for SqliteDriver {
             return Ok(Some(n));
         }
         Ok(None)
+    }
+
+    async fn read_node_chunk_secure(&self, path: &str, username: &str, role: &str, offset: usize, size: usize) -> Result<Vec<u8>, PytjaError> {
+        let is_admin = role == "admin";
+
+        // WICHTIG: SQLite SUBSTR ist 1-basiert (das erste Byte ist 1, nicht 0)!
+        let sqlite_offset = offset + 1;
+
+        // PERFORMANCE MAGIE: SUBSTR lädt nur den angeforderten Teil des BLOBs aus der Festplatte.
+        let row = sqlx::query("SELECT SUBSTR(content, ?, ?) as chunk FROM file_nodes WHERE path = ? AND (? = 1 OR permissions > 0 OR owner = ?)")
+            .bind(sqlite_offset as i64)
+            .bind(size as i64)
+            .bind(path)
+            .bind(is_admin)
+            .bind(username)
+            .fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        if let Some(r) = row {
+            use sqlx::Row;
+            let chunk: Vec<u8> = r.try_get("chunk").unwrap_or_default();
+            Ok(chunk)
+        } else {
+            // Wenn die Datei nicht existiert oder Rechte fehlen, geben wir leer zurück
+            Ok(vec![])
+        }
     }
 }

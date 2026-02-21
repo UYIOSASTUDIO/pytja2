@@ -107,10 +107,10 @@ impl PytjaRepository for PostgresDriver {
     // --- Filesystem ---
 
     async fn save_node(&self, node: &FileNode) -> Result<(), PytjaError> {
-        sqlx::query("INSERT INTO file_nodes (path, name, owner, is_folder, size, content, blob_id, lock_pass, permissions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                      ON CONFLICT (path) DO UPDATE SET size=$5, content=$6, blob_id=$7, permissions=$9")
+        sqlx::query("INSERT INTO file_nodes (path, name, owner, is_folder, size, content, blob_id, lock_pass, permissions, created_at, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                      ON CONFLICT (path) DO UPDATE SET size=$5, content=$6, blob_id=$7, permissions=$9, metadata=$11")
             .bind(&node.path).bind(&node.name).bind(&node.owner).bind(node.is_folder).bind(node.size as i64)
-            .bind(&node.content).bind(&node.blob_id).bind(&node.lock_pass).bind(node.permissions as i32).bind(node.created_at)
+            .bind(&node.content).bind(&node.blob_id).bind(&node.lock_pass).bind(node.permissions as i32).bind(node.created_at).bind(&node.metadata)
             .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
         Ok(())
     }
@@ -133,6 +133,7 @@ impl PytjaRepository for PostgresDriver {
                 lock_pass: r.try_get("lock_pass").ok(),
                 permissions: r.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: r.try_get("created_at").unwrap_or(0.0),
+                metadata: r.try_get("metadata").ok(),
             }))
         } else {
             Ok(None)
@@ -158,6 +159,7 @@ impl PytjaRepository for PostgresDriver {
             lock_pass: r.try_get("lock_pass").ok(),
             permissions: r.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
             created_at: r.try_get("created_at").unwrap_or(0.0),
+            metadata: r.try_get("metadata").ok(),
         }).collect())
     }
 
@@ -320,6 +322,7 @@ impl PytjaRepository for PostgresDriver {
                 lock_pass: row.try_get::<Option<String>, _>("lock_pass").unwrap_or(None).filter(|s| !s.is_empty()),
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get::<f64, _>("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             });
         }
         Ok(nodes)
@@ -357,6 +360,7 @@ impl PytjaRepository for PostgresDriver {
                 lock_pass: None,
                 permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
                 created_at: row.try_get::<f64, _>("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
             });
         }
         Ok(nodes)
@@ -371,5 +375,31 @@ impl PytjaRepository for PostgresDriver {
             return Ok(Some(n));
         }
         Ok(None)
+    }
+
+    async fn read_node_chunk_secure(&self, path: &str, username: &str, role: &str, offset: usize, size: usize) -> Result<Vec<u8>, PytjaError> {
+        let is_admin = role == "admin";
+
+        // WICHTIG: PostgreSQL SUBSTRING ist ebenfalls 1-basiert!
+        let pg_offset = offset + 1;
+
+        // PERFORMANCE MAGIE: SUBSTRING(bytea FROM start FOR length) lädt nur den Chunk
+        // Wir casten $1::int und $2::int explizit, damit sqlx bei Postgres nicht durcheinander kommt.
+        let row = sqlx::query("SELECT SUBSTRING(content FROM $1::int FOR $2::int) as chunk FROM file_nodes WHERE path = $3 AND ($4 = true OR permissions > 0 OR owner = $5)")
+            .bind(pg_offset as i32) // Postgres bytea max size ist 1GB, daher reicht i32 perfekt
+            .bind(size as i32)
+            .bind(path)
+            .bind(is_admin) // Echter Boolean für Postgres
+            .bind(username)
+            .fetch_optional(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        if let Some(r) = row {
+            use sqlx::Row;
+            let chunk: Vec<u8> = r.try_get("chunk").unwrap_or_default();
+            Ok(chunk)
+        } else {
+            // Wenn die Datei nicht existiert oder Rechte fehlen, geben wir leer zurück
+            Ok(vec![])
+        }
     }
 }

@@ -73,6 +73,9 @@ impl PytjaService for MyPytjaService {
     async fn generate_invite_code(&self, r: Request<GenerateInviteRequest>) -> Result<Response<GenerateInviteResponse>, Status> { self.generate_invite_code_impl(r).await }
     async fn revoke_invite_code(&self, r: Request<RevokeInviteRequest>) -> Result<Response<AdminActionResponse>, Status> { self.revoke_invite_code_impl(r).await }
     async fn list_invite_codes(&self, r: Request<ListInvitesRequest>) -> Result<Response<ListInvitesResponse>, Status> { self.list_invite_codes_impl(r).await }
+    async fn read_file_chunk(&self, r: Request<pytja_proto::pytja::ReadChunkRequest>) -> Result<Response<pytja_proto::pytja::ReadChunkResponse>, Status> {
+        self.read_file_chunk_impl(r).await
+    }
 }
 
 #[tokio::main]

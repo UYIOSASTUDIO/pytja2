@@ -75,8 +75,8 @@ impl VirtualFileSystem {
 
     // --- ASYNC CORE OPERATIONS ---
 
-    pub async fn create(&mut self, mut name: String, is_folder: bool, content: Vec<u8>, system_override: bool, lock_pass: Option<String>) -> Result<String, PytjaError> {
-        if !system_override {
+    // NEU: metadata: Option<String> am Ende hinzugefügt
+    pub async fn create(&mut self, mut name: String, is_folder: bool, content: Vec<u8>, system_override: bool, lock_pass: Option<String>, metadata: Option<String>) -> Result<String, PytjaError> {        if !system_override {
             if !is_folder {
                 let has_valid_ext = ALLOWED_TEXT_EXTENSIONS.iter().any(|&ext| name.ends_with(ext));
                 if !has_valid_ext && !name.contains('.') { name.push_str(".txt"); }
@@ -103,6 +103,7 @@ impl VirtualFileSystem {
             permissions: 0,
             created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
             blob_id: None,
+            metadata,
         };
 
         db.save_node(&node).await?;
@@ -250,6 +251,7 @@ impl VirtualFileSystem {
                         permissions: 0,
                         created_at: 0.0,
                         blob_id: None,
+                        metadata: None,
                     };
                     let _ = repo.save_node(&node).await;
                 }
@@ -353,7 +355,8 @@ impl VirtualFileSystem {
 
         if host_path.is_dir() {
             println!("Starting recursive import of '{}'...", name);
-            match self.create(name.clone(), true, vec![], false, lock_pass.clone()).await {
+            // NEU: ', None' am Ende hinzugefügt
+            match self.create(name.clone(), true, vec![], false, lock_pass.clone(), None).await {
                 Ok(_) => {}, Err(PytjaError::AlreadyExists(_)) => {}, Err(e) => return Err(e),
             }
             let target_root = if self.current_path == "/" { format!("/{}", name) } else { format!("{}/{}", self.current_path, name) };
@@ -362,7 +365,8 @@ impl VirtualFileSystem {
         } else {
             let content = fs::read(host_path).map_err(|e| PytjaError::IoError(e))?;
             let current_pass = if recursive_lock { lock_pass } else { None };
-            self.create(name.clone(), false, content, true, current_pass).await?;
+            // NEU: ', None' am Ende hinzugefügt
+            self.create(name.clone(), false, content, true, current_pass, None).await?;
             return Ok(format!("Imported file: {}", name));
         }
     }
@@ -387,6 +391,7 @@ impl VirtualFileSystem {
                         is_folder: true, size: 0, content: vec![], lock_pass: current_pass.clone(),
                         permissions: 0, created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
                         blob_id: None,
+                        metadata: None,
                     };
                     let _ = db.save_node(&node).await;
                     self.import_recursive(path, vfs_path, lock_pass.clone(), rec_lock).await?;
@@ -397,6 +402,7 @@ impl VirtualFileSystem {
                             is_folder: false, size: content.len(), content, lock_pass: current_pass,
                             permissions: 0, created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
                             blob_id: None,
+                            metadata: None,
                         };
                         let _ = db.save_node(&node).await;
                     }

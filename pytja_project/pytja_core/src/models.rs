@@ -38,6 +38,7 @@ pub struct FileNode {
     pub lock_pass: Option<String>,
     pub permissions: u8,
     pub created_at: f64,
+    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

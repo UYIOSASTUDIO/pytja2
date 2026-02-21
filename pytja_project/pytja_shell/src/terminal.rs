@@ -133,11 +133,10 @@ impl Terminal {
                 if self.plugin_manager.has_command(cmd) {
                     println!("🚀 Launching Plugin: {}", cmd.cyan());
 
-                    if let Err(e) = self.plugin_manager.execute(cmd, args, self.vfs.clone()) {
+                    // FIX: Wir übergeben den Netzwerk-Client und den aktuellen Pfad (statt des lokalen VFS)
+                    if let Err(e) = self.plugin_manager.execute(cmd, args, &mut self.client, &self.current_path).await {
                         self.handle_error("Plugin Crash", e);
                     }
-                } else {
-                    println!("Command not found: {}", cmd);
                 }
             }
         }
@@ -436,7 +435,8 @@ impl Terminal {
                     }
                 } else {
                     print!("Uploading {}... ", rel.to_string_lossy());
-                    match self.client.upload_file(path.to_str().unwrap(), &remote, None, &self.user_id).await {
+                    // NEU: , None am Ende hinzugefügt (für leere Metadaten)
+                    match self.client.upload_file(path.to_str().unwrap(), &remote, None, &self.user_id, None).await {
                         Ok(_) => println!("{}", "OK".green()),
                         Err(e) => {
                             println!("{}", "FAIL".red());
@@ -449,7 +449,8 @@ impl Terminal {
             let lock_pass = if args.contains(&"-lock") { Some(self.ask_password("Set Password: ")) } else { None };
             println!("Uploading {}...", local_path.display());
 
-            match self.client.upload_file(local_path.to_str().unwrap(), &remote_base, lock_pass, &self.user_id).await {
+            // NEU: , None am Ende hinzugefügt (für leere Metadaten)
+            match self.client.upload_file(local_path.to_str().unwrap(), &remote_base, lock_pass, &self.user_id, None).await {
                 Ok(_) => {
                     info!("Upload success: {}", remote_base);
                     println!("{}", "Upload complete.".green());

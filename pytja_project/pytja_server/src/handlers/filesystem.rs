@@ -38,6 +38,7 @@ impl MyPytjaService {
                     permissions: 0,
                     created_at: 0.0,
                     blob_id: None,
+                    metadata: None,
                 });
             }
         }
@@ -156,6 +157,7 @@ impl MyPytjaService {
             lock_pass: if metadata.lock_password.is_empty() { None } else { Some(metadata.lock_password) },
             permissions: 2, // FIX: Default Public Permissions (2)
             created_at: chrono::Utc::now().timestamp() as f64,
+            metadata: metadata.metadata,
         };
 
         repo.save_node(&node).await.map_err(|e| Status::internal(e.to_string()))?;
@@ -237,6 +239,7 @@ impl MyPytjaService {
             permissions: 2, // FIX: Default Public Permissions
             created_at: chrono::Utc::now().timestamp() as f64,
             blob_id: None,
+            metadata: None,
         };
 
         let res = repo.save_node(&node).await;
@@ -360,6 +363,7 @@ impl MyPytjaService {
                     path: dst_rel.clone(), name, owner: claims.sub.clone(), is_folder: false, size: src_node.size,
                     content: src_node.content, blob_id: new_blob_id, lock_pass: src_node.lock_pass, permissions: src_node.permissions,
                     created_at: chrono::Utc::now().timestamp() as f64,
+                    metadata: src_node.metadata.clone(),
                 };
 
                 if let Err(e) = repo_dst.save_node(&new_node).await {
@@ -398,6 +402,7 @@ impl MyPytjaService {
             path: dst_rel, name: "".into(), owner: claims.sub.clone(), is_folder: false,
             content: src_node.content, blob_id: src_node.blob_id, size: src_node.size,
             lock_pass: None, permissions: 2, created_at: chrono::Utc::now().timestamp() as f64,
+            metadata: src_node.metadata.clone(),
         };
         repo.save_node(&new_node).await.map_err(|e| Status::internal(e.to_string()))?;
         self.sessions.update_quota(&claims.sub, new_node.size as i64).await;
@@ -525,5 +530,35 @@ impl MyPytjaService {
             let _ = tx.send(Ok(ExecResponse { output_line: "Result: [Function executed successfully]".into() })).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    pub async fn read_file_chunk_impl(&self, request: Request<pytja_proto::pytja::ReadChunkRequest>) -> Result<Response<pytja_proto::pytja::ReadChunkResponse>, Status> {
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
+        let req = request.into_inner();
+
+        let (repo, relative_path) = self.resolve_repo(&req.path).await?;
+
+        // Wenn ein Passwort gesendet wurde, prüfen wir das (wie bei get_node)
+        if let Ok(Some(node)) = repo.get_node(&relative_path).await {
+            if let Some(real_pass) = node.lock_pass {
+                let provided = req.password.unwrap_or_default();
+                if provided != real_pass {
+                    return Err(Status::permission_denied("Locked file. Incorrect password."));
+                }
+            }
+        } else {
+            return Err(Status::not_found("File not found"));
+        }
+
+        // Lade nur den Chunk (Zero-Trust + Zero-RAM Overhead)
+        let chunk = repo.read_node_chunk_secure(&relative_path, &claims.sub, &claims.role, req.offset as usize, req.chunk_size as usize)
+            .await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let is_eof = chunk.len() < req.chunk_size as usize;
+
+        Ok(Response::new(pytja_proto::pytja::ReadChunkResponse {
+            chunk,
+            is_eof,
+        }))
     }
 }

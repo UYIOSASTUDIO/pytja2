@@ -55,4 +55,6 @@ pub trait PytjaRepository: Send + Sync {
     async fn list_directory_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError>;
     async fn list_recursive_secure(&self, path: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError>;
     async fn get_node_secure(&self, path: &str, username: &str, role: &str) -> Result<Option<FileNode>, PytjaError>;
+    // Lädt einen Chunk einer Datei für performantes Streaming (ohne RAM-Overhead)
+    async fn read_node_chunk_secure(&self, path: &str, username: &str, role: &str, offset: usize, size: usize) -> Result<Vec<u8>, PytjaError>;
 }

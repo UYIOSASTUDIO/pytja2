@@ -214,12 +214,13 @@ impl PluginManager {
         self.modules.keys().cloned().collect()
     }
 
-    #[instrument(skip(self, _vfs))]
-    pub fn execute(
+    #[instrument(skip(self, client))]
+    pub async fn execute(
         &mut self,
         cmd: &str,
         args: Vec<&str>,
-        _vfs: std::sync::Arc<tokio::sync::Mutex<crate::vfs::VirtualFileSystem>>
+        client: &mut crate::network_client::PytjaClient, // KORREKT: Der Netzwerk-Client!
+        current_path: &str, // KORREKT: Der aktuelle Pfad!
     ) -> Result<()> {
         let module = self.modules.get(cmd).context("Plugin not found")?;
         let permissions = self.permissions_db.granted.get(cmd)
@@ -227,27 +228,76 @@ impl PluginManager {
 
         info!("Executing Plugin '{}' with rights: {:?}", cmd, permissions);
 
-        // FIX: Kein Chaining beim Konstruktor, um E0716 zu vermeiden!
         let mut builder = WasiState::new(cmd);
-
-        // Jetzt sicher konfigurieren:
         builder.args(&args);
 
+        let mut _temp_dir = None;
+        let mut temp_path_clone = None;
+
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
-            builder.map_dir(".", ".")?;
+            let td = tempfile::tempdir().context("Failed to create secure sandbox directory")?;
+            let temp_path = td.path().to_path_buf();
+
+            builder.map_dir("/", temp_path.clone())?;
+            builder.preopen_dir(temp_path.clone())?;
+
+            temp_path_clone = Some(temp_path);
+            _temp_dir = Some(td);
         }
 
         if permissions.contains(&Permission::Env) || permissions.contains(&Permission::Admin) {
             builder.envs(std::env::vars());
+        } else {
+            builder.env("SANDBOXED", "true");
         }
 
-        // Finalize konsumiert den Builder
         let mut wasi_env = builder.finalize(&mut self.store)?;
-
         let import_object = wasi_env.import_object(&mut self.store, &module)?;
-        let instance = Instance::new(&mut self.store, &module, &import_object)?;
 
+        // 1. PLUGIN INITIALISIEREN
+        let instance = Instance::new(&mut self.store, &module, &import_object)?;
         wasi_env.initialize(&mut self.store, &instance)?;
+
+        // DEN START-KNOPF DRÜCKEN
+        let start = instance.exports.get_function("_start").context("Plugin is missing a _start (main) function")?;
+        start.call(&mut self.store, &[]).context("Plugin crashed during execution")?;
+
+        // 2. POST-EXECUTION SYNC (Direkt über gRPC zum Server)
+        if let Some(tp) = temp_path_clone {
+            if permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
+                let mut synced_files = 0;
+
+                for entry in walkdir::WalkDir::new(&tp).into_iter().filter_map(|e| e.ok()) {
+                    let path = entry.path();
+
+                    if path.is_file() && !path.to_string_lossy().ends_with(".meta.json") {
+                        let rel_path = path.strip_prefix(&tp).unwrap().to_string_lossy().to_string();
+
+                        let remote_path = if current_path == "/" { format!("/{}", rel_path) } else { format!("{}/{}", current_path, rel_path) };
+
+                        let meta_path = std::path::PathBuf::from(format!("{}.meta.json", path.display()));
+                        let metadata = if meta_path.exists() {
+                            std::fs::read_to_string(&meta_path).ok()
+                        } else {
+                            None
+                        };
+
+                        let local_str = path.to_string_lossy().to_string();
+
+                        // UPLOAD: Wir pushen die Datei direkt live in die entfernte Datenbank
+                        if client.upload_file(&local_str, &remote_path, None, "plugin_system", metadata).await.is_ok() {
+                            synced_files += 1;
+                        } else {
+                            eprintln!("{} Failed to upload {}", "❌".red(), rel_path);
+                        }
+                    }
+                }
+
+                if synced_files > 0 {
+                    println!("{} Synced {} output files (with metadata) to Pytja VFS.", "✔".green(), synced_files);
+                }
+            }
+        }
 
         Ok(())
     }

@@ -214,21 +214,24 @@ impl PytjaClient {
 
     // --- STREAMING UPLOAD ---
 
-    pub async fn upload_file(&self, local_path: &str, remote_path: &str, lock: Option<String>, owner: &str) -> Result<String> {
+    // NEU: metadata_json am Ende hinzugefügt
+    pub async fn upload_file(&self, local_path: &str, remote_path: &str, lock: Option<String>, owner: &str, metadata_json: Option<String>) -> Result<String> {
         let path = Path::new(local_path);
         if !path.exists() { return Err(anyhow!("File not found")); }
 
-        let metadata = pytja_proto::pytja::FileMetadata {
+        // NEU: Das JSON-Feld an FileMetadata übergeben
+        let file_meta = pytja_proto::pytja::FileMetadata {
             path: remote_path.to_string(),
             owner: owner.to_string(),
             lock_password: lock.unwrap_or_default(),
             is_folder: false,
+            metadata: metadata_json, // Hier greift die neue Proto-Definition!
         };
 
         let file_path = local_path.to_string();
 
         let outbound = async_stream::stream! {
-            yield UploadRequest { data: Some(Data::Metadata(metadata)) };
+            yield UploadRequest { data: Some(Data::Metadata(file_meta)) };
 
             // Chunked Reading
             if let Ok(content) = fs::read(&file_path) {
@@ -240,16 +243,16 @@ impl PytjaClient {
 
         // Streaming Request manuell bauen (auth_req geht nicht für Streams direkt)
         let mut request = Request::new(outbound);
-        let lock = self.token.lock().await;
-        if let Some(token) = &*lock {
+        let lock_token = self.token.lock().await;
+        if let Some(token) = &*lock_token {
             let val = format!("Bearer {}", token);
             if let Ok(meta) = tonic::metadata::MetadataValue::from_str(&val) {
                 request.metadata_mut().insert("authorization", meta);
             }
         }
 
-        let mut client = self.client.lock().await;
-        let response = client.upload_file(request).await?.into_inner();
+        let mut client_lock = self.client.lock().await;
+        let response = client_lock.upload_file(request).await?.into_inner();
         if response.success { Ok(response.message) } else { Err(anyhow!(response.message)) }
     }
 
