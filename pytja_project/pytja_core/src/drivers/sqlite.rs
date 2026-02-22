@@ -528,4 +528,29 @@ impl PytjaRepository for SqliteDriver {
             Ok(vec![])
         }
     }
+
+    async fn query_metadata_secure(&self, query: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError> {
+        let is_admin = role == "admin";
+        let search = format!("%{}%", query); // Performante Volltextsuche im JSON
+
+        let rows = sqlx::query("SELECT * FROM file_nodes WHERE metadata IS NOT NULL AND metadata LIKE ? AND (? = 1 OR permissions > 0 OR owner = ?)")
+            .bind(&search).bind(is_admin).bind(username)
+            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(FileNode {
+                path: row.try_get("path").unwrap_or_default(),
+                name: row.try_get("name").unwrap_or_default(),
+                owner: row.try_get("owner").unwrap_or_default(),
+                is_folder: row.try_get("is_folder").unwrap_or(false),
+                content: vec![], blob_id: None, lock_pass: None,
+                size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
+                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
+                created_at: row.try_get("created_at").unwrap_or(0.0),
+                metadata: row.try_get("metadata").ok(),
+            });
+        }
+        Ok(nodes)
+    }
 }

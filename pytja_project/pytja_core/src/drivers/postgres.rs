@@ -402,4 +402,35 @@ impl PytjaRepository for PostgresDriver {
             Ok(vec![])
         }
     }
+
+    async fn query_metadata_secure(&self, query: &str, username: &str, role: &str) -> Result<Vec<FileNode>, PytjaError> {
+        let is_admin = role == "admin";
+        let search = format!("%{}%", query); // Performante Volltextsuche im JSON
+
+        // Der komplette, korrekte Postgres-SQL-Befehl
+        let rows = sqlx::query("SELECT * FROM file_nodes WHERE metadata IS NOT NULL AND metadata LIKE $1 AND ($2 = true OR permissions > 0 OR owner = $3)")
+            .bind(&search)
+            .bind(is_admin) // Postgres nutzt echte Booleans (true/false) statt 1/0
+            .bind(username)
+            .fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            use sqlx::Row;
+            nodes.push(FileNode {
+                path: row.try_get("path").unwrap_or_default(),
+                name: row.try_get("name").unwrap_or_default(),
+                owner: row.try_get("owner").unwrap_or_default(),
+                is_folder: row.try_get("is_folder").unwrap_or(false),
+                content: vec![],
+                blob_id: None,
+                lock_pass: None,
+                size: row.try_get::<i64, _>("size").unwrap_or(0) as usize,
+                permissions: row.try_get::<i32, _>("permissions").unwrap_or(0) as u8,
+                created_at: row.try_get::<f64, _>("created_at").unwrap_or(0.0),
+                metadata: row.try_get::<Option<String>, _>("metadata").unwrap_or(None),
+            });
+        }
+        Ok(nodes)
+    }
 }

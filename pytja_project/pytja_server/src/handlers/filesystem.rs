@@ -561,4 +561,19 @@ impl MyPytjaService {
             is_eof,
         }))
     }
+
+    pub async fn query_metadata_impl(&self, request: Request<pytja_proto::pytja::QueryMetadataRequest>) -> Result<Response<pytja_proto::pytja::ListResponse>, Status> {
+        let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
+        let req = request.into_inner();
+        let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
+
+        let nodes = repo.query_metadata_secure(&req.query, &claims.sub, &claims.role).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let proto_files = nodes.into_iter().map(|node| FileInfo {
+            name: node.name, is_folder: node.is_folder, size: node.size as u64,
+            owner: node.owner, permissions: node.permissions as u32, created_at: node.created_at,
+        }).collect();
+
+        Ok(Response::new(pytja_proto::pytja::ListResponse { files: proto_files }))
+    }
 }

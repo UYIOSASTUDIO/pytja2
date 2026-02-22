@@ -128,6 +128,7 @@ impl Terminal {
             "find" => self.handle_find(args).await,
             "grep" => self.handle_grep(args).await,
             "du" => self.handle_du(args).await,
+            "query" => self.handle_query(args).await,
             _ => {
                 // Plugin Check
                 if self.plugin_manager.has_command(cmd) {
@@ -697,5 +698,26 @@ impl Terminal {
 
         // 2. Anzeigen für den User (Rot, kurz, verständlich)
         println!("{} {}", format!("{}:", context).red().bold(), e);
+    }
+
+    async fn handle_query(&self, args: Vec<&str>) {
+        if args.is_empty() { println!("Usage: query <search_term>"); return; }
+        let search_term = args.join(" "); // Erlaubt Leerzeichen in der Suche
+
+        println!("{} Searching metadata for '{}'...", "🔍".cyan(), search_term);
+        match self.client.query_metadata(&search_term).await {
+            Ok(items) => {
+                if items.is_empty() {
+                    println!("No files found matching the metadata query.");
+                } else {
+                    println!("Found {} files:", items.len());
+                    for item in items {
+                        let icon = if item.is_folder { "📁" } else { "📄" };
+                        println!(" {} {} (Owner: {}, Size: {})", icon, item.name.green(), item.owner, self.format_size(item.size));
+                    }
+                }
+            },
+            Err(e) => self.handle_error("Query Error", e),
+        }
     }
 }

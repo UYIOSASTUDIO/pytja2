@@ -11,6 +11,7 @@ use std::str::FromStr;
 use futures_util::StreamExt;
 use std::fs;
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 
 #[derive(Clone)]
 pub struct PytjaClient {
@@ -233,11 +234,26 @@ impl PytjaClient {
         let outbound = async_stream::stream! {
             yield UploadRequest { data: Some(Data::Metadata(file_meta)) };
 
-            // Chunked Reading
-            if let Ok(content) = fs::read(&file_path) {
-                for chunk in content.chunks(64 * 1024) {
-                    yield UploadRequest { data: Some(Data::Chunk(chunk.to_vec())) };
+            // ECHTES ASYNCHRONES STREAMING (Enterprise Memory Management)
+            // Die Datei wird in 64 KB Blöcken gelesen. RAM-Verbrauch bleibt konstant bei ~64 KB!
+            if let Ok(mut file) = tokio::fs::File::open(&file_path).await {
+                let mut buffer = vec![0u8; 64 * 1024]; // 64 KB Chunk Buffer
+
+                loop {
+                    match file.read(&mut buffer).await {
+                        Ok(0) => break, // EOF (End of File) erreicht
+                        Ok(n) => {
+                            // Wir senden nur die exakt gelesenen Bytes (n) ans Netzwerk
+                            yield UploadRequest { data: Some(Data::Chunk(buffer[..n].to_vec())) };
+                        }
+                        Err(e) => {
+                            eprintln!("{} Error reading local file chunk: {}", "❌".red(), e);
+                            break;
+                        }
+                    }
                 }
+            } else {
+                eprintln!("{} Failed to open local file for streaming.", "❌".red());
             }
         };
 
@@ -299,4 +315,12 @@ impl PytjaClient {
         println!("{}", "--- REMOTE OUTPUT END ---".cyan());
         Ok(())
     }
+
+    pub async fn query_metadata(&self, query: &str) -> Result<Vec<FileInfo>> {
+        let mut client = self.client.lock().await;
+        let req = self.auth_req(QueryMetadataRequest { query: query.to_string() }).await;
+        let resp = client.query_metadata(req).await?.into_inner();
+        Ok(resp.files)
+    }
+
 }

@@ -44,6 +44,7 @@ service PytjaService {
     rpc RevokeInviteCode (RevokeInviteRequest) returns (AdminActionResponse);
     rpc ListInviteCodes (ListInvitesRequest) returns (ListInvitesResponse);
     rpc ReadFileChunk (ReadChunkRequest) returns (ReadChunkResponse);
+    rpc QueryMetadata (QueryMetadataRequest) returns (ListResponse);
 }
 
 // --- Messages (Datenpakete) ---
@@ -450,4 +451,8 @@ message ReadChunkRequest {
 message ReadChunkResponse {
     bytes chunk = 1;
     bool is_eof = 2;
+}
+
+message QueryMetadataRequest {
+    string query = 1;
 }

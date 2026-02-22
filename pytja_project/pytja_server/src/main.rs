@@ -76,6 +76,9 @@ impl PytjaService for MyPytjaService {
     async fn read_file_chunk(&self, r: Request<pytja_proto::pytja::ReadChunkRequest>) -> Result<Response<pytja_proto::pytja::ReadChunkResponse>, Status> {
         self.read_file_chunk_impl(r).await
     }
+    async fn query_metadata(&self, r: Request<pytja_proto::pytja::QueryMetadataRequest>) -> Result<Response<pytja_proto::pytja::ListResponse>, Status> {
+        self.query_metadata_impl(r).await
+    }
 }
 
 #[tokio::main]
