@@ -18,6 +18,8 @@ use directories::ProjectDirs;
 use walkdir::WalkDir;
 use std::path::Path;
 use tracing::{info, warn, error};
+use std::future::Future;
+use std::pin::Pin;
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
@@ -568,11 +570,21 @@ impl Terminal {
     // --- INTELLIGENCE ---
 
     async fn handle_tree(&self, args: Vec<&str>) {
-        let path = if args.is_empty() { "." } else { args[0] };
-        let full_path = self.resolve_path(path).await;
+        // FIX: "" statt "." als Default, um "/." direkt im Client zu vermeiden!
+        let path = if args.is_empty() { "" } else { args[0] };
+        let mut full_path = self.resolve_path(path).await;
+
+        // Zero-Trust: Falls durch andere Befehle doch mal ein "/." entsteht, bereinigen wir es.
+        if full_path.ends_with("/.") {
+            full_path = full_path.trim_end_matches('.').trim_end_matches('/').to_string();
+        }
+        if full_path.is_empty() {
+            full_path = "/".to_string();
+        }
+
         match self.client.get_tree(&full_path).await {
             Ok(tree) => println!("{}", tree.cyan()),
-            Err(e) => self.handle_error("Context", e),
+            Err(e) => self.handle_error("Tree Fetch Error", e),
         }
     }
 

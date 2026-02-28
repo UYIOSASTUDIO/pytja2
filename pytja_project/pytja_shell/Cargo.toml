@@ -3,6 +3,10 @@ name = "pytja_shell"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "pytja_shell"
+path = "src/lib.rs"
+
 [dependencies]
 # Die neue Verbindung zum Core
 pytja_core = { path = "../pytja_core" }

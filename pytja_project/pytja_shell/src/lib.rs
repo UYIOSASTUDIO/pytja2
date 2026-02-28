@@ -29,12 +29,10 @@ use crate::identity::Identity;
 const DB_PATH: &str = "pytja_local_cache.db";
 const IDENTITY_DIR: &str = "usb_drive";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn start_shell() -> Result<()> {
     // 1. Logging Setup (File only)
     let file_appender = tracing_appender::rolling::daily("logs", "pytja_shell.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    tracing_subscriber::fmt().with_writer(non_blocking).with_ansi(false).init();
 
     // 2. UI Start
     print!("\x1B[2J\x1B[1;1H");

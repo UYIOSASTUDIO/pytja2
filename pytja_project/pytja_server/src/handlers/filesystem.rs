@@ -9,6 +9,7 @@ use bytes::Bytes;
 use std::env;
 use std::sync::Arc;
 use futures_util::Stream;
+use colored::Colorize;
 
 impl MyPytjaService {
 
@@ -467,34 +468,63 @@ impl MyPytjaService {
     }
 
     // --- TREE ---
+    // --- TREE ---
     pub async fn get_tree_impl(&self, request: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> {
         let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+
+        // 1. FIX: Pfad serverseitig normalisieren (Zero-Trust gegen fehlerhafte Client-Pfade)
+        // Aus "/." oder "" wird strikt "/" gemacht, damit die Datenbank-Query funktioniert.
+        if req.root_path.ends_with("/.") {
+            req.root_path = req.root_path.trim_end_matches('.').trim_end_matches('/').to_string();
+        }
+        if req.root_path.is_empty() {
+            req.root_path = "/".to_string();
+        }
+
+        // 2. Repo und relativen Pfad auflösen
         let (repo, rel_path) = self.resolve_repo(&req.root_path).await?;
 
-        // 1. Rekursive Liste holen
-        let mut all_nodes = repo.list_recursive_secure(&rel_path, &claims.sub, &claims.role).await.map_err(|e| Status::internal(e.to_string()))?;
-        all_nodes.sort_by(|a, b| a.path.cmp(&b.path));
+        // 3. Rekursive Liste holen (Das ist extrem performant: Nur 1 DB Call!)
+        let mut all_nodes = repo.list_recursive_secure(&rel_path, &claims.sub, &claims.role)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut output = format!("{}\n", req.root_path);
+        // Ordner vor Dateien sortieren, dann nach Pfad (Standard Linux-Tree Verhalten)
+        all_nodes.sort_by(|a, b| b.is_folder.cmp(&a.is_folder).then(a.path.cmp(&b.path)));
+
+        let mut output = format!("{}\n", req.root_path.blue().bold().to_string()); // Optional: Farbe für die Root
         let base_depth = if rel_path == "/" { 0 } else { rel_path.matches('/').count() };
 
-        if all_nodes.is_empty() { output.push_str("(empty)\n"); }
+        if all_nodes.is_empty() {
+            output.push_str("(empty)\n");
+        }
 
         let total_dirs = all_nodes.iter().filter(|n| n.is_folder).count();
         let total_files = all_nodes.iter().filter(|n| !n.is_folder).count();
 
-        for node in all_nodes {
-            if node.path == rel_path || (rel_path == "/" && node.path.is_empty()) { continue; }
+        for node in &all_nodes {
+            // Root-Verzeichnis selbst nicht noch einmal auflisten
+            if node.path == rel_path || (rel_path == "/" && node.path.is_empty()) || node.path == "/" {
+                continue;
+            }
+
             let depth = node.path.matches('/').count();
-            let relative_depth = if depth >= base_depth { depth - base_depth } else { 0 };
-            let indent = "    ".repeat(relative_depth.saturating_sub(1));
-            let prefix = if relative_depth > 0 { "└── " } else { "├── " };
-            let marker = if node.is_folder { "[DIR]" } else { "" };
-            let lock_marker = if node.lock_pass.is_some() { "🔒" } else { "" };
-            output.push_str(&format!("{}{}{}{} {}\n", indent, prefix, node.name, marker, lock_marker));
+            let relative_depth = if depth > base_depth { depth - base_depth } else { 1 };
+
+            // Formatierung (Einrückung)
+            let indent = "│   ".repeat(relative_depth.saturating_sub(1));
+            let prefix = "├── ";
+
+            // Visuelle Marker für Typ und Sperre
+            let marker = if node.is_folder { " [DIR]" } else { "" };
+            let lock_marker = if node.lock_pass.is_some() { " 🔒" } else { "" };
+
+            output.push_str(&format!("{}{}{}{}{}\n", indent, prefix, node.name, marker, lock_marker));
         }
+
         output.push_str(&format!("\n{} directories, {} files\n", total_dirs, total_files));
+
         Ok(Response::new(TreeResponse { tree_output: output }))
     }
 

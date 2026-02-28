@@ -81,8 +81,7 @@ impl PytjaService for MyPytjaService {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
     // 1. Config Laden

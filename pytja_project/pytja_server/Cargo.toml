@@ -2,7 +2,10 @@
 name = "pytja_server"
 version = "0.1.0"
 edition = "2021"
-default-run = "pytja_server"
+
+[lib]
+name = "pytja_server"
+path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
