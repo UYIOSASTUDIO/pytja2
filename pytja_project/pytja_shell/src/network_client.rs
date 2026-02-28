@@ -9,7 +9,6 @@ use anyhow::{Result, anyhow, Context};
 use colored::*;
 use std::str::FromStr;
 use futures_util::StreamExt;
-use std::fs;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 
@@ -17,6 +16,7 @@ use tokio::io::AsyncReadExt;
 pub struct PytjaClient {
     client: Arc<Mutex<PytjaServiceClient<Channel>>>,
     token: Arc<Mutex<Option<String>>>,
+    #[allow(dead_code)]
     pub signing_key: Vec<u8>,
     pub username: String,
 }
@@ -48,6 +48,7 @@ impl PytjaClient {
         })
     }
 
+    #[allow(dead_code)]
     pub fn new(_url: &str, _key: Vec<u8>, _user: String) -> Self {
         panic!("Legacy constructor removed. Use PytjaClient::connect() with TLS support.");
     }

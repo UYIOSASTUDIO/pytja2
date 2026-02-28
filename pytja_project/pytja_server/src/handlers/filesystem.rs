@@ -468,13 +468,11 @@ impl MyPytjaService {
     }
 
     // --- TREE ---
-    // --- TREE ---
     pub async fn get_tree_impl(&self, request: Request<TreeRequest>) -> Result<Response<TreeResponse>, Status> {
         let claims = self.check_permissions(request.metadata(), Some("core:fs:read")).await?;
         let mut req = request.into_inner();
 
-        // 1. FIX: Pfad serverseitig normalisieren (Zero-Trust gegen fehlerhafte Client-Pfade)
-        // Aus "/." oder "" wird strikt "/" gemacht, damit die Datenbank-Query funktioniert.
+        // 1. Pfad säubern
         if req.root_path.ends_with("/.") {
             req.root_path = req.root_path.trim_end_matches('.').trim_end_matches('/').to_string();
         }
@@ -482,48 +480,91 @@ impl MyPytjaService {
             req.root_path = "/".to_string();
         }
 
-        // 2. Repo und relativen Pfad auflösen
         let (repo, rel_path) = self.resolve_repo(&req.root_path).await?;
 
-        // 3. Rekursive Liste holen (Das ist extrem performant: Nur 1 DB Call!)
-        let mut all_nodes = repo.list_recursive_secure(&rel_path, &claims.sub, &claims.role)
+        // Wir holen nach wie vor superschnell alle Nodes mit einem DB-Call
+        let all_nodes = repo.list_recursive_secure(&rel_path, &claims.sub, &claims.role)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Ordner vor Dateien sortieren, dann nach Pfad (Standard Linux-Tree Verhalten)
-        all_nodes.sort_by(|a, b| b.is_folder.cmp(&a.is_folder).then(a.path.cmp(&b.path)));
+        let mut output = format!("{}\n", req.root_path.blue().bold());
 
-        let mut output = format!("{}\n", req.root_path.blue().bold().to_string()); // Optional: Farbe für die Root
-        let base_depth = if rel_path == "/" { 0 } else { rel_path.matches('/').count() };
+        let mut dirs_count = 0;
+        let mut files_count = 0;
 
-        if all_nodes.is_empty() {
-            output.push_str("(empty)\n");
-        }
+        // 2. Rekursive Hilfsfunktion: Baut aus der flachen Liste einen echten Baum
+        fn build_tree(
+            nodes: &[FileNode],
+            current_path: &str,
+            prefix: String,
+            output: &mut String,
+            dirs_count: &mut usize,
+            files_count: &mut usize,
+        ) {
+            // Finde nur die DIREKTEN Kinder des aktuellen Pfades
+            let mut children: Vec<&FileNode> = nodes.iter().filter(|n| {
+                if n.path == "/" || n.path == current_path {
+                    return false; // Sich selbst ignorieren
+                }
 
-        let total_dirs = all_nodes.iter().filter(|n| n.is_folder).count();
-        let total_files = all_nodes.iter().filter(|n| !n.is_folder).count();
+                let trimmed = n.path.trim_end_matches('/');
+                let parent = match trimmed.rfind('/') {
+                    Some(0) => "/",
+                    Some(idx) => &trimmed[..idx],
+                    None => "/",
+                };
 
-        for node in &all_nodes {
-            // Root-Verzeichnis selbst nicht noch einmal auflisten
-            if node.path == rel_path || (rel_path == "/" && node.path.is_empty()) || node.path == "/" {
-                continue;
+                parent == current_path
+            }).collect();
+
+            // Sortiere nur die Kinder dieser Ebene: Ordner zuerst, dann Alphabetisch
+            children.sort_by(|a, b| b.is_folder.cmp(&a.is_folder).then(a.name.cmp(&b.name)));
+
+            let count = children.len();
+            for (i, child) in children.iter().enumerate() {
+                let is_last = i == count - 1;
+                let connector = if is_last { "└── " } else { "├── " };
+
+                // Farbgebung
+                let colored_name = if child.is_folder {
+                    child.name.blue().bold().to_string()
+                } else {
+                    child.name.green().to_string()
+                };
+
+                let marker = if child.is_folder { " [DIR]".blue().to_string() } else { "".to_string() };
+                let lock_marker = if child.lock_pass.is_some() { " 🔒".to_string() } else { "".to_string() };
+
+                // Zeichnen der aktuellen Zeile
+                output.push_str(&format!("{}{}{}{}{}\n", prefix, connector, colored_name, marker, lock_marker));
+
+                // Wenn es ein Ordner ist, tauchen wir eine Ebene tiefer ab
+                if child.is_folder {
+                    *dirs_count += 1;
+                    // Der Präfix für die nächste Ebene hängt davon ab, ob wir gerade das letzte Element waren
+                    let extension = if is_last { "    " } else { "│   " };
+                    let new_prefix = format!("{}{}", prefix, extension);
+
+                    build_tree(nodes, &child.path, new_prefix, output, dirs_count, files_count);
+                } else {
+                    *files_count += 1;
+                }
             }
-
-            let depth = node.path.matches('/').count();
-            let relative_depth = if depth > base_depth { depth - base_depth } else { 1 };
-
-            // Formatierung (Einrückung)
-            let indent = "│   ".repeat(relative_depth.saturating_sub(1));
-            let prefix = "├── ";
-
-            // Visuelle Marker für Typ und Sperre
-            let marker = if node.is_folder { " [DIR]" } else { "" };
-            let lock_marker = if node.lock_pass.is_some() { " 🔒" } else { "" };
-
-            output.push_str(&format!("{}{}{}{}{}\n", indent, prefix, node.name, marker, lock_marker));
         }
 
-        output.push_str(&format!("\n{} directories, {} files\n", total_dirs, total_files));
+        // 3. Baum-Zeichnung starten
+        if all_nodes.is_empty() || (all_nodes.len() == 1 && all_nodes[0].path == rel_path) {
+            output.push_str("(empty)\n");
+        } else {
+            let normalized_rel_path = if rel_path.ends_with('/') && rel_path.len() > 1 {
+                rel_path.trim_end_matches('/')
+            } else {
+                &rel_path
+            };
+            build_tree(&all_nodes, normalized_rel_path, String::new(), &mut output, &mut dirs_count, &mut files_count);
+        }
+
+        output.push_str(&format!("\n{} directories, {} files\n", dirs_count, files_count));
 
         Ok(Response::new(TreeResponse { tree_output: output }))
     }

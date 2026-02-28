@@ -83,7 +83,8 @@ impl AdminClient {
         let ciphertext = &blob[28..];
 
         let mut derived_key = [0u8; 32];
-        pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 100_000, &mut derived_key);
+        pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 100_000, &mut derived_key)
+            .expect("Kritischer Fehler bei der Schlüsselableitung");
 
         let cipher = Aes256Gcm::new(&derived_key.into());
         let nonce = Nonce::from_slice(nonce_bytes);
@@ -140,6 +141,7 @@ impl AdminClient {
         Ok(resp.users)
     }
 
+    #[allow(dead_code)]
     pub async fn register_user(&mut self, username: String, pub_key: Vec<u8>, role: String, quota: u64) -> anyhow::Result<()> {
         let req = self.request(pytja::RegisterUserRequest {
             username,

@@ -33,6 +33,12 @@ pub struct DriverManager {
     config_file_path: Arc<RwLock<String>>,
 }
 
+impl Default for DriverManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DriverManager {
     pub fn new() -> Self {
         Self {

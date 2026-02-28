@@ -35,4 +35,4 @@ uuid = { version = "1.4", features = ["v4", "fast-rng", "macro-diagnostics"] }
 base64 = "0.21"
 sysinfo = "0.29"
 tokio-stream = { version = "0.1", features = ["sync"] }
-dotenv = "0.15"
+dotenvy = "0.15"

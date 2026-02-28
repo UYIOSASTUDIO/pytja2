@@ -81,9 +81,7 @@ impl BlobStorage for FileSystemStorage {
 
         let stream = tokio_util::io::ReaderStream::new(file);
         let s = stream.map(|res| {
-            res.map_err(|e| PytjaError::System(e.to_string()))
-                .map(Bytes::from)
-        });
+            res.map_err(|e| PytjaError::System(e.to_string()))});
 
         Ok(Box::pin(s))
     }

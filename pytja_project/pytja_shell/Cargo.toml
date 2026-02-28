@@ -11,7 +11,7 @@ path = "src/lib.rs"
 # Die neue Verbindung zum Core
 pytja_core = { path = "../pytja_core" }
 
-extism = "1.0"          # Die Wasm Runtime
+extism = "1.13"          # Die Wasm Runtime
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -53,5 +53,5 @@ dialoguer = "0.10"
 walkdir = "2.4"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
-wasmer = "3.1.1"
-wasmer-wasi = "3.1.1"
+wasmer = "4.3"
+wasmer-wasi = "4.3"

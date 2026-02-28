@@ -310,7 +310,7 @@ impl MyPytjaService {
         sys.refresh_all();
 
         let active_sessions = self.sessions.get_all_sessions().await.len() as u64;
-        let redis_ok = self.sessions.get_cached_quota("ping").await.is_some() || true;
+        let redis_ok = self.sessions.get_cached_quota("ping").await.is_some();
 
         Ok(Response::new(SystemStatsResponse {
             cpu_usage_percent: sys.global_cpu_info().cpu_usage() as f64,

@@ -1,5 +1,6 @@
 // pytja_admin/src/utils.rs
 // Aktuell leer, wird für Formatierung genutzt
+#[allow(dead_code)]
 pub fn format_bytes(b: u64) -> String {
     const UNIT: u64 = 1024;
     if b < UNIT { return format!("{} B", b); }

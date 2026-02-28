@@ -7,11 +7,12 @@ use jsonwebtoken::{decode, Validation, DecodingKey};
 use std::env;
 use pytja_proto::pytja::LogStreamEntry;
 
-pub const DEFAULT_QUOTA_LIMIT: usize = 1 * 1024 * 1024 * 1024;
+pub const DEFAULT_QUOTA_LIMIT: usize = 1024 * 1024 * 1024;
 
 pub struct MyPytjaService {
     pub manager: Arc<DriverManager>,
     pub sessions: Arc<SessionManager>,
+    #[allow(dead_code)]
     pub config: AppConfig,
     pub storage: Arc<dyn BlobStorage>,
     pub log_broadcast: broadcast::Sender<LogStreamEntry>,

@@ -1,7 +1,7 @@
 use pytja_core::drivers::sqlite::SqliteDriver;
 use pytja_core::repo::PytjaRepository;
 use pytja_core::models::User;
-use ed25519_dalek::{SigningKey, Signer};
+use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
 use std::path::Path;
@@ -12,8 +12,7 @@ use pbkdf2::pbkdf2;
 use hmac::Hmac;
 use sha2::Sha256;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn start_registrar() -> anyhow::Result<()> {
     println!("--- PYTJA IDENTITY REGISTRAR (SECURE V2) ---");
 
     // 1. Setup
@@ -54,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Key Derivation
     let mut derived_key = [0u8; 32];
-    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, 100_000, &mut derived_key);
+    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, 100_000, &mut derived_key)
+        .expect("Kritischer Fehler bei der Schlüsselableitung");
 
     let cipher = Aes256Gcm::new(&derived_key.into());
     let nonce = Nonce::from_slice(&nonce_bytes);

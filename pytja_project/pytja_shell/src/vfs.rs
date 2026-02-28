@@ -2,9 +2,8 @@
 use pytja_core::{
     PytjaRepository, DriverManager, DatabaseType, FileNode, PytjaError
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::io::{Write, Read};
 use std::fs;
 use colored::*;
 use std::sync::Arc;
@@ -274,7 +273,7 @@ impl VirtualFileSystem {
         let script_content = String::from_utf8(node.content.clone())
             .map_err(|_| PytjaError::System("Binary file cannot be executed".to_string()))?;
 
-        let output = Command::new("python3").arg("-c").arg(&script_content).output().await.map_err(|e| PytjaError::IoError(e))?;
+        let output = Command::new("python3").arg("-c").arg(&script_content).output().await.map_err(PytjaError::IoError)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         Ok(format!("{}\n{}", stdout, stderr.red()))
@@ -361,25 +360,25 @@ impl VirtualFileSystem {
             }
             let target_root = if self.current_path == "/" { format!("/{}", name) } else { format!("{}/{}", self.current_path, name) };
             self.import_recursive(host_path.to_path_buf(), target_root, lock_pass, recursive_lock).await?;
-            return Ok(format!("Imported directory structure: {}", name));
+            Ok(format!("Imported directory structure: {}", name))
         } else {
-            let content = fs::read(host_path).map_err(|e| PytjaError::IoError(e))?;
+            let content = fs::read(host_path).map_err(PytjaError::IoError)?;
             let current_pass = if recursive_lock { lock_pass } else { None };
             // NEU: ', None' am Ende hinzugefügt
             self.create(name.clone(), false, content, true, current_pass, None).await?;
-            return Ok(format!("Imported file: {}", name));
+            Ok(format!("Imported file: {}", name))
         }
     }
 
     fn import_recursive<'a>(&'a mut self, host_path: std::path::PathBuf, vfs_parent: String, lock_pass: Option<String>, rec_lock: bool)
                             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PytjaError>> + Send + 'a>> {
         Box::pin(async move {
-            let entries = fs::read_dir(&host_path).map_err(|e| PytjaError::IoError(e))?;
+            let entries = fs::read_dir(&host_path).map_err(PytjaError::IoError)?;
             // FIX: get_db returns Option, handle it
             let db = self.get_db().await.ok_or(PytjaError::System("DB not connected".into()))?;
 
             for entry in entries {
-                let entry = entry.map_err(|e| PytjaError::IoError(e))?;
+                let entry = entry.map_err(PytjaError::IoError)?;
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 let vfs_path = if vfs_parent == "/" { format!("/{}", name) } else { format!("{}/{}", vfs_parent, name) };
@@ -395,17 +394,15 @@ impl VirtualFileSystem {
                     };
                     let _ = db.save_node(&node).await;
                     self.import_recursive(path, vfs_path, lock_pass.clone(), rec_lock).await?;
-                } else {
-                    if let Ok(content) = fs::read(&path) {
-                        let node = FileNode {
-                            path: vfs_path, name, owner: self.user_id.clone(),
-                            is_folder: false, size: content.len(), content, lock_pass: current_pass,
-                            permissions: 0, created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                            blob_id: None,
-                            metadata: None,
-                        };
-                        let _ = db.save_node(&node).await;
-                    }
+                } else if let Ok(content) = fs::read(&path) {
+                    let node = FileNode {
+                        path: vfs_path, name, owner: self.user_id.clone(),
+                        is_folder: false, size: content.len(), content, lock_pass: current_pass,
+                        permissions: 0, created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                        blob_id: None,
+                        metadata: None,
+                    };
+                    let _ = db.save_node(&node).await;
                 }
             }
             Ok(())
@@ -423,7 +420,7 @@ impl VirtualFileSystem {
         if node.is_folder { return Err(PytjaError::System("Folder export not supported.".to_string())); }
 
         let target_path = Path::new(host_path).join(&node.name);
-        fs::write(&target_path, &node.content).map_err(|e| PytjaError::IoError(e))?;
+        fs::write(&target_path, &node.content).map_err(PytjaError::IoError)?;
         Ok(format!("Exported to {:?}", target_path))
     }
 

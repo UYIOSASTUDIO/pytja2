@@ -8,9 +8,6 @@ use std::path::PathBuf;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-use tracing::{info, error};
-use tracing_subscriber;
-use tracing_appender;
 
 use pytja_core::crypto::CryptoService;
 
@@ -32,7 +29,7 @@ const IDENTITY_DIR: &str = "usb_drive";
 pub async fn start_shell() -> Result<()> {
     // 1. Logging Setup (File only)
     let file_appender = tracing_appender::rolling::daily("logs", "pytja_shell.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (_non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     // 2. UI Start
     print!("\x1B[2J\x1B[1;1H");
@@ -44,7 +41,7 @@ pub async fn start_shell() -> Result<()> {
     if let Ok(entries) = fs::read_dir(IDENTITY_DIR) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "pytja") {
+            if path.extension().is_some_and(|ext| ext == "pytja") {
                 available_keys.push(path.to_string_lossy().to_string());
             }
         }
@@ -65,6 +62,7 @@ pub async fn start_shell() -> Result<()> {
             println!("  [{}] {}", i + 1, key.green());
         }
 
+        #[allow(unused_assignments)]
         let mut selected = String::new();
         loop {
             print!("{} ", "Select number:".bold());

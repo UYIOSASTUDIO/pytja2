@@ -5,21 +5,16 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use colored::*;
 use std::io::{self, Write};
-use std::process;
 use std::str;
-use pytja_core::{FileNode, PytjaRepository};
-use rpassword;
+use pytja_core::FileNode;
 use chrono::{DateTime, Local};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use pytja_proto::FileInfo;
-use indicatif::{ProgressBar, ProgressStyle};
 use directories::ProjectDirs;
 use walkdir::WalkDir;
 use std::path::Path;
 use tracing::{info, warn, error};
-use std::future::Future;
-use std::pin::Pin;
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
@@ -131,6 +126,7 @@ impl Terminal {
             "grep" => self.handle_grep(args).await,
             "du" => self.handle_du(args).await,
             "query" => self.handle_query(args).await,
+            "plugins" => self.handle_plugins(),
             _ => {
                 // Plugin Check
                 if self.plugin_manager.has_command(cmd) {
@@ -181,6 +177,7 @@ impl Terminal {
         println!("\n{}", "[ NETWORK ]".cyan());
         println!("{:<10} : {:<30}", "upload", "Import from Host [-lock]");
         println!("{:<10} : {:<30}", "download", "Export to Host");
+        println!("{:<10} : {:<30}", "plugins", "Show active plugins & perms");
         println!("{}", "=".repeat(60));
     }
 
@@ -245,12 +242,10 @@ impl Terminal {
             }
         } else if target.starts_with('/') {
             target.to_string()
+        } else if self.current_path == "/" {
+            format!("/{}", target)
         } else {
-            if self.current_path == "/" {
-                format!("/{}", target)
-            } else {
-                format!("{}/{}", self.current_path, target)
-            }
+            format!("{}/{}", self.current_path, target)
         };
 
         match self.client.stat_node(&new_path).await {
@@ -536,7 +531,7 @@ impl Terminal {
         if args.len() < 2 { println!("Usage: chmod <0|1|2> <file>"); return; }
         let perm_val: i32 = args[0].parse().unwrap_or(-1);
         let path = self.resolve_path(args[1]).await;
-        if perm_val < 0 || perm_val > 2 { println!("Invalid mode."); return; }
+        if !(0..=2).contains(&perm_val) { println!("Invalid mode."); return; }
         match self.client.change_mode(&path, perm_val as u32).await {
             Ok(msg) => println!("{}", msg.green()),
             Err(e) => self.handle_error("Context", e),
@@ -583,7 +578,7 @@ impl Terminal {
         }
 
         match self.client.get_tree(&full_path).await {
-            Ok(tree) => println!("{}", tree.cyan()),
+            Ok(tree) => println!("{}", tree),
             Err(e) => self.handle_error("Tree Fetch Error", e),
         }
     }
@@ -731,5 +726,64 @@ impl Terminal {
             },
             Err(e) => self.handle_error("Query Error", e),
         }
+    }
+
+    fn handle_plugins(&self) {
+        let plugins = self.plugin_manager.list_plugins();
+
+        if plugins.is_empty() {
+            println!("\n{} Keine Plugins geladen.\n", "ℹ️".cyan());
+            return;
+        }
+
+        // 1. Tabellen-Kopf (Header) ausgeben
+        println!("\n{:<20} {:<10} {:<30} DESCRIPTION", "NAME", "VERSION", "PERMISSIONS");
+        println!("{}", "-".repeat(90));
+
+        // 2. Plugins als Zeilen ausgeben
+        for (manifest, granted) in plugins.iter() {
+            // Namen und Version auf eine feste Breite bringen (bevor die Farbe dazu kommt!)
+            let name_padded = format!("{:<20}", manifest.name);
+            let version_padded = format!("{:<10}", manifest.version);
+
+            // Berechtigungen formatieren
+            let perms: Vec<String> = granted.iter().map(|p| format!("{:?}", p)).collect();
+            let mut raw_perms = if perms.is_empty() {
+                "Keine".to_string()
+            } else {
+                perms.join(", ")
+            };
+
+            let is_high_risk = raw_perms.contains("Admin")
+                || raw_perms.contains("FsWrite")
+                || raw_perms.contains("Network");
+
+            // Falls ein Plugin absurd viele Rechte hat, schneiden wir den String für die Tabelle ab
+            if raw_perms.len() > 28 {
+                raw_perms.truncate(25);
+                raw_perms.push_str("...");
+            }
+
+            let perms_padded = format!("{:<30}", raw_perms);
+
+            // JETZT erst die Farben anwenden!
+            let name_colored = name_padded.green().bold();
+            let version_colored = version_padded.yellow();
+            let perms_colored = if perms.is_empty() {
+                perms_padded.dimmed()
+            } else if is_high_risk {
+                perms_padded.red()
+            } else {
+                perms_padded.cyan()
+            };
+
+            let desc_colored = manifest.description.dimmed();
+
+            // Zeile drucken
+            println!("{} {} {} {}", name_colored, version_colored, perms_colored, desc_colored);
+        }
+
+        // Footer wie beim ls-Befehl
+        println!("\n[TOTAL: {} PLUGINS]\n", plugins.len());
     }
 }

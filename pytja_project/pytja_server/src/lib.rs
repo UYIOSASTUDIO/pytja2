@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info; // Cleanup: warn und error entfernt, da wir println für Startup nutzen
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use std::fs;
 use colored::*;
 
@@ -83,6 +83,8 @@ impl PytjaService for MyPytjaService {
 
 pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
+
+    colored::control::set_override(true);
 
     // 1. Config Laden
     let config = AppConfig::new().expect("CRITICAL: Failed to load configuration");

@@ -3,7 +3,7 @@ use pytja_core::drivers::DatabaseType;
 use pytja_core::models::User;
 use clap::{Parser, Subcommand};
 use colored::*;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use std::sync::Arc;
 
 #[derive(Parser)]

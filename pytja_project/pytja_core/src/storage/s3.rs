@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt}; // FIX: TryStreamExt hinzugefügt
 use uuid::Uuid;
 use tracing::{info, debug}; // warn entfernt, da ungenutzt
@@ -132,9 +131,17 @@ impl BlobStorage for S3Storage {
             .send()
             .await
             .map_err(|e| {
-                // Auch hier Abbruch versuchen, falls Complete fehlschlägt
-                let _ = self.client.abort_multipart_upload().bucket(&self.bucket).key(&blob_id).upload_id(&upload_id).send();
-                PytjaError::System(format!("S3 Complete Failed: {}", e))
+                // FIX: Abbruch im Hintergrund an S3 senden, da map_err synchron ist
+                let c = self.client.clone();
+                let b = self.bucket.to_string();
+                let k = blob_id.to_string();
+                let u = upload_id.to_string();
+
+                tokio::spawn(async move {
+                    let _ = c.abort_multipart_upload().bucket(b).key(k).upload_id(u).send().await;
+                });
+
+                PytjaError::System(e.to_string())
             })?;
 
         info!("Stored blob {} on S3 (Multipart)", blob_id);
@@ -150,7 +157,7 @@ impl BlobStorage for S3Storage {
             .map_err(|e| PytjaError::NotFound(format!("S3 Download Error: {}", e)))?;
 
         let reader = resp.body.into_async_read();
-        let stream = ReaderStream::new(reader).map_err(|e| PytjaError::IoError(e));
+        let stream = ReaderStream::new(reader).map_err(PytjaError::IoError);
         Ok(Box::pin(stream))
     }
 

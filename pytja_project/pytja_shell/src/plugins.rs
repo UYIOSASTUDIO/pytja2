@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn, error, instrument};
+use tracing::{info, error, instrument};
 use wasmer_wasi::WasiState;
 use serde::{Deserialize, Serialize};
 use colored::*;
@@ -88,7 +88,7 @@ impl PluginManager {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map_or(false, |ext| ext == "wasm") {
+            if path.extension().is_some_and(|ext| ext == "wasm") {
                 let stem = path.file_stem().unwrap().to_string_lossy().to_string();
                 let manifest_path = path.with_extension("json");
 
@@ -211,6 +211,7 @@ impl PluginManager {
         self.modules.contains_key(cmd)
     }
 
+    #[allow(dead_code)]
     pub fn list_functions(&self) -> Vec<String> {
         self.modules.keys().cloned().collect()
     }
@@ -317,7 +318,7 @@ impl PluginManager {
 
             // Wir holen die Memory-Instanz, um sie zu überwachen (Optional, für Logging)
             let memory = instance.exports.get_memory("memory")?;
-            let initial_size = memory.view(&store).size().bytes().0;
+            let _initial_size = memory.view(&store).size().bytes().0;
             // info!("Plugin allocated {} bytes initially", initial_size);
 
             let start = instance.exports.get_function("_start").context("Plugin is missing a _start (main) function")?;
@@ -389,5 +390,20 @@ impl PluginManager {
         }
 
         Ok(())
+    }
+
+    // --- NEU: Plugins für die Shell auflisten ---
+    pub fn list_plugins(&self) -> Vec<(PluginManifest, std::collections::HashSet<Permission>)> {
+        let mut result = Vec::new();
+
+        for (name, manifest) in &self.manifests {
+            // Wir holen die gewährten Rechte aus der Datenbank (falls keine da sind, eine leere Menge)
+            let granted = self.permissions_db.granted.get(name).cloned().unwrap_or_default();
+            result.push((manifest.clone(), granted));
+        }
+
+        // Alphabetisch sortieren, damit es schön aussieht
+        result.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        result
     }
 }
