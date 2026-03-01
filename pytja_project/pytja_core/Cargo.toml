@@ -14,7 +14,7 @@ async-trait = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "sqlite", "postgres", "macros", "chrono", "uuid"] }
 
 # --- STORAGE & AWS ---
-object_store = "0.9"
+object_store = "0.11"
 aws-config = "1.1"
 aws-sdk-s3 = "1.14"
 bytes = "1.5"

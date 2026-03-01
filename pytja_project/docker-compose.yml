@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # --- PYTJA SERVER ---
   server:
@@ -21,6 +19,10 @@ services:
       - PYTJA_SERVER__HOST=0.0.0.0
       - PYTJA_SERVER__PORT=50051
       - PYTJA_SERVER__WORKER_THREADS=8
+
+      # --- NEU: TLS CONFIG VIA ENVIRONMENT ---
+      - PYTJA_TLS__CERT_PATH=certs/server.crt
+      - PYTJA_TLS__KEY_PATH=certs/server.key
 
       # Security
       - PYTJA_SECURITY__JWT_SECRET=super_secure_docker_secret_change_me
@@ -45,6 +47,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./mounts.json:/app/mounts.json
+      - ./certs:/app/certs:ro
 
   # --- POSTGRESQL (Primary DB) ---
   db:
