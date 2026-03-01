@@ -43,10 +43,12 @@ services:
       - AWS_ENDPOINT_URL=http://minio:9000
       # Wichtig für lokales MinIO (S3 Force Path Style)
       - AWS_S3_FORCE_PATH_STYLE=true
+      - PYTJA_PATHS__MOUNTS_FILE=data/mounts.json
 
     volumes:
       - ./logs:/app/logs
-      - ./mounts.json:/app/mounts.json
+      - ./data:/app/data
+      - ./config:/app/config:ro
       - ./certs:/app/certs:ro
 
   # --- POSTGRESQL (Primary DB) ---
