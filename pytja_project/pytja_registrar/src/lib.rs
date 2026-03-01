@@ -1,6 +1,9 @@
 use pytja_core::drivers::sqlite::SqliteDriver;
+use pytja_core::drivers::postgres::PostgresDriver;
 use pytja_core::repo::PytjaRepository;
 use pytja_core::models::User;
+use pytja_core::config::AppConfig;
+use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
@@ -15,17 +18,34 @@ use sha2::Sha256;
 pub async fn start_registrar() -> anyhow::Result<()> {
     println!("--- PYTJA IDENTITY REGISTRAR (SECURE V2) ---");
 
-    // 1. Setup
+    // 1. Enterprise Config laden
+    // Wir laden die Config genauso wie der Server, um Synchronität zu garantieren
+    let config = AppConfig::new().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+    let db_url = config.database.primary_url;
+
+    println!("🔗 Connecting to Database at: {}", db_url);
+
+    // 2. Dynamische Treiber-Auswahl (Polymorphismus via Trait Object)
+    let repo: Arc<dyn PytjaRepository> = if db_url.starts_with("postgres://") || db_url.starts_with("postgresql://") {
+        let driver = PostgresDriver::new(&db_url).await?;
+        driver.init().await?;
+        Arc::new(driver)
+    } else if db_url.starts_with("sqlite://") {
+        let path = db_url.replace("sqlite://", "");
+        let driver = SqliteDriver::new(&path).await?;
+        driver.init().await?;
+        Arc::new(driver)
+    } else {
+        return Err(anyhow::anyhow!("Unsupported database URL protocol: {}", db_url));
+    };
+
+    // 3. Setup des Key-Ordners
     if !Path::new("usb_drive").exists() { fs::create_dir("usb_drive")?; }
 
-    let db_path = "pytja.db";
-    let repo = SqliteDriver::new(db_path).await?;
-    repo.init().await?;
-
-    // 2. Inputs
+    // 4. Inputs
     let username: String = Input::new().with_prompt("Username").interact_text()?;
 
-    // Check if user exists
+    // Check if user exists (now strictly via chosen backend)
     if repo.user_exists(&username).await.unwrap_or(false) {
         println!("⚠️  User '{}' already exists in DB.", username);
         // Wir machen weiter, um z.B. nur das Keyfile neu zu erstellen
@@ -36,15 +56,14 @@ pub async fn start_registrar() -> anyhow::Result<()> {
         .with_confirmation("Confirm Password", "Mismatch")
         .interact()?;
 
-    // 3. Crypto Gen
+    // 5. Crypto Gen
     println!("Generating keys...");
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
     let pub_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
     let priv_key_bytes = signing_key.to_bytes();
 
-    // 4. Encryption (AES-256-GCM)
-    // Salt (16 Bytes) + Nonce (12 Bytes)
+    // 6. Encryption (AES-256-GCM)
     let mut salt = [0u8; 16];
     csprng.fill_bytes(&mut salt);
 
@@ -62,7 +81,7 @@ pub async fn start_registrar() -> anyhow::Result<()> {
     let encrypted_priv = cipher.encrypt(nonce, priv_key_bytes.as_ref())
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-    // 5. File Blob: Salt(16) + Nonce(12) + Ciphertext(...)
+    // 7. File Blob
     let mut payload = Vec::new();
     payload.extend_from_slice(&salt);
     payload.extend_from_slice(&nonce_bytes);
@@ -77,7 +96,7 @@ pub async fn start_registrar() -> anyhow::Result<()> {
     fs::write(&filename, content)?;
     println!("✅ Identity saved to: {}", filename);
 
-    // 6. DB Save
+    // 8. DB Save
     let user = User {
         username: username.clone(),
         public_key: pub_key_bytes,
@@ -88,9 +107,8 @@ pub async fn start_registrar() -> anyhow::Result<()> {
         description: Some("Admin User".into()),
     };
 
-    // Ignore error if user exists
     let _ = repo.create_user(&user).await;
-    println!("✅ User registered in Database.");
+    println!("✅ User '{}' successfully registered in Enterprise Database.", username);
 
     Ok(())
 }
