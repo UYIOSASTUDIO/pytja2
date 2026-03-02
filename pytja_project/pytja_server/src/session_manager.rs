@@ -43,7 +43,7 @@ impl SessionManager {
     // --- SESSION LOGIC ---
 
     pub async fn register_session(&self, username: &str, role: &str, ip: &str) -> Result<String, redis::RedisError> {
-        let mut conn = self.client.get_async_connection().await?;
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let key = format!("session:{}", session_id);
 
@@ -69,7 +69,7 @@ impl SessionManager {
     }
 
     pub async fn is_valid(&self, session_id: &str) -> bool {
-        let mut conn = match self.client.get_async_connection().await {
+        let mut conn = match self.client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -82,14 +82,14 @@ impl SessionManager {
     }
 
     pub async fn remove_session(&self, session_id: &str) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = format!("session:{}", session_id);
             let _: redis::RedisResult<()> = conn.del(&key).await;
         }
     }
 
     pub async fn clear_user_sessions(&self, username: &str) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let set_key = format!("user_sessions:{}", username);
             let sessions: Vec<String> = conn.smembers(&set_key).await.unwrap_or_default();
             for sid in sessions {
@@ -101,7 +101,7 @@ impl SessionManager {
 
     pub async fn get_all_sessions(&self) -> Vec<ActiveSession> {
         let mut sessions = Vec::new();
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             if let Ok(keys) = conn.keys::<_, Vec<String>>("session:*").await {
                 for key in keys {
                     if let Ok(json) = conn.get::<_, String>(&key).await {
@@ -140,7 +140,7 @@ impl SessionManager {
     }
 
     pub async fn init_upload(&self, owner: &str, path: &str) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = Self::get_upload_key(owner, path);
             let state = UploadState {
                 owner: owner.to_string(), path: path.to_string(), total_size_hint: 0,
@@ -152,7 +152,7 @@ impl SessionManager {
     }
 
     pub async fn update_upload_progress(&self, owner: &str, path: &str, bytes_added: usize) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = Self::get_upload_key(owner, path);
             if let Ok(json) = conn.get::<_, String>(&key).await {
                 if let Ok(mut state) = serde_json::from_str::<UploadState>(&json) {
@@ -165,7 +165,7 @@ impl SessionManager {
     }
 
     pub async fn complete_upload(&self, owner: &str, path: &str) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = Self::get_upload_key(owner, path);
             let _: redis::RedisResult<()> = conn.del(&key).await;
         }
@@ -174,7 +174,7 @@ impl SessionManager {
     // --- NEU: DISTRIBUTED FILE LOCKING (Enterprise Feature) ---
 
     pub async fn try_lock_file(&self, path: &str, owner: &str) -> bool {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             // Wir nutzen Base64 für den Pfad im Key, um Probleme mit Sonderzeichen zu vermeiden
             use base64::{Engine as _, engine::general_purpose};
             let path_b64 = general_purpose::STANDARD.encode(path);
@@ -196,7 +196,7 @@ impl SessionManager {
     }
 
     pub async fn unlock_file(&self, path: &str, owner: &str) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             use base64::{Engine as _, engine::general_purpose};
             let path_b64 = general_purpose::STANDARD.encode(path);
             let key = format!("lock:file:{}", path_b64);
@@ -217,7 +217,7 @@ impl SessionManager {
     // --- QUOTA CACHING (Enterprise Performance) ---
 
     pub async fn get_cached_quota(&self, username: &str) -> Option<u64> {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = format!("quota:{}", username);
             return conn.get(key).await.ok();
         }
@@ -225,7 +225,7 @@ impl SessionManager {
     }
 
     pub async fn set_cached_quota(&self, username: &str, bytes: u64) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = format!("quota:{}", username);
             // 3600 Sekunden (1h) TTL sorgt für den automatischen Sync mit der DB
             let _: redis::RedisResult<()> = conn.set_ex(key, bytes, 3600).await;
@@ -233,7 +233,7 @@ impl SessionManager {
     }
 
     pub async fn update_quota(&self, username: &str, delta: i64) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = format!("quota:{}", username);
             // Wir updaten nur, wenn der Key existiert.
             // Falls nicht, wird er beim nächsten Read eh sauber aus der DB geladen.
@@ -244,7 +244,7 @@ impl SessionManager {
     }
 
     pub async fn invalidate_quota(&self, username: &str) {
-        if let Ok(mut conn) = self.client.get_async_connection().await {
+        if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let key = format!("quota:{}", username);
             let _: redis::RedisResult<()> = conn.del(key).await;
         }

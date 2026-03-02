@@ -127,6 +127,7 @@ impl Terminal {
             "du" => self.handle_du(args).await,
             "query" => self.handle_query(args).await,
             "plugins" => self.handle_plugins(),
+            "mounts" => self.handle_mounts(args).await,
             _ => {
                 // Plugin Check
                 if self.plugin_manager.has_command(cmd) {
@@ -174,6 +175,7 @@ impl Terminal {
         println!("{:<10} : {:<30}", "find", "Find by name <pattern>");
         println!("{:<10} : {:<30}", "grep", "Search content <pattern>");
         println!("{:<10} : {:<30}", "du", "Disk usage / Quota");
+        println!("{:<10} : {:<30}", "mounts", "Show DB mounts [--status]");
         println!("\n{}", "[ NETWORK ]".cyan());
         println!("{:<10} : {:<30}", "upload", "Import from Host [-lock]");
         println!("{:<10} : {:<30}", "download", "Export to Host");
@@ -785,5 +787,43 @@ impl Terminal {
 
         // Footer wie beim ls-Befehl
         println!("\n[TOTAL: {} PLUGINS]\n", plugins.len());
+    }
+
+    async fn handle_mounts(&self, args: Vec<&str>) {
+        let detailed = args.contains(&"--status");
+
+        match self.client.get_mounts().await {
+            Ok(mounts) => {
+                println!("\n{:<15} {:<15} {:<20} {:<10}", "MOUNT NAME", "TYPE", "CONNECTION", "STATUS");
+                println!("{}", "-".repeat(65));
+
+                for m in mounts {
+                    let status = if m.is_connected { "ONLINE".green() } else { "OFFLINE".red() };
+                    // Im Standard-Modus maskieren wir die Verbindungs-Strings aus Sicherheitsgründen
+                    let conn = if detailed { m.connection } else { "*** HIDDEN ***".dimmed().to_string() };
+                    println!("{:<15} {:<15} {:<20} {:<10}", m.name.cyan(), m.r#type, conn, status);
+                }
+
+                // Wenn --status gesetzt ist, laden wir die Hardwaredaten des Servers dazu
+                if detailed {
+                    match self.client.get_system_stats().await {
+                        Ok(stats) => {
+                            println!("\n{}", "[ SYSTEM PERFORMANCE & HEALTH ]".cyan().bold());
+                            println!("{}", "-".repeat(65));
+                            println!("{:<20}: {:.2}%", "CPU Usage", stats.cpu_usage_percent);
+                            println!("{:<20}: {}", "RAM Usage", self.format_size(stats.memory_usage_bytes));
+                            println!("{:<20}: {}", "Active Sessions", stats.active_sessions);
+                            println!("{:<20}: {}", "Server Uptime", stats.uptime);
+
+                            let redis_status = if stats.redis_connected { "ONLINE".green() } else { "OFFLINE".red() };
+                            println!("{:<20}: {}", "Redis Cache", redis_status);
+                        },
+                        Err(e) => self.handle_error("Stats Fetch Error", e),
+                    }
+                }
+                println!();
+            },
+            Err(e) => self.handle_error("Mounts Fetch Error", e),
+        }
     }
 }

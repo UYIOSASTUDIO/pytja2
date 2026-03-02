@@ -324,4 +324,20 @@ impl PytjaClient {
         Ok(resp.files)
     }
 
+    pub async fn get_mounts(&self) -> Result<Vec<MountInfo>> {
+        let mut client = self.client.lock().await;
+        let req = self.auth_req(GetMountsRequest {}).await;
+
+        let response = client.get_mounts(req).await?.into_inner();
+        Ok(response.mounts)
+    }
+
+    pub async fn get_system_stats(&self) -> Result<SystemStatsResponse> {
+        let mut client = self.client.lock().await;
+        let req = self.auth_req(SystemStatsRequest {}).await;
+
+        let response = client.get_system_stats(req).await?.into_inner();
+        Ok(response)
+    }
+
 }

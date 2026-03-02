@@ -1,12 +1,14 @@
 use anyhow::{Result, anyhow, Context};
 use ed25519_dalek::SigningKey;
 use std::fs;
+use std::path::Path;
 use base64::{Engine as _, engine::general_purpose};
-use dialoguer::Password;
+use dialoguer::{Password, Input};
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use pbkdf2::pbkdf2;
 use hmac::Hmac;
 use sha2::Sha256;
+use colored::*;
 
 pub struct Identity {
     pub username: String,
@@ -14,6 +16,37 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Enterprise Pfad-Auflösung
+    pub fn load_or_prompt(provided_path: Option<String>) -> Result<Self> {
+        let mut path_str = match provided_path {
+            // 1. Priorität: Der Nutzer hat --identity /pfad/zur.pytja übergeben
+            Some(p) => p,
+
+            // 2. Priorität: Interaktiver Fallback, wenn nichts übergeben wurde
+            None => {
+                println!("{}", "No identity path provided via arguments or environment.".yellow());
+                Input::<String>::new()
+                    .with_prompt("Enter absolute path to your .pytja file (e.g., /Volumes/USB/sandro.pytja)")
+                    .interact_text()?
+            }
+        };
+
+        // NEU: Tilde (~) Expansion für Mac/Linux
+        if path_str.starts_with("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                path_str = path_str.replacen("~", &home, 1);
+            }
+        }
+
+        let path = Path::new(&path_str);
+        if !path.exists() {
+            return Err(anyhow!("Identity file not found at: {}", path_str));
+        }
+
+        // Lädt, parst und entschlüsselt die Datei
+        Self::load(&path_str)
+    }
+
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not open file: {}", path))?;

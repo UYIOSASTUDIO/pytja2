@@ -15,17 +15,15 @@ use pbkdf2::pbkdf2;
 use hmac::Hmac;
 use sha2::Sha256;
 
-pub async fn start_registrar() -> anyhow::Result<()> {
+pub async fn start_registrar(output_dir: Option<String>) -> anyhow::Result<()> {
     println!("--- PYTJA IDENTITY REGISTRAR (SECURE V2) ---");
 
-    // 1. Enterprise Config laden
-    // Wir laden die Config genauso wie der Server, um Synchronität zu garantieren
     let config = AppConfig::new().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
     let db_url = config.database.primary_url;
 
     println!("🔗 Connecting to Database at: {}", db_url);
 
-    // 2. Dynamische Treiber-Auswahl (Polymorphismus via Trait Object)
+    // Dynamische Treiber-Auswahl (Polymorphismus via Trait Object)
     let repo: Arc<dyn PytjaRepository> = if db_url.starts_with("postgres://") || db_url.starts_with("postgresql://") {
         let driver = PostgresDriver::new(&db_url).await?;
         driver.init().await?;
@@ -39,16 +37,19 @@ pub async fn start_registrar() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("Unsupported database URL protocol: {}", db_url));
     };
 
-    // 3. Setup des Key-Ordners
-    if !Path::new("usb_drive").exists() { fs::create_dir("usb_drive")?; }
+    // Dynamische Pfad-Auflösung
+    let save_dir = output_dir.unwrap_or_else(|| ".".to_string());
+    let save_path = Path::new(&save_dir);
+    if !save_path.exists() {
+        fs::create_dir_all(save_path)?;
+    }
 
-    // 4. Inputs
+    // Input
     let username: String = Input::new().with_prompt("Username").interact_text()?;
 
-    // Check if user exists (now strictly via chosen backend)
+    // Check if user exists
     if repo.user_exists(&username).await.unwrap_or(false) {
         println!("⚠️  User '{}' already exists in DB.", username);
-        // Wir machen weiter, um z.B. nur das Keyfile neu zu erstellen
     }
 
     let password = Password::new()
@@ -56,14 +57,14 @@ pub async fn start_registrar() -> anyhow::Result<()> {
         .with_confirmation("Confirm Password", "Mismatch")
         .interact()?;
 
-    // 5. Crypto Gen
+    // Crypto Gen
     println!("Generating keys...");
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
     let pub_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
     let priv_key_bytes = signing_key.to_bytes();
 
-    // 6. Encryption (AES-256-GCM)
+    // Encryption (AES-256-GCM)
     let mut salt = [0u8; 16];
     csprng.fill_bytes(&mut salt);
 
@@ -81,7 +82,7 @@ pub async fn start_registrar() -> anyhow::Result<()> {
     let encrypted_priv = cipher.encrypt(nonce, priv_key_bytes.as_ref())
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-    // 7. File Blob
+    // File Blob
     let mut payload = Vec::new();
     payload.extend_from_slice(&salt);
     payload.extend_from_slice(&nonce_bytes);
@@ -90,13 +91,16 @@ pub async fn start_registrar() -> anyhow::Result<()> {
     let priv_b64 = general_purpose::STANDARD.encode(&payload);
     let pub_b64 = general_purpose::STANDARD.encode(&pub_key_bytes);
 
-    let filename = format!("usb_drive/{}.pytja", username);
+    // Dynamisches Speichern am Zielort
+    let filename_path = save_path.join(format!("{}.pytja", username));
+    let filename = filename_path.to_string_lossy().to_string();
+
     let content = format!("PYTJA-ID-V2-ENCRYPTED\nUSER:{}\nPRIV:{}\nPUB:{}\nROLE:admin", username, priv_b64, pub_b64);
 
-    fs::write(&filename, content)?;
+    fs::write(&filename_path, content)?;
     println!("✅ Identity saved to: {}", filename);
 
-    // 8. DB Save
+    // DB Save
     let user = User {
         username: username.clone(),
         public_key: pub_key_bytes,

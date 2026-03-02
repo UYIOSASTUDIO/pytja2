@@ -40,6 +40,27 @@ impl PytjaRepository for PostgresDriver {
             .await
             .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
 
+        // Roles Table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles (
+                name TEXT PRIMARY KEY,
+                permissions TEXT NOT NULL
+            )"
+        )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        // Enterprise Seed: Automatisch die Super-Admin-Rolle anlegen
+        // Wir speichern die Berechtigungen als sauberen JSON-String
+        sqlx::query(
+            "INSERT INTO roles (name, permissions) VALUES ('admin', '[\"core:fs:read\", \"core:fs:write\", \"core:fs:execute\", \"core:fs:delete\", \"core:admin:users\", \"core:admin:roles\", \"core:admin:system\", \"core:admin:mounts\", \"core:admin:invites\"]')
+             ON CONFLICT (name) DO NOTHING"
+        )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
         // File Nodes Table
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS file_nodes (
@@ -284,13 +305,54 @@ impl PytjaRepository for PostgresDriver {
 
     // --- RBAC ---
 
-    async fn get_role(&self, _name: &str) -> Result<Option<Role>, PytjaError> {
-        // Stub implementation, as Role table might differ
-        Ok(None)
+    async fn get_role(&self, name: &str) -> Result<Option<Role>, PytjaError> {
+        let row = sqlx::query("SELECT * FROM roles WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        if let Some(r) = row {
+            use sqlx::Row;
+            let perms_str: String = r.try_get("permissions").unwrap_or_else(|_| "[]".into());
+            let permissions: Vec<String> = serde_json::from_str(&perms_str).unwrap_or_default();
+            Ok(Some(Role {
+                name: r.try_get("name").unwrap_or_default(),
+                permissions,
+            }))
+        } else {
+            Ok(None)
+        }
     }
-    async fn create_role(&self, _role: &Role) -> Result<(), PytjaError> { Ok(()) }
-    async fn update_role_permissions(&self, _name: &str, _permissions: Vec<String>) -> Result<(), PytjaError> { Ok(()) }
-    async fn list_roles(&self) -> Result<Vec<Role>, PytjaError> { Ok(vec![]) }
+
+    async fn create_role(&self, role: &Role) -> Result<(), PytjaError> {
+        let perms_str = serde_json::to_string(&role.permissions).unwrap_or_else(|_| "[]".into());
+        sqlx::query("INSERT INTO roles (name, permissions) VALUES ($1, $2)")
+            .bind(&role.name).bind(&perms_str)
+            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_role_permissions(&self, name: &str, permissions: Vec<String>) -> Result<(), PytjaError> {
+        let perms_str = serde_json::to_string(&permissions).unwrap_or_else(|_| "[]".into());
+        sqlx::query("UPDATE roles SET permissions = $1 WHERE name = $2")
+            .bind(perms_str).bind(name)
+            .execute(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>, PytjaError> {
+        let rows = sqlx::query("SELECT * FROM roles").fetch_all(&self.pool).await.map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| {
+            use sqlx::Row;
+            let perms_str: String = r.try_get("permissions").unwrap_or_else(|_| "[]".into());
+            let permissions: Vec<String> = serde_json::from_str(&perms_str).unwrap_or_default();
+            Role {
+                name: r.try_get("name").unwrap_or_default(),
+                permissions,
+            }
+        }).collect())
+    }
 
     // --- Audit ---
 

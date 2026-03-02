@@ -15,35 +15,38 @@ services:
       - RUN_MODE=production
       - RUST_LOG=info
 
-      # Server Config
-      - PYTJA_SERVER__HOST=0.0.0.0
-      - PYTJA_SERVER__PORT=50051
-      - PYTJA_SERVER__WORKER_THREADS=8
+      # Server Config (Doppelter Unterstrich nach PYTJA)
+      - PYTJA__SERVER__HOST=0.0.0.0
+      - PYTJA__SERVER__PORT=50051
+      - PYTJA__SERVER__WORKER_THREADS=8
 
-      # --- NEU: TLS CONFIG VIA ENVIRONMENT ---
-      - PYTJA_TLS__CERT_PATH=certs/server.crt
-      - PYTJA_TLS__KEY_PATH=certs/server.key
+      # TLS CONFIG VIA ENVIRONMENT
+      - PYTJA__TLS__ENABLED=true
+      - PYTJA__TLS__CERT_PATH=/app/certs/server.crt
+      - PYTJA__TLS__KEY_PATH=/app/certs/server.key
 
-      # Security
-      - PYTJA_SECURITY__JWT_SECRET=super_secure_docker_secret_change_me
+      # Security (Wird meist direkt gelesen, daher so lassen)
+      - PYTJA_JWT_SECRET=super_secure_docker_secret_change_me
 
       # Database (Postgres Connection)
-      - PYTJA_DATABASE__PRIMARY_URL=postgres://pytja:securepass@db:5432/pytja_db
+      - PYTJA__DATABASE__PRIMARY_URL=postgres://pytja:securepass@db:5432/pytja_db
 
       # Redis Cache
-      - PYTJA_REDIS__URL=redis://redis:6379/
+      - PYTJA__REDIS__URL=redis://redis:6379/
 
-      # Storage (Wir nutzen MinIO als S3 Backend)
-      - PYTJA_STORAGE__STORAGE_TYPE=s3
-      - PYTJA_STORAGE__S3_BUCKET=pytja-data
-      - PYTJA_STORAGE__S3_REGION=us-east-1 # MinIO Default
-      # AWS SDK liest diese automatisch:
+      # Storage (MinIO S3 Backend)
+      - PYTJA__STORAGE__STORAGE_TYPE=s3
+      - PYTJA__STORAGE__S3_BUCKET=pytja-data
+      - PYTJA__STORAGE__S3_REGION=us-east-1
+
+      # AWS SDK liest diese automatisch (kein PYTJA Prefix nötig)
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin
       - AWS_ENDPOINT_URL=http://minio:9000
-      # Wichtig für lokales MinIO (S3 Force Path Style)
       - AWS_S3_FORCE_PATH_STYLE=true
-      - PYTJA_PATHS__MOUNTS_FILE=data/mounts.json
+
+      # Pfade für Mounts
+      - PYTJA__PATHS__MOUNTS_FILE=/app/data/mounts.json
 
     volumes:
       - ./logs:/app/logs

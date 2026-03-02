@@ -1,13 +1,11 @@
-use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use colored::*;
-use std::io::{self, Write};
 use std::fs;
 use std::path::PathBuf;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
-
+use directories::ProjectDirs;
 
 use pytja_core::crypto::CryptoService;
 
@@ -23,10 +21,9 @@ use crate::plugins::PluginManager;
 use crate::network_client::PytjaClient;
 use crate::identity::Identity;
 
-const DB_PATH: &str = "pytja_local_cache.db";
-const IDENTITY_DIR: &str = "usb_drive";
+// Die hartcodierten Konstanten (DB_PATH und IDENTITY_DIR) wurden restlos entfernt!
 
-pub async fn start_shell() -> Result<()> {
+pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
     // 1. Logging Setup (File only)
     let file_appender = tracing_appender::rolling::daily("logs", "pytja_shell.log");
     let (_non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -34,55 +31,10 @@ pub async fn start_shell() -> Result<()> {
     // 2. UI Start
     print!("\x1B[2J\x1B[1;1H");
     println!("{}", "PYTJA SHELL v2.0 (Enterprise Client)".green().bold());
-    println!("========================================");
+    println!("{}", "========================================".dimmed());
 
-    // 3. Identity Laden & Multi-Account Selection
-    let mut available_keys = Vec::new();
-    if let Ok(entries) = fs::read_dir(IDENTITY_DIR) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "pytja") {
-                available_keys.push(path.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    if available_keys.is_empty() {
-        println!("{}", "NO IDENTITY FOUND!".red().bold());
-        println!("Please place a .pytja file in the '{}' directory.", IDENTITY_DIR);
-        return Ok(());
-    }
-
-    // MULTI-ACCOUNT AUSWAHL
-    let key_path = if available_keys.len() == 1 {
-        available_keys[0].clone()
-    } else {
-        println!("{}", "Multiple identities found. Please select an account:".cyan().bold());
-        for (i, key) in available_keys.iter().enumerate() {
-            println!("  [{}] {}", i + 1, key.green());
-        }
-
-        #[allow(unused_assignments)]
-        let mut selected = String::new();
-        loop {
-            print!("{} ", "Select number:".bold());
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-
-            if let Ok(num) = input.trim().parse::<usize>() {
-                if num > 0 && num <= available_keys.len() {
-                    selected = available_keys[num - 1].clone();
-                    break;
-                }
-            }
-            println!("{}", "Invalid selection. Please try again.".red());
-        }
-        selected
-    };
-
-    // Die Identity::load Funktion gibt selbst aus, wen sie lädt.
-    let identity = match Identity::load(&key_path) {
+    // 3. Enterprise Identity Loading (Ein einziger, dynamischer Aufruf!)
+    let identity = match Identity::load_or_prompt(identity_path) {
         Ok(id) => id,
         Err(e) => {
             println!("{} {}", "LOGIN FAILED:".red().bold(), e);
@@ -154,7 +106,7 @@ pub async fn start_shell() -> Result<()> {
     }
 
     pb.set_message("Authenticating...");
-    tokio::time::sleep(Duration::from_millis(300)).await; // Kleines Delay für UX
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let challenge = match client.get_challenge(&username).await {
         Ok(c) => c,
@@ -182,11 +134,20 @@ pub async fn start_shell() -> Result<()> {
         return Ok(());
     }
 
+    // 5. Enterprise Pfad-Auflösung für lokalen Cache
+    let db_path = if let Some(proj_dirs) = ProjectDirs::from("com", "pytja", "shell") {
+        let data_dir = proj_dirs.data_dir();
+        fs::create_dir_all(data_dir)?;
+        data_dir.join("pytja_local_cache.db").to_string_lossy().to_string()
+    } else {
+        "pytja_local_cache.db".to_string() // Fallback
+    };
+
     // Plugins & VFS
     let mut plugin_manager = PluginManager::new("./plugins", "data");
     let _ = plugin_manager.load_and_verify_plugins();
 
-    let vfs = VirtualFileSystem::new(username.clone(), DB_PATH).await;
+    let vfs = VirtualFileSystem::new(username.clone(), &db_path).await;
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
     println!("\nStarting Shell Session...");

@@ -219,4 +219,9 @@ impl DriverManager {
         let map = self.connections.read().await;
         map.keys().cloned().collect()
     }
+
+    pub async fn get_mount_configs(&self) -> Vec<MountConfig> {
+        let cache = self.config_cache.read().await;
+        cache.clone()
+    }
 }
