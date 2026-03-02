@@ -3,7 +3,7 @@ use dialoguer::{theme::ColorfulTheme, Select, Input};
 use comfy_table::{Table, presets::UTF8_FULL, Cell, Color, Attribute};
 use console::Term;
 use std::time::Duration;
-use tokio::time::sleep;
+use crossterm::event::{self, Event, KeyCode};
 
 pub async fn show(client: &mut AdminClient) -> anyhow::Result<()> {
     loop {
@@ -36,8 +36,8 @@ pub async fn show(client: &mut AdminClient) -> anyhow::Result<()> {
 }
 
 async fn live_dashboard(client: &mut AdminClient) -> anyhow::Result<()> {
-    println!("Starting Dashboard... (Press Ctrl+C to stop)");
-    // Einfacher Loop, der alle 2s abfragt
+    println!("Starting Dashboard... (Press 'q' or 'ESC' to return)");
+
     loop {
         let stats = client.get_system_stats().await?;
         Term::stdout().clear_screen()?;
@@ -50,10 +50,19 @@ async fn live_dashboard(client: &mut AdminClient) -> anyhow::Result<()> {
         println!("Uptime:         {}", stats.uptime);
         println!("------------------");
         println!("Active Sessions: {}", stats.active_sessions);
-        println!("Redis Status:    {}", if stats.redis_connected { "✅ Connected" } else { "❌ Error" });
+        println!("Redis Status:    {}", if stats.redis_connected { "[OK] Connected" } else { "[FAIL] Error" });
+        println!("\nPress 'q' or 'ESC' to return to menu.");
 
-        sleep(Duration::from_secs(2)).await;
+        // Nicht-blockierendes Polling: Wartet bis zu 2 Sekunden auf Eingaben
+        if event::poll(Duration::from_secs(2))? {
+            if let Event::Key(key_event) = event::read()? {
+                if key_event.code == KeyCode::Char('q') || key_event.code == KeyCode::Esc {
+                    break;
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 async fn show_audit_log(client: &mut AdminClient) -> anyhow::Result<()> {
@@ -62,7 +71,18 @@ async fn show_audit_log(client: &mut AdminClient) -> anyhow::Result<()> {
         .default(50)
         .interact()?;
 
-    let logs = client.get_audit_logs(limit, None).await?;
+    let filter_input: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Filter by user (leave empty for all)")
+        .allow_empty(true)
+        .interact_text()?;
+
+    let filter = if filter_input.trim().is_empty() {
+        None
+    } else {
+        Some(filter_input.trim().to_string())
+    };
+
+    let logs = client.get_audit_logs(limit, filter).await?;
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -93,13 +113,7 @@ async fn stream_logs(client: &mut AdminClient) -> anyhow::Result<()> {
     let mut stream = client.stream_logs().await?;
 
     while let Some(log_res) = stream.message().await? {
-        let level_color = match log_res.level.as_str() {
-            "ERROR" => console::Style::new().red().bold(),
-            "WARN" => console::Style::new().yellow(),
-            _ => console::Style::new().green(),
-        };
-
-        println!("[{}] {} | {}", log_res.timestamp, level_color.apply_to(log_res.level), log_res.message);
+        println!("[{}] {} | {}", log_res.timestamp, log_res.level, log_res.message);
     }
     Ok(())
 }

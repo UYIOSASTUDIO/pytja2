@@ -6,6 +6,7 @@ pub mod repo;
 pub mod drivers;
 pub mod config;
 pub mod storage; // <-- Modul muss da sein
+pub mod identity;
 
 // Re-Exports für einfachen Zugriff
 pub use repo::PytjaRepository;

@@ -13,13 +13,12 @@ mod terminal;
 mod vfs;
 mod plugins;
 mod network_client;
-mod identity;
 
 use crate::terminal::Terminal;
 use crate::vfs::VirtualFileSystem;
 use crate::plugins::PluginManager;
 use crate::network_client::PytjaClient;
-use crate::identity::Identity;
+use pytja_core::identity::Identity;
 
 // Die hartcodierten Konstanten (DB_PATH und IDENTITY_DIR) wurden restlos entfernt!
 

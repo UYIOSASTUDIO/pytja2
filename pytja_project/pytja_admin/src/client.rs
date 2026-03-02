@@ -1,15 +1,10 @@
 use pytja_proto::pytja::{self, pytja_service_client::PytjaServiceClient};
 use tonic::{transport::Channel, Request};
-use ed25519_dalek::{Signer, SigningKey};
 use std::fs;
-use base64::{Engine as _, engine::general_purpose};
-use dialoguer::Password;
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
-use pbkdf2::pbkdf2;
-use hmac::Hmac;
-use sha2::Sha256;
 use tonic::transport::{ClientTlsConfig, Certificate};
 use std::path::PathBuf;
+use pytja_core::identity::Identity;
+use ed25519_dalek::Signer;
 
 pub struct AdminClient {
     pub client: PytjaServiceClient<Channel>,
@@ -56,46 +51,14 @@ impl AdminClient {
     }
 
     pub async fn login_with_identity(&mut self, path: &str) -> anyhow::Result<bool> {
-        println!("Loading identity from: {}", path);
-        let content = fs::read_to_string(path).map_err(|_| anyhow::anyhow!("File not found: {}", path))?;
+        println!("Authenticating via Identity...");
 
-        let mut username = String::new();
-        let mut priv_b64 = String::new();
-
-        for line in content.lines() {
-            if let Some(v) = line.strip_prefix("USER:") { username = v.trim().to_string(); }
-            if let Some(v) = line.strip_prefix("PRIV:") { priv_b64 = v.trim().to_string(); }
-        }
-
-        if username.is_empty() || priv_b64.is_empty() {
-            return Err(anyhow::anyhow!("Invalid identity file"));
-        }
-        self.username = username.clone();
-
-        // 1. Password Prompt & Decrypt (wie in der Shell)
-        let password = Password::new().with_prompt("Enter Identity Password").interact()?;
-        let blob = general_purpose::STANDARD.decode(&priv_b64)?;
-
-        if blob.len() < 28 { return Err(anyhow::anyhow!("Corrupted identity file")); }
-
-        let salt = &blob[0..16];
-        let nonce_bytes = &blob[16..28];
-        let ciphertext = &blob[28..];
-
-        let mut derived_key = [0u8; 32];
-        pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 100_000, &mut derived_key)
-            .expect("Kritischer Fehler bei der Schlüsselableitung");
-
-        let cipher = Aes256Gcm::new(&derived_key.into());
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        let priv_key_bytes = cipher.decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow::anyhow!("Decryption failed - wrong password?"))?;
-
-        let signing_key = SigningKey::from_bytes(priv_key_bytes.as_slice().try_into()?);
+        // Nutzt die zentrale Enterprise-Logik (inkl. Tilde-Auflösung und Entschlüsselung)
+        let identity = Identity::load_or_prompt(Some(path.to_string()))?;
+        self.username = identity.username.clone();
 
         // 2. Challenge
-        let chal_req = Request::new(pytja::ChallengeRequest { username: username.clone() });
+        let chal_req = Request::new(pytja::ChallengeRequest { username: self.username.clone() });
         let chal_resp: pytja::ChallengeResponse = self.client.get_challenge(chal_req).await?.into_inner();
 
         if !chal_resp.user_exists {
@@ -103,11 +66,12 @@ impl AdminClient {
         }
 
         // 3. Sign & Login
-        let signature_bytes = signing_key.sign(chal_resp.challenge.as_bytes()).to_bytes().to_vec();
+        use base64::{Engine as _, engine::general_purpose};
+        let signature_bytes = identity.keypair.sign(chal_resp.challenge.as_bytes()).to_bytes().to_vec();
         let signature_str = general_purpose::STANDARD.encode(&signature_bytes);
 
         let login_req = Request::new(pytja::LoginRequest {
-            username,
+            username: self.username.clone(),
             challenge: chal_resp.challenge,
             signature: signature_str,
         });

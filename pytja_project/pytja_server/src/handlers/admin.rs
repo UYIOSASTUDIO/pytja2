@@ -112,7 +112,7 @@ impl MyPytjaService {
     }
 
     pub async fn list_invite_codes_impl(&self, request: Request<ListInvitesRequest>) -> Result<Response<ListInvitesResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:invites")).await?;
         let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
 
         let invites = repo.list_invites().await.map_err(|e| Status::internal(e.to_string()))?;
@@ -183,7 +183,7 @@ impl MyPytjaService {
     }
 
     pub async fn get_active_sessions_impl(&self, request: Request<GetSessionsRequest>) -> Result<Response<GetSessionsResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:users")).await?;
 
         let sessions: Vec<_> = self.sessions.get_all_sessions().await.into_iter().map(|s| SessionInfo {
             session_id: s.session_id,
@@ -240,7 +240,7 @@ impl MyPytjaService {
     }
 
     pub async fn list_roles_impl(&self, request: Request<ListRolesRequest>) -> Result<Response<ListRolesResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:roles")).await?;
         let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
         let roles = repo.list_roles().await.map_err(|e| Status::internal(e.to_string()))?;
         let infos = roles.into_iter().map(|r| RoleInfo { name: r.name, permissions: r.permissions }).collect();
@@ -327,7 +327,7 @@ impl MyPytjaService {
     }
 
     pub async fn get_audit_logs_impl(&self, request: Request<GetAuditLogsRequest>) -> Result<Response<GetAuditLogsResponse>, Status> {
-        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:system")).await?;
         let req = request.into_inner();
 
         let repo = self.manager.get_repo("primary").await.ok_or(Status::internal("DB Error"))?;
@@ -348,7 +348,7 @@ impl MyPytjaService {
     }
 
     pub async fn stream_server_logs_impl(&self, request: Request<LogStreamRequest>) -> Result<Response<ReceiverStream<Result<LogStreamEntry, Status>>>, Status> {
-        self.check_permissions(request.metadata(), Some("core:admin:read")).await?;
+        self.check_permissions(request.metadata(), Some("core:admin:system")).await?;
 
         let mut rx = self.log_broadcast.subscribe();
         let (tx, response_rx) = mpsc::channel(100);
