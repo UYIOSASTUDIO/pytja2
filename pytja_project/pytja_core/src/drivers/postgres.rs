@@ -24,7 +24,72 @@ impl PostgresDriver {
 #[async_trait]
 impl PytjaRepository for PostgresDriver {
     async fn init(&self) -> Result<(), PytjaError> {
-        // Init logic for Postgres...
+        // Users Table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                public_key BYTEA NOT NULL,
+                role TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT true,
+                created_at DOUBLE PRECISION NOT NULL,
+                quota_limit BIGINT NOT NULL DEFAULT 0,
+                description TEXT
+            )"
+        )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        // File Nodes Table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS file_nodes (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                is_folder BOOLEAN NOT NULL DEFAULT false,
+                size BIGINT NOT NULL DEFAULT 0,
+                content BYTEA NOT NULL,
+                blob_id TEXT,
+                lock_pass TEXT,
+                permissions INT NOT NULL DEFAULT 0,
+                created_at DOUBLE PRECISION NOT NULL,
+                metadata TEXT
+            )"
+        )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        // Audit Logs Table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS audit_logs (
+                id SERIAL PRIMARY KEY,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL,
+                timestamp DOUBLE PRECISION NOT NULL
+            )"
+        )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
+        // Invite Codes Table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS invite_codes (
+                code TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                max_uses INT NOT NULL DEFAULT 0,
+                used_count INT NOT NULL DEFAULT 0,
+                quota_limit BIGINT NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"
+        )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PytjaError::DatabaseError(e.to_string()))?;
+
         Ok(())
     }
 

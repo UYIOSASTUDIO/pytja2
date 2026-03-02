@@ -111,14 +111,18 @@ pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
 
     manager.load_config(&config.paths.mounts_file).await;
 
-    let db_path_or_url = if config.database.primary_url.starts_with("sqlite://") {
-        config.database.primary_url.strip_prefix("sqlite://").unwrap()
+    // Dynamische Datenbank-Erkennung für den Server
+    let db_url = &config.database.primary_url;
+    let (db_path, db_type) = if db_url.starts_with("postgres://") || db_url.starts_with("postgresql://") {
+        (db_url.as_str(), DatabaseType::Postgres)
+    } else if db_url.starts_with("sqlite://") {
+        (db_url.strip_prefix("sqlite://").unwrap(), DatabaseType::Sqlite)
     } else {
-        &config.database.primary_url
+        panic!("FATAL: Unsupported database URL protocol: {}", db_url);
     };
 
-    println!("Mounting Primary Database...");
-    manager.mount("primary", db_path_or_url, DatabaseType::Sqlite).await
+    println!("Mounting Primary Database ({:?})...", db_type);
+    manager.mount("primary", db_path, db_type).await
         .expect("FATAL: Failed to mount primary DB");
 
     if let Some(repo) = manager.get_repo("primary").await {
