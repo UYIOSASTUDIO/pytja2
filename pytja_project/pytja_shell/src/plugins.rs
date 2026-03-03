@@ -143,11 +143,12 @@ impl PluginManager {
         let wasm_bytes = fs::read(&plugin_path).context("Failed to read plugin binary.")?;
         let cmd_string = cmd_name.to_string();
 
-        // Erstelle den Kommunikationskanal für diesen Daemon
         let (tx, mut rx) = mpsc::channel::<PluginMessage>(32);
         self.active_daemons.insert(cmd_string.clone(), tx);
 
-        // Starte den isolierten Background-Task (Der Actor)
+        // NEU: Tokio Handle sichern, um ihn an den isolierten Thread zu übergeben
+        let handle = tokio::runtime::Handle::current();
+
         tokio::spawn(async move {
             info!("Daemon '{}' is now running in background.", cmd_string);
 
@@ -157,19 +158,21 @@ impl PluginManager {
                         let thread_permissions = permissions.clone();
                         let bytes_clone = wasm_bytes.clone();
                         let cmd_clone = cmd_string.clone();
+                        let handle_clone = handle.clone();
 
                         let res = tokio::task::spawn_blocking(move || -> Result<String> {
+                            // ENTERPRISE FIX 1: Den Tokio-Kontext im synchronen Thread wiederherstellen!
+                            let _guard = handle_clone.enter();
+
                             let mut store = Store::default();
                             let module = Module::new(&store, bytes_clone)?;
 
                             let mut builder = WasiEnv::builder(&cmd_clone);
                             builder = builder.args(&args);
 
-                            // NEU: Die Sandbox sicher für das Plugin mounten
                             if let Some(sp) = sandbox_path {
-                                // Mappe den Host-Ordner auf /workspace in der Sandbox
-                                builder = builder.map_dir("/workspace", sp)?;
-                                // Setze das Arbeitsverzeichnis, damit relative Pfade (wie "test.txt") funktionieren
+                                builder = builder.map_dir("/workspace", sp)
+                                    .context("Sandbox-Directory mapping failed")?;
                                 builder = builder.current_dir("/workspace");
                             }
 
@@ -179,10 +182,14 @@ impl PluginManager {
                                 builder = builder.env("SANDBOXED", "true");
                             }
 
-                            let (instance, _env) = builder.instantiate(module, &mut store)?;
-                            let start = instance.exports.get_function("_start").context("Missing _start")?;
+                            // Wir fangen das Instantiate jetzt mit vollem Kontext ab
+                            let (instance, _env) = builder.instantiate(module, &mut store)
+                                .context("WASI instantiation failed")?;
 
-                            start.call(&mut store, &[]).context("Plugin crashed")?;
+                            let start = instance.exports.get_function("_start")
+                                .context("Missing _start function in WASM module")?;
+
+                            start.call(&mut store, &[]).context("Plugin crashed during execution")?;
                             Ok(format!("Execution of {} completed.", cmd_clone))
                         }).await;
 
@@ -304,7 +311,9 @@ impl PluginManager {
 
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
             let td = tempfile::tempdir().context("Failed to create secure sandbox directory")?;
-            let temp_path = td.path().to_path_buf();
+
+            // ENTERPRISE FIX: Mac/Linux Symlinks auflösen, damit WASI den echten Pfad sieht!
+            let temp_path = std::fs::canonicalize(td.path()).unwrap_or_else(|_| td.path().to_path_buf());
             sandbox_path = Some(temp_path.clone());
 
             let mut i = 0;
@@ -350,7 +359,7 @@ impl PluginManager {
 
         let execution_successful = match resp_rx.await {
             Ok(Ok(msg)) => { pb.finish_and_clear(); println!("{} {}", "[OK]".green(), msg); true },
-            Ok(Err(e)) => { pb.finish_and_clear(); eprintln!("{} {}", "[ERROR] Plugin error:".red(), e); false },
+            Ok(Err(e)) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[ERROR] Plugin error:".red(), e); false },
             Err(_) => { pb.finish_and_clear(); eprintln!("{}", "[FATAL] Daemon disconnected.".red()); false }
         };
 
