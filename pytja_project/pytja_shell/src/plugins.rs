@@ -171,9 +171,12 @@ impl PluginManager {
                             builder = builder.args(&args);
 
                             if let Some(sp) = sandbox_path {
-                                builder = builder.map_dir("/workspace", sp)
-                                    .context("Sandbox-Directory mapping failed")?;
-                                builder = builder.current_dir("/workspace");
+                                // ENTERPRISE FIX: Wir umgehen den WASIX map_dir Alias-Bug!
+                                // Statt einem virtuellen "/workspace" mounten wir den echten Pfad
+                                // per 'preopen_dir' und setzen ihn als direktes Arbeitsverzeichnis.
+                                builder = builder.preopen_dir(&sp)
+                                    .context("Sandbox preopen failed")?;
+                                builder = builder.current_dir(&sp);
                             }
 
                             if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
@@ -305,15 +308,17 @@ impl PluginManager {
         let permissions = self.permissions_db.granted.get(cmd).cloned().unwrap_or_default();
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
 
-        // --- 1. SANDBOX SETUP & DOWNLOAD ---
-        let mut _temp_dir = None;
+        // --- 1. ENTERPRISE SANDBOX SETUP ---
         let mut sandbox_path = None;
 
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
-            let td = tempfile::tempdir().context("Failed to create secure sandbox directory")?;
 
-            // ENTERPRISE FIX: Mac/Linux Symlinks auflösen, damit WASI den echten Pfad sieht!
-            let temp_path = std::fs::canonicalize(td.path()).unwrap_or_else(|_| td.path().to_path_buf());
+            // ENTERPRISE FIX: Absolute Pfade ohne MacOS Canonicalize-Quirks!
+            let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let temp_path = current_dir.join("data").join("sandboxes").join(session_id);
+
+            std::fs::create_dir_all(&temp_path).context("Failed to create secure sandbox directory")?;
             sandbox_path = Some(temp_path.clone());
 
             let mut i = 0;
@@ -321,7 +326,6 @@ impl PluginManager {
                 if args[i] == "--input" && i + 1 < args.len() {
                     let remote_path = args[i + 1];
 
-                    // RESOLVE PATH: Wandelt relative Pfade in absolute VFS-Pfade um
                     let absolute_remote = if remote_path.starts_with('/') {
                         remote_path.to_string()
                     } else if current_path == "/" {
@@ -336,12 +340,12 @@ impl PluginManager {
                     println!("[INFO] Mounting input file '{}' into Sandbox...", absolute_remote);
                     if let Err(e) = client.download_file(&absolute_remote, local_dest.to_str().unwrap(), None).await {
                         eprintln!("[ERROR] Failed to mount {}: {}", absolute_remote, e);
+                        let _ = std::fs::remove_dir_all(&temp_path); // Cleanup bei Fehler
                         return Err(anyhow::anyhow!("Sandbox Mount aborted."));
                     }
                 }
                 i += 1;
             }
-            _temp_dir = Some(td); // Hält den temporären Ordner am Leben!
         }
 
         // --- 2. ASYNC DAEMON KOMMUNIKATION ---
@@ -365,13 +369,13 @@ impl PluginManager {
 
         // --- 3. SERVER SYNC (UPLOAD) ---
         if execution_successful {
-            if let Some(tp) = sandbox_path {
+            if let Some(ref tp) = sandbox_path {
                 if permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
                     let mut synced_files = 0;
-                    for entry in walkdir::WalkDir::new(&tp).into_iter().filter_map(|e| e.ok()) {
+                    for entry in walkdir::WalkDir::new(tp).into_iter().filter_map(|e| e.ok()) {
                         let path = entry.path();
                         if path.is_file() && !path.to_string_lossy().ends_with(".meta.json") {
-                            let rel_path = path.strip_prefix(&tp).unwrap().to_string_lossy().to_string();
+                            let rel_path = path.strip_prefix(tp).unwrap().to_string_lossy().to_string();
                             let remote_path = if current_path == "/" { format!("/{}", rel_path) } else { format!("{}/{}", current_path, rel_path) };
                             let local_str = path.to_string_lossy().to_string();
 
@@ -386,6 +390,12 @@ impl PluginManager {
                     }
                 }
             }
+        }
+
+        // --- 4. ENTERPRISE CLEANUP ---
+        // Nach getaner Arbeit den Workspace spurlos löschen
+        if let Some(tp) = sandbox_path {
+            let _ = std::fs::remove_dir_all(tp);
         }
 
         Ok(())
