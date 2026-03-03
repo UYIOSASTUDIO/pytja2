@@ -167,7 +167,10 @@ impl PluginManager {
 
                             // NEU: Die Sandbox sicher für das Plugin mounten
                             if let Some(sp) = sandbox_path {
-                                builder = builder.map_dir("/", sp)?;
+                                // Mappe den Host-Ordner auf /workspace in der Sandbox
+                                builder = builder.map_dir("/workspace", sp)?;
+                                // Setze das Arbeitsverzeichnis, damit relative Pfade (wie "test.txt") funktionieren
+                                builder = builder.current_dir("/workspace");
                             }
 
                             if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
@@ -308,12 +311,22 @@ impl PluginManager {
             while i < args.len() {
                 if args[i] == "--input" && i + 1 < args.len() {
                     let remote_path = args[i + 1];
-                    let file_name = Path::new(remote_path).file_name().unwrap_or_default();
+
+                    // RESOLVE PATH: Wandelt relative Pfade in absolute VFS-Pfade um
+                    let absolute_remote = if remote_path.starts_with('/') {
+                        remote_path.to_string()
+                    } else if current_path == "/" {
+                        format!("/{}", remote_path)
+                    } else {
+                        format!("{}/{}", current_path, remote_path)
+                    };
+
+                    let file_name = std::path::Path::new(&absolute_remote).file_name().unwrap_or_default();
                     let local_dest = temp_path.join(file_name);
 
-                    println!("[INFO] Mounting input file '{}' into Sandbox...", remote_path);
-                    if let Err(e) = client.download_file(remote_path, local_dest.to_str().unwrap(), None).await {
-                        eprintln!("[ERROR] Failed to mount {}: {}", remote_path, e);
+                    println!("[INFO] Mounting input file '{}' into Sandbox...", absolute_remote);
+                    if let Err(e) = client.download_file(&absolute_remote, local_dest.to_str().unwrap(), None).await {
+                        eprintln!("[ERROR] Failed to mount {}: {}", absolute_remote, e);
                         return Err(anyhow::anyhow!("Sandbox Mount aborted."));
                     }
                 }
