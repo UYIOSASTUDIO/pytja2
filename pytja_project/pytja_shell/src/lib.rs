@@ -142,10 +142,36 @@ pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
         "pytja_local_cache.db".to_string() // Fallback
     };
 
-    // Plugins & VFS
+    // --- 6. OS BOOT SEQUENCE (PLUGINS & DAEMONS) ---
     let mut plugin_manager = PluginManager::new("./plugins", "data");
-    let _ = plugin_manager.load_and_verify_plugins();
 
+    // Wir prüfen erst kritisch, ob es Probleme beim Laden gibt
+    if let Err(e) = plugin_manager.load_and_verify_plugins() {
+        eprintln!("{} Plugin system error: {}", "[WARNING]".yellow(), e);
+    }
+
+    let active_plugins = plugin_manager.list_plugins();
+    if !active_plugins.is_empty() {
+        println!("\n{}", "--- INITIALIZING DAEMONS ---".cyan().bold());
+
+        for (manifest, _) in active_plugins {
+            // Wir clonen den gRPC Client, da jeder Background-Daemon
+            // seine eigene, thread-sichere Verbindung zum Server benötigt.
+            match plugin_manager.boot_daemon(&manifest.name) {
+                Ok(_) => {
+                    println!("{} Service '{}' (v{}) is running in background.",
+                             "[OK]".green(), manifest.name.bold(), manifest.version);
+                }
+                Err(e) => {
+                    eprintln!("{} Failed to boot '{}' daemon: {}",
+                              "[FAIL]".red(), manifest.name, e);
+                }
+            }
+        }
+        println!("{}", "----------------------------".cyan().bold());
+    }
+
+    // --- 7. FILE SYSTEM & TERMINAL START ---
     let vfs = VirtualFileSystem::new(username.clone(), &db_path).await;
     let vfs_shared = Arc::new(Mutex::new(vfs));
 

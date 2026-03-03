@@ -101,7 +101,7 @@ impl Terminal {
         let args = parts[1..].to_vec();
 
         match cmd {
-            "exit" => return self.handle_exit(), // Gibt explizit false zurück
+            "exit" => return self.handle_exit().await,
             "help" => self.handle_help(),
             "clear" => self.print_banner(),
             "whoami" => println!("{}", self.user_id.green().bold()),
@@ -145,9 +145,15 @@ impl Terminal {
 
     // --- COMMAND HANDLERS ---
 
-    fn handle_exit(&self) -> bool {
+    async fn handle_exit(&mut self) -> bool {
+        println!("Shutting down OS subsystems...");
+
+        // NEU: Sauberes Beenden aller asynchronen Plugin-Daemons
+        self.plugin_manager.shutdown_all().await;
+
         println!("Verschlüssele Daten...");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
         println!("Verbindung getrennt.");
         false // Signal to stop loop
     }
