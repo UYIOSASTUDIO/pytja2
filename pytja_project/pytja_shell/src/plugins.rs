@@ -213,9 +213,8 @@ impl PluginManager {
         client: &mut crate::network_client::PytjaClient,
         current_path: &str,
     ) -> Result<()> {
-        // Wir ziehen das bereits fertig kompilierte Modul aus dem Cache
         let module = match self.modules.get(cmd) {
-            Some(m) => m.clone(), // Klonen des Moduls ist bei Wasmer thread-safe und extrem billig
+            Some(m) => m.clone(),
             None => {
                 eprintln!("{}", format!("[ERROR] Plugin '{}' not found in memory cache.", cmd).red());
                 return Ok(());
@@ -256,7 +255,7 @@ impl PluginManager {
                     println!("[INFO] Mounting input file '{}' into Sandbox...", absolute_remote);
                     if let Err(e) = client.download_file(&absolute_remote, local_dest.to_str().unwrap(), None).await {
                         eprintln!("[ERROR] Failed to mount {}: {}", absolute_remote, e);
-                        let _ = std::fs::remove_dir_all(&temp_path); // Cleanup bei Fehler
+                        let _ = std::fs::remove_dir_all(&temp_path);
                         return Err(anyhow::anyhow!("Sandbox Mount aborted."));
                     }
                 }
@@ -264,29 +263,27 @@ impl PluginManager {
             }
         }
 
-        // --- 2. JIT EXECUTION (Serverless Pattern) ---
+        // --- 2. JIT EXECUTION (Synchronous Enterprise Pattern) ---
         let pb = ProgressBar::new_spinner();
         pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
         pb.set_message(format!("Executing {} in secure enclave...", cmd.cyan()));
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        let sp_clone = sandbox_path.clone();
-        let thread_permissions = permissions.clone(); // ENTERPRISE FIX: Clone für den Thread
-
-        let execution_task = tokio::task::spawn_blocking(move || -> Result<String> {
+        // ENTERPRISE FIX: Synchronous Execution.
+        // We eliminate spawn_blocking. A CLI terminal inherently waits for commands to finish.
+        // This keeps Wasmer WASIX on the main OS thread, completely avoiding macOS VFS bugs.
+        let execution_result = (|| -> Result<String> {
             let mut store = Store::default();
             let mut builder = WasiEnv::builder(&cmd_string);
             builder = builder.args(&args_owned);
 
-            if let Some(sp) = sp_clone {
-                // Enterprise Fix: Da wir nun in einem sauberen On-Demand Thread laufen,
-                // schluckt Wasmer den map_dir Befehl für macOS jetzt ohne zu murren!
-                builder = builder.map_dir("/workspace", &sp).context("Sandbox mapping failed")?;
+            if let Some(ref sp) = sandbox_path {
+                let absolute_sp = sp.to_string_lossy().to_string();
+                builder = builder.map_dir("/workspace", &absolute_sp).context("Sandbox mapping failed")?;
                 builder = builder.current_dir("/workspace");
             }
 
-            // Wir nutzen hier nun den thread_permissions Clone
-            if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
+            if permissions.contains(&Permission::Env) || permissions.contains(&Permission::Admin) {
                 for (k, v) in std::env::vars() { builder = builder.env(k, v); }
             } else {
                 builder = builder.env("SANDBOXED", "true");
@@ -298,12 +295,11 @@ impl PluginManager {
             start.call(&mut store, &[]).context("Plugin crashed")?;
 
             Ok(format!("Execution of {} completed.", cmd_string))
-        });
+        })();
 
-        let execution_successful = match execution_task.await {
-            Ok(Ok(msg)) => { pb.finish_and_clear(); println!("{} {}", "[OK]".green(), msg); true },
-            Ok(Err(e)) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[ERROR] Plugin error:".red(), e); false },
-            Err(e) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[FATAL] Thread panic:".red(), e); false }
+        let execution_successful = match execution_result {
+            Ok(msg) => { pb.finish_and_clear(); println!("{} {}", "[OK]".green(), msg); true },
+            Err(e) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[ERROR] Plugin error:".red(), e); false }
         };
 
         // --- 3. SERVER SYNC (UPLOAD) ---
