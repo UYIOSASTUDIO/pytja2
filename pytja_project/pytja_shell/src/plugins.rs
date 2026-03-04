@@ -3,27 +3,14 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, instrument};
+use tracing::instrument;
 use wasmer_wasix::WasiEnv;
 use serde::{Deserialize, Serialize};
 use colored::*;
 use dialoguer::{Confirm, theme::ColorfulTheme};
-use wasmer::{Module, Store};
-use tokio::sync::{mpsc, oneshot};
-
-// --- ASYNC MESSAGE SYSTEM ---
-#[derive(Debug)]
-pub enum PluginMessage {
-    ExecuteCommand {
-        args: Vec<String>,
-        sandbox_path: Option<PathBuf>,
-        responder: oneshot::Sender<anyhow::Result<String>>,
-    },
-    Shutdown,
-}
+use wasmer::{Module, Store, Engine};
 
 // --- DATA STRUCTURES ---
-// (Dein bestehender Code für Permission, PluginManifest, PermissionDb bleibt exakt gleich!)
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -58,16 +45,15 @@ pub struct PermissionDb {
     pub granted: HashMap<String, HashSet<Permission>>,
 }
 
-// --- MANAGER ---
-
-// --- MANAGER ---
+// --- MANAGER (Serverless Edge Architecture) ---
 
 pub struct PluginManager {
     plugin_dir: PathBuf,
     manifests: HashMap<String, PluginManifest>,
+    modules: HashMap<String, Module>, // NEU: Der In-Memory Pre-Compiled Cache
+    engine: Engine,
     db_path: PathBuf,
     permissions_db: PermissionDb,
-    active_daemons: HashMap<String, mpsc::Sender<PluginMessage>>,
 }
 
 impl PluginManager {
@@ -84,9 +70,10 @@ impl PluginManager {
         Self {
             plugin_dir: plugin_dir.as_ref().to_path_buf(),
             manifests: HashMap::new(),
+            modules: HashMap::new(),
+            engine: Engine::default(),
             db_path,
             permissions_db,
-            active_daemons: HashMap::new(),
         }
     }
 
@@ -117,6 +104,12 @@ impl PluginManager {
                     }
                 };
 
+                // ENTERPRISE JIT COMPILATION: Wir kompilieren das WASM Modul HIER beim Start nur EINMAL.
+                // Dadurch wird die Ausführung im Terminal später blitzschnell!
+                let wasm_bytes = fs::read(&path).context("Failed to read wasm file")?;
+                let module = Module::new(&self.engine, &wasm_bytes).context("Failed to compile WASM")?;
+                self.modules.insert(stem.clone(), module);
+
                 if !self.permissions_db.granted.contains_key(&manifest.name) {
                     new_plugins.push(manifest.clone());
                 } else {
@@ -133,83 +126,6 @@ impl PluginManager {
         if !new_plugins.is_empty() {
             self.interactive_permission_grant(new_plugins)?;
         }
-
-        Ok(())
-    }
-
-    pub fn boot_daemon(&mut self, cmd_name: &str) -> Result<()> {
-        let permissions = self.permissions_db.granted.get(cmd_name).cloned().unwrap_or_default();
-        let plugin_path = self.plugin_dir.join(format!("{}.wasm", cmd_name));
-        let wasm_bytes = fs::read(&plugin_path).context("Failed to read plugin binary.")?;
-        let cmd_string = cmd_name.to_string();
-
-        let (tx, mut rx) = mpsc::channel::<PluginMessage>(32);
-        self.active_daemons.insert(cmd_string.clone(), tx);
-
-        // NEU: Tokio Handle sichern, um ihn an den isolierten Thread zu übergeben
-        let handle = tokio::runtime::Handle::current();
-
-        tokio::spawn(async move {
-            info!("Daemon '{}' is now running in background.", cmd_string);
-
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    PluginMessage::ExecuteCommand { args, sandbox_path, responder } => {
-                        let thread_permissions = permissions.clone();
-                        let bytes_clone = wasm_bytes.clone();
-                        let cmd_clone = cmd_string.clone();
-                        let handle_clone = handle.clone();
-
-                        let res = tokio::task::spawn_blocking(move || -> Result<String> {
-                            // ENTERPRISE FIX 1: Den Tokio-Kontext im synchronen Thread wiederherstellen!
-                            let _guard = handle_clone.enter();
-
-                            let mut store = Store::default();
-                            let module = Module::new(&store, bytes_clone)?;
-
-                            let mut builder = WasiEnv::builder(&cmd_clone);
-                            builder = builder.args(&args);
-
-                            if let Some(sp) = sandbox_path {
-                                // ENTERPRISE FIX: Wir umgehen den WASIX map_dir Alias-Bug!
-                                // Statt einem virtuellen "/workspace" mounten wir den echten Pfad
-                                // per 'preopen_dir' und setzen ihn als direktes Arbeitsverzeichnis.
-                                builder = builder.preopen_dir(&sp)
-                                    .context("Sandbox preopen failed")?;
-                                builder = builder.current_dir(&sp);
-                            }
-
-                            if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
-                                for (k, v) in std::env::vars() { builder = builder.env(k, v); }
-                            } else {
-                                builder = builder.env("SANDBOXED", "true");
-                            }
-
-                            // Wir fangen das Instantiate jetzt mit vollem Kontext ab
-                            let (instance, _env) = builder.instantiate(module, &mut store)
-                                .context("WASI instantiation failed")?;
-
-                            let start = instance.exports.get_function("_start")
-                                .context("Missing _start function in WASM module")?;
-
-                            start.call(&mut store, &[]).context("Plugin crashed during execution")?;
-                            Ok(format!("Execution of {} completed.", cmd_clone))
-                        }).await;
-
-                        let final_result = match res {
-                            Ok(Ok(success_msg)) => Ok(success_msg),
-                            Ok(Err(e)) => Err(e),
-                            Err(e) => Err(anyhow::anyhow!("Thread panic: {}", e)),
-                        };
-                        let _ = responder.send(final_result);
-                    }
-                    PluginMessage::Shutdown => {
-                        info!("Daemon '{}' shutting down.", cmd_string);
-                        break;
-                    }
-                }
-            }
-        });
 
         Ok(())
     }
@@ -297,23 +213,23 @@ impl PluginManager {
         client: &mut crate::network_client::PytjaClient,
         current_path: &str,
     ) -> Result<()> {
-        let sender = match self.active_daemons.get(cmd) {
-            Some(s) => s,
+        // Wir ziehen das bereits fertig kompilierte Modul aus dem Cache
+        let module = match self.modules.get(cmd) {
+            Some(m) => m.clone(), // Klonen des Moduls ist bei Wasmer thread-safe und extrem billig
             None => {
-                eprintln!("{}", format!("[ERROR] Plugin Daemon '{}' is not running.", cmd).red());
+                eprintln!("{}", format!("[ERROR] Plugin '{}' not found in memory cache.", cmd).red());
                 return Ok(());
             }
         };
 
         let permissions = self.permissions_db.granted.get(cmd).cloned().unwrap_or_default();
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let cmd_string = cmd.to_string();
 
         // --- 1. ENTERPRISE SANDBOX SETUP ---
         let mut sandbox_path = None;
 
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
-
-            // ENTERPRISE FIX: Absolute Pfade ohne MacOS Canonicalize-Quirks!
             let current_dir = std::env::current_dir().context("Failed to get current directory")?;
             let session_id = uuid::Uuid::new_v4().to_string();
             let temp_path = current_dir.join("data").join("sandboxes").join(session_id);
@@ -348,23 +264,46 @@ impl PluginManager {
             }
         }
 
-        // --- 2. ASYNC DAEMON KOMMUNIKATION ---
-        let (resp_tx, resp_rx) = oneshot::channel();
+        // --- 2. JIT EXECUTION (Serverless Pattern) ---
         let pb = ProgressBar::new_spinner();
         pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
-        pb.set_message(format!("Sending command to {} daemon...", cmd.cyan()));
+        pb.set_message(format!("Executing {} in secure enclave...", cmd.cyan()));
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        sender.send(PluginMessage::ExecuteCommand {
-            args: args_owned,
-            sandbox_path: sandbox_path.clone(),
-            responder: resp_tx,
-        }).await.context("Failed to communicate with plugin daemon")?;
+        let sp_clone = sandbox_path.clone();
+        let thread_permissions = permissions.clone(); // ENTERPRISE FIX: Clone für den Thread
 
-        let execution_successful = match resp_rx.await {
+        let execution_task = tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut store = Store::default();
+            let mut builder = WasiEnv::builder(&cmd_string);
+            builder = builder.args(&args_owned);
+
+            if let Some(sp) = sp_clone {
+                // Enterprise Fix: Da wir nun in einem sauberen On-Demand Thread laufen,
+                // schluckt Wasmer den map_dir Befehl für macOS jetzt ohne zu murren!
+                builder = builder.map_dir("/workspace", &sp).context("Sandbox mapping failed")?;
+                builder = builder.current_dir("/workspace");
+            }
+
+            // Wir nutzen hier nun den thread_permissions Clone
+            if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
+                for (k, v) in std::env::vars() { builder = builder.env(k, v); }
+            } else {
+                builder = builder.env("SANDBOXED", "true");
+            }
+
+            let (instance, _env) = builder.instantiate(module, &mut store).context("WASI instantiation failed")?;
+            let start = instance.exports.get_function("_start").context("Missing _start")?;
+
+            start.call(&mut store, &[]).context("Plugin crashed")?;
+
+            Ok(format!("Execution of {} completed.", cmd_string))
+        });
+
+        let execution_successful = match execution_task.await {
             Ok(Ok(msg)) => { pb.finish_and_clear(); println!("{} {}", "[OK]".green(), msg); true },
             Ok(Err(e)) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[ERROR] Plugin error:".red(), e); false },
-            Err(_) => { pb.finish_and_clear(); eprintln!("{}", "[FATAL] Daemon disconnected.".red()); false }
+            Err(e) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[FATAL] Thread panic:".red(), e); false }
         };
 
         // --- 3. SERVER SYNC (UPLOAD) ---
@@ -393,7 +332,6 @@ impl PluginManager {
         }
 
         // --- 4. ENTERPRISE CLEANUP ---
-        // Nach getaner Arbeit den Workspace spurlos löschen
         if let Some(tp) = sandbox_path {
             let _ = std::fs::remove_dir_all(tp);
         }
@@ -402,7 +340,7 @@ impl PluginManager {
     }
 
     pub fn has_command(&self, cmd: &str) -> bool {
-        self.active_daemons.contains_key(cmd) || self.manifests.contains_key(cmd)
+        self.modules.contains_key(cmd)
     }
 
     pub fn list_plugins(&self) -> Vec<(PluginManifest, std::collections::HashSet<Permission>)> {
@@ -415,12 +353,5 @@ impl PluginManager {
 
         result.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         result
-    }
-
-    pub async fn shutdown_all(&mut self) {
-        for (name, sender) in self.active_daemons.drain() {
-            let _ = sender.send(PluginMessage::Shutdown).await;
-            info!("Sent shutdown signal to daemon '{}'", name);
-        }
     }
 }

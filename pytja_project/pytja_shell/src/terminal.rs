@@ -147,15 +147,10 @@ impl Terminal {
 
     async fn handle_exit(&mut self) -> bool {
         println!("Shutting down OS subsystems...");
-
-        // NEU: Sauberes Beenden aller asynchronen Plugin-Daemons
-        self.plugin_manager.shutdown_all().await;
-
         println!("Verschlüssele Daten...");
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
         println!("Verbindung getrennt.");
-        false // Signal to stop loop
+        false
     }
 
     fn handle_help(&self) {

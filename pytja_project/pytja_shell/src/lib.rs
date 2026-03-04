@@ -142,33 +142,22 @@ pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
         "pytja_local_cache.db".to_string() // Fallback
     };
 
-    // --- 6. OS BOOT SEQUENCE (PLUGINS & DAEMONS) ---
+    // --- 6. OS BOOT SEQUENCE (PLUGINS) ---
     let mut plugin_manager = PluginManager::new("./plugins", "data");
 
-    // Wir prüfen erst kritisch, ob es Probleme beim Laden gibt
     if let Err(e) = plugin_manager.load_and_verify_plugins() {
         eprintln!("{} Plugin system error: {}", "[WARNING]".yellow(), e);
     }
 
     let active_plugins = plugin_manager.list_plugins();
     if !active_plugins.is_empty() {
-        println!("\n{}", "--- INITIALIZING DAEMONS ---".cyan().bold());
-
+        println!("\n{}", "--- PLUGINS LOADED ---".cyan().bold());
         for (manifest, _) in active_plugins {
-            // Wir clonen den gRPC Client, da jeder Background-Daemon
-            // seine eigene, thread-sichere Verbindung zum Server benötigt.
-            match plugin_manager.boot_daemon(&manifest.name) {
-                Ok(_) => {
-                    println!("{} Service '{}' (v{}) is running in background.",
-                             "[OK]".green(), manifest.name.bold(), manifest.version);
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to boot '{}' daemon: {}",
-                              "[FAIL]".red(), manifest.name, e);
-                }
-            }
+            // Zeigt an, dass das WASM Modul im RAM gecached wurde
+            println!("{} Loaded '{}' (v{}) into memory cache.",
+                     "[OK]".green(), manifest.name.bold(), manifest.version);
         }
-        println!("{}", "----------------------------".cyan().bold());
+        println!("{}", "----------------------".cyan().bold());
     }
 
     // --- 7. FILE SYSTEM & TERMINAL START ---
