@@ -228,17 +228,15 @@ impl PluginManager {
 
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
 
-            // THE ULTIMATE MACOS FIX:
-            // Wir umgehen /tmp, /var und /private komplett, um Wasmers Symlink-Paranoia zu besiegen.
-            // Wir umgehen ./data, damit dein eigenes Pytja VFS den Ordner nicht löscht.
-            // Wir nutzen stattdessen einen versteckten Ordner in deinem Mac-Home-Verzeichnis!
-            let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            // DIE ULTIMATIVE ISOLATION: Ein versteckter Ordner im Projekt-Root.
+            // Immun gegen das Pytja VFS (da nicht im "data" Ordner).
+            // Immun gegen macOS Path-Traversal (da echte lokale Pfade ohne Symlinks).
+            let current_dir = std::env::current_dir().context("Failed to get current directory")?;
             let session_id = uuid::Uuid::new_v4().to_string();
-            let temp_path = PathBuf::from(home_dir).join(".pytja").join("sandboxes").join(session_id);
+            let temp_path = current_dir.join(".wasi_enclaves").join(session_id);
 
             std::fs::create_dir_all(&temp_path).context("Failed to create secure sandbox directory")?;
-
-            // Kein Canonicalize mehr nötig, da der Home-Pfad absolut und real ist!
+            let temp_path = std::fs::canonicalize(&temp_path).unwrap_or(temp_path);
             sandbox_path = Some(temp_path.clone());
 
             let mut i = 0;
@@ -268,17 +266,27 @@ impl PluginManager {
             }
         }
 
-        // --- 2. JIT EXECUTION (Synchronous Enterprise Pattern) ---
+        // --- 2. JIT EXECUTION (Micro-Runtime Pattern) ---
         let pb = ProgressBar::new_spinner();
         pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
         pb.set_message(format!("Executing {} in secure enclave...", cmd.cyan()));
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        // Wir bleiben auf dem synchronen Haupt-Thread. Das ist die sicherste Variante für macOS
-        // und verhindert zu 100% Tokio-Context Verluste.
         let sp_clone = sandbox_path.clone();
+        let thread_permissions = permissions.clone();
 
-        let execution_result = (|| -> Result<String> {
+        let execution_task = tokio::task::spawn_blocking(move || -> Result<String> {
+
+            // THE ENTERPRISE FIX: Die dedizierte Micro-Runtime.
+            // Wir entkoppeln Wasmer vollständig vom Pytja-Hauptprozess und geben ihm
+            // eine eigene, makellose Asynchron-Umgebung für seine macOS Systemaufrufe.
+            let enclave_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to build enclave micro-runtime")?;
+
+            let _guard = enclave_rt.enter();
+
             let mut store = Store::default();
             let mut builder = WasiEnv::builder(&cmd_string);
             builder = builder.args(&args_owned);
@@ -289,7 +297,7 @@ impl PluginManager {
                 builder = builder.current_dir("/workspace");
             }
 
-            if permissions.contains(&Permission::Env) || permissions.contains(&Permission::Admin) {
+            if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
                 for (k, v) in std::env::vars() { builder = builder.env(k, v); }
             } else {
                 builder = builder.env("SANDBOXED", "true");
@@ -301,11 +309,12 @@ impl PluginManager {
             start.call(&mut store, &[]).context("Plugin crashed")?;
 
             Ok(format!("Execution of {} completed.", cmd_string))
-        })();
+        });
 
-        let execution_successful = match execution_result {
-            Ok(msg) => { pb.finish_and_clear(); println!("{} {}", "[OK]".green(), msg); true },
-            Err(e) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[ERROR] Plugin error:".red(), e); false }
+        let execution_successful = match execution_task.await {
+            Ok(Ok(msg)) => { pb.finish_and_clear(); println!("{} {}", "[OK]".green(), msg); true },
+            Ok(Err(e)) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[ERROR] Plugin error:".red(), e); false },
+            Err(e) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[FATAL] Thread panic:".red(), e); false }
         };
 
         // --- 3. SERVER SYNC (UPLOAD) ---
