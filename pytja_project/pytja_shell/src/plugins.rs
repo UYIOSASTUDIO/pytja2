@@ -23,7 +23,7 @@ pub enum Permission {
     #[serde(rename = "env")]
     Env,
     #[serde(rename = "admin")]
-    Admin, // "Root" Zugriff
+    Admin,
 }
 
 impl Permission {
@@ -50,7 +50,7 @@ pub struct PermissionDb {
 pub struct PluginManager {
     plugin_dir: PathBuf,
     manifests: HashMap<String, PluginManifest>,
-    modules: HashMap<String, Module>, // NEU: Der In-Memory Pre-Compiled Cache
+    modules: HashMap<String, Module>,
     engine: Engine,
     db_path: PathBuf,
     permissions_db: PermissionDb,
@@ -104,8 +104,6 @@ impl PluginManager {
                     }
                 };
 
-                // ENTERPRISE JIT COMPILATION: Wir kompilieren das WASM Modul HIER beim Start nur EINMAL.
-                // Dadurch wird die Ausführung im Terminal später blitzschnell!
                 let wasm_bytes = fs::read(&path).context("Failed to read wasm file")?;
                 let module = Module::new(&self.engine, &wasm_bytes).context("Failed to compile WASM")?;
                 self.modules.insert(stem.clone(), module);
@@ -229,11 +227,18 @@ impl PluginManager {
         let mut sandbox_path = None;
 
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
-            let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+
+            // THE ULTIMATE MACOS FIX:
+            // Wir umgehen /tmp, /var und /private komplett, um Wasmers Symlink-Paranoia zu besiegen.
+            // Wir umgehen ./data, damit dein eigenes Pytja VFS den Ordner nicht löscht.
+            // Wir nutzen stattdessen einen versteckten Ordner in deinem Mac-Home-Verzeichnis!
+            let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             let session_id = uuid::Uuid::new_v4().to_string();
-            let temp_path = current_dir.join("data").join("sandboxes").join(session_id);
+            let temp_path = PathBuf::from(home_dir).join(".pytja").join("sandboxes").join(session_id);
 
             std::fs::create_dir_all(&temp_path).context("Failed to create secure sandbox directory")?;
+
+            // Kein Canonicalize mehr nötig, da der Home-Pfad absolut und real ist!
             sandbox_path = Some(temp_path.clone());
 
             let mut i = 0;
@@ -269,15 +274,16 @@ impl PluginManager {
         pb.set_message(format!("Executing {} in secure enclave...", cmd.cyan()));
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        // ENTERPRISE FIX: Synchronous Execution.
-        // We eliminate spawn_blocking. A CLI terminal inherently waits for commands to finish.
-        // This keeps Wasmer WASIX on the main OS thread, completely avoiding macOS VFS bugs.
+        // Wir bleiben auf dem synchronen Haupt-Thread. Das ist die sicherste Variante für macOS
+        // und verhindert zu 100% Tokio-Context Verluste.
+        let sp_clone = sandbox_path.clone();
+
         let execution_result = (|| -> Result<String> {
             let mut store = Store::default();
             let mut builder = WasiEnv::builder(&cmd_string);
             builder = builder.args(&args_owned);
 
-            if let Some(ref sp) = sandbox_path {
+            if let Some(ref sp) = sp_clone {
                 let absolute_sp = sp.to_string_lossy().to_string();
                 builder = builder.map_dir("/workspace", &absolute_sp).context("Sandbox mapping failed")?;
                 builder = builder.current_dir("/workspace");
