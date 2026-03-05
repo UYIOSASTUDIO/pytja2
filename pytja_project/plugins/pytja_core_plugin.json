@@ -1,10 +1,12 @@
 {
   "name": "pytja_core_plugin",
   "version": "1.0.0",
-  "description": "Autonomous SOAR Agent",
+  "description": "Enterprise VFS & C2 Telemetry Agent",
   "permissions": [
     "fs_read",
-    "network_tcp"
+    "fs_write",
+    "network_tcp",
+    "display_ui"
   ],
   "autostart": true
 }

@@ -18,6 +18,7 @@ pub struct PytjaClient {
     token: Arc<Mutex<Option<String>>>,
     #[allow(dead_code)]
     pub signing_key: Vec<u8>,
+    #[allow(dead_code)]
     pub username: String,
 }
 

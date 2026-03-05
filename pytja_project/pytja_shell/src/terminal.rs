@@ -1,7 +1,14 @@
 use crate::vfs::VirtualFileSystem;
 use crate::radar::RadarEngine;
 use crate::network_client::PytjaClient;
-use rustyline::DefaultEditor;
+use rustyline::{Editor, Context};
+use rustyline::completion::{Completer, extract_word};
+use rustyline::hint::Hinter;
+use rustyline::highlight::Highlighter;
+use rustyline::validate::{Validator, ValidationResult, ValidationContext};
+use rustyline::Helper;
+use rustyline::history::DefaultHistory;
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use colored::*;
 use std::io::{self, Write};
@@ -15,6 +22,60 @@ use directories::ProjectDirs;
 use walkdir::WalkDir;
 use std::path::Path;
 use tracing::{info, warn, error};
+
+pub struct PytjaHelper {
+    commands: Vec<String>,
+    plugins: Vec<String>,
+}
+
+impl Completer for PytjaHelper {
+    type Candidate = String;
+
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
+        let (start, word) = extract_word(line, pos, None, |c| c == ' ' || c == '\t');
+        let mut matches = Vec::new();
+
+        // Befehle und Plugins autovervollständigen
+        if start == 0 {
+            for cmd in &self.commands {
+                if cmd.starts_with(word) {
+                    matches.push(cmd.clone());
+                }
+            }
+            for plugin in &self.plugins {
+                if plugin.starts_with(word) {
+                    matches.push(plugin.clone());
+                }
+            }
+        } else {
+            // Kontext-sensitive Autovervollständigung (z.B. nach "daemon start" oder "ui open")
+            if line.starts_with("daemon start ") || line.starts_with("daemon stop ") || line.starts_with("ui open ") {
+                for plugin in &self.plugins {
+                    if plugin.starts_with(word) {
+                        matches.push(plugin.clone());
+                    }
+                }
+            }
+        }
+        Ok((start, matches))
+    }
+}
+
+impl Hinter for PytjaHelper {
+    type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> { None }
+}
+
+impl Highlighter for PytjaHelper {}
+
+impl Validator for PytjaHelper {
+    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+    fn validate_while_typing(&self) -> bool { false }
+}
+
+impl Helper for PytjaHelper {}
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
@@ -37,7 +98,25 @@ impl Terminal {
 
     pub async fn start(&mut self) -> anyhow::Result<()> {
         self.print_banner();
-        let mut rl = DefaultEditor::new()?;
+        // Dynamische Plugin-Namen für die Autovervollständigung laden
+        let plugin_names: Vec<String> = self.radar_engine.get_manifests().into_iter().map(|m| m.name).collect();
+
+        let helper = PytjaHelper {
+            commands: vec![
+                "exit".into(), "help".into(), "clear".into(), "whoami".into(),
+                "ls".into(), "ll".into(), "cd".into(), "mkdir".into(), "touch".into(),
+                "cp".into(), "mv".into(), "rm".into(), "nano".into(), "cat".into(),
+                "upload".into(), "download".into(), "exec".into(), "chmod".into(),
+                "chown".into(), "lock".into(), "tree".into(), "stat".into(),
+                "find".into(), "grep".into(), "du".into(), "query".into(),
+                "plugins".into(), "mounts".into(), "daemon".into(), "ui".into()
+            ],
+            plugins: plugin_names,
+        };
+
+        let mut rl = Editor::<PytjaHelper, DefaultHistory>::new()?;
+        rl.set_helper(Some(helper));
+        rl.set_completion_type(rustyline::CompletionType::List);
 
         // 1. History laden
         let history_path = if let Some(proj_dirs) = ProjectDirs::from("com", "pytja", "shell") {
@@ -63,7 +142,6 @@ impl Terminal {
             if manifest.autostart {
                 println!("[RADAR] Auto-booting background service: {}", manifest.name.cyan());
                 let client_clone = self.client.clone();
-                // Wir starten den Daemon ohne zusätzliche Argumente
                 if let Err(e) = self.radar_engine.start_daemon(&manifest.name, vec![], client_clone) {
                     println!("{} Failed to autostart daemon '{}': {}", "[ERROR]".red().bold(), manifest.name, e);
                 } else {
@@ -74,6 +152,11 @@ impl Terminal {
         if autostart_count > 0 {
             println!("{} {} autonomous agent(s) booted successfully.\n", "[OK]".green().bold(), autostart_count);
         }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Init CWD from VFS
+        self.current_path = self.vfs.lock().await.get_cwd().to_string();
 
         loop {
             let prompt = format!("┌──({}㉿pytja)-[{}]\n└─$ ", self.user_id.red(), self.current_path.blue());
@@ -870,6 +953,19 @@ impl Terminal {
                     println!("{:<25} RUNNING", d);
                 }
                 println!();
+            },
+            "logs" => {
+                if args.len() < 2 {
+                    println!("Usage: daemon logs <plugin_name>");
+                    return;
+                }
+                match self.radar_engine.get_daemon_logs(args[1]).await {
+                    Ok(logs) => {
+                        println!("\n{}", format!("--- LOGS: {} ---", args[1]).cyan().bold());
+                        println!("{}", logs);
+                    },
+                    Err(e) => self.handle_error("Daemon Logs", e),
+                }
             },
             "send" => {
                 if args.len() < 3 {

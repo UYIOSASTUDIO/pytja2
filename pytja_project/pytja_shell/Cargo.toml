@@ -56,3 +56,4 @@ wasmer = "4.4.0"
 wasmer-wasix = "0.28.0"
 
 reqwest = { version = "0.11", features = ["json"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }

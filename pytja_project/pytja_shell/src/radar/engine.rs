@@ -7,12 +7,14 @@ use wasmer_wasix::virtual_fs::{FileSystem, TmpFileSystem};
 use tokio::io::AsyncWriteExt;
 use crate::network_client::PytjaClient;
 
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use super::models::{PluginManifest, RadarPermission};
+use super::models::PluginManifest;
 
 pub struct DaemonContext {
     pub monitor_task: tokio::task::JoinHandle<()>,
     pub tx: mpsc::Sender<String>,
+    pub mem_fs: TmpFileSystem, // NEU: Referenz auf das RAM-Laufwerk des Daemons
 }
 
 pub struct RadarEngine {
@@ -20,15 +22,25 @@ pub struct RadarEngine {
     module_cache: HashMap<String, Module>,
     manifests: HashMap<String, PluginManifest>,
     active_daemons: HashMap<String, DaemonContext>,
+    pub ui_registry: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl RadarEngine {
     pub fn new() -> Result<Self> {
+        let ui_registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        // --- ENTERPRISE FIX: Hintergrund UI Server booten ---
+        let ui_reg_clone = ui_registry.clone();
+        tokio::spawn(async move {
+            crate::radar::display::run_ui_server(ui_reg_clone).await;
+        });
+
         Ok(Self {
             wasm_engine: Engine::default(),
             module_cache: HashMap::new(),
             manifests: HashMap::new(),
             active_daemons: HashMap::new(),
+            ui_registry,
         })
     }
 
@@ -71,16 +83,21 @@ impl RadarEngine {
 
         // --- THE C2 EVENT BUS ---
         let (tx, mut rx) = mpsc::channel::<String>(32);
+
+        // --- THE SOCKET MAP (Verwaltet aktive Verbindungen des Daemons) ---
+        let active_sockets: Arc<tokio::sync::Mutex<std::collections::HashMap<String, mpsc::Sender<String>>>> = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        // --- ENTERPRISE FIX: EINHEITLICHES DATEISYSTEM ---
         let mem_fs = TmpFileSystem::new();
         let mem_fs_inbox = mem_fs.clone();
+        let mem_fs_sandbox = mem_fs.clone();
+        let mem_fs_context = mem_fs.clone(); // Für den DaemonContext (Logs abrufen)
 
-        // Hintergrund-Relay: Leitet asynchrone Channel-Nachrichten in den RAM des Plugins
         // Hintergrund-Relay: Leitet asynchrone Channel-Nachrichten in den RAM des Plugins
         let inbox_handle = handle.clone();
         inbox_handle.spawn(async move {
             use tokio::io::AsyncWriteExt;
             while let Some(msg) = rx.recv().await {
-                // THE ENTERPRISE FIX: Das OpenOptions-Objekt VOR dem .await sofort droppen
                 let open_result = mem_fs_inbox
                     .new_open_options()
                     .write(true)
@@ -94,25 +111,33 @@ impl RadarEngine {
             }
         });
 
+        // Wir klonen tx für die WebAssembly-Sandbox, damit die Host-Engine das Original behalten kann.
+        let tx_for_daemon = tx.clone();
+        // Wir klonen das UI-Registry VOR dem Hintergrund-Thread
+        let ui_registry_for_daemon = self.ui_registry.clone();
+
         // 1. Die Sandbox im Hintergrund aufbauen
         let daemon_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let _guard = handle.enter();
 
             let mut store = Store::default();
-            let mem_fs = TmpFileSystem::new();
 
-            // FIX: Klone das FS für die ABI, BEVOR es vom Builder konsumiert wird
-            let mem_fs_abi = mem_fs.clone();
+            // WICHTIG: Das vereinheitlichte FS nutzen!
+            let mem_fs_abi = mem_fs_sandbox.clone();
 
             let mut builder = WasiEnv::builder(&plugin_name_owned)
                 .args(&args)
-                .sandbox_fs(mem_fs);
+                .sandbox_fs(mem_fs_sandbox);
 
             builder = builder.env("RADAR_MODE", "DAEMON");
-
-            // THE ENTERPRISE FIX: Dem Daemon den Schlüssel zum RAM-Ordner übergeben
             builder = builder.preopen_dir("/workspace")?;
             builder = builder.current_dir("/workspace");
+
+            // --- ENTERPRISE FIX: SILENT DAEMON ---
+            // Leitet alle println! Ausgaben des Daemons in eine versteckte Log-Datei um!
+            if let Ok(log_out) = mem_fs_abi.new_open_options().write(true).create(true).open(std::path::Path::new("/workspace/daemon.log")) {
+                builder = builder.stdout(log_out);
+            }
 
             let mut wasi_env = builder.finalize(&mut store)?;
             let mut import_object = wasi_env.import_object(&mut store, &module)?;
@@ -126,13 +151,24 @@ impl RadarEngine {
 
             let handle_abi = handle.clone();
             let client_abi = client.clone();
-            let perms_abi = process_permissions.clone(); // Die Security-Tokens für den Router
+            let perms_abi = process_permissions.clone();
+            let plugin_owner_id = format!("radar_{}", plugin_name_owned);
+            let ui_registry_abi = ui_registry_for_daemon;
+            let plugin_tx_abi = tx_for_daemon.clone();
+            let sockets_abi = active_sockets.clone();
 
-            // THE ENTERPRISE FIX: Unified IPC Router mit Zero Trust PEP
+            // THE ENTERPRISE FIX: Unified IPC Router (JSON-RPC)
             radar_exports.insert("host_ipc_request", Function::new_typed(&mut store, move || -> i32 {
+                // 1. Für JEDEN Aufruf frische Klone erzeugen
                 let fs = mem_fs_abi.clone();
                 let client_req = client_abi.clone();
                 let allowed_perms = perms_abi.clone();
+                let owner_id = plugin_owner_id.clone();
+
+                // HIER IST DER FIX: Wir klonen die Sender für den inneren async-Block
+                let ui_inner = ui_registry_abi.clone();
+                let tx_inner = plugin_tx_abi.clone();
+                let sockets_inner = sockets_abi.clone();
 
                 handle_abi.block_on(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -145,76 +181,34 @@ impl RadarEngine {
                     let response_json = match serde_json::from_str::<serde_json::Value>(&req_content) {
                         Ok(req) => {
                             let module = req["module"].as_str().unwrap_or("");
-                            let method = req["method"].as_str().unwrap_or("");
 
                             // --- ROUTE: VFS MODULE ---
                             if module == "vfs" {
-                                // SECURITY CHECK: FsRead (angepasst an dein neues Modell)
-                                if !allowed_perms.contains(&RadarPermission::FsRead) {
-                                    r#"{"status": "error", "message": "403 Forbidden: Missing fs_read permission"}"#.to_string()
-                                } else if method == "list_dir" {
-                                    let target_path = req["params"]["path"].as_str().unwrap_or("/");
-
-                                    match client_req.list_files(target_path).await {
-                                        Ok(items) => {
-                                            let json_items: Vec<String> = items.iter().map(|i| {
-                                                format!(r#"{{"name": "{}", "is_folder": {}, "size": {}}}"#, i.name, i.is_folder, i.size)
-                                            }).collect();
-                                            format!(r#"{{"status": "success", "data": {{"items": [{}]}}}}"#, json_items.join(", "))
-                                        },
-                                        Err(e) => {
-                                            let safe_err = e.to_string().replace("\"", "\\\"");
-                                            format!(r#"{{"status": "error", "message": "{}"}}"#, safe_err)
-                                        }
-                                    }
-                                } else {
-                                    r#"{"status": "error", "message": "Method not implemented in VFS module"}"#.to_string()
-                                }
+                                crate::radar::vfs::handle_vfs_request(
+                                    &req,
+                                    &client_req,
+                                    &allowed_perms,
+                                    &owner_id
+                                ).await
                             }
                             // --- ROUTE: NETWORK MODULE ---
                             else if module == "network" {
-                                // SECURITY CHECK: NetworkTcp
-                                if !allowed_perms.contains(&RadarPermission::NetworkTcp) {
-                                    r#"{"status": "error", "message": "403 Forbidden: Missing network_tcp permission"}"#.to_string()
-                                } else {
-                                    let url = req["params"]["url"].as_str().unwrap_or("");
-                                    let method_http = req["params"]["method"].as_str().unwrap_or("GET");
-                                    let body_opt = req["params"]["body"].as_str();
-
-                                    let client_http = reqwest::Client::new();
-                                    let mut request_builder = match method_http {
-                                        "POST" => client_http.post(url),
-                                        "PUT" => client_http.put(url),
-                                        _ => client_http.get(url),
-                                    };
-
-                                    if let Some(b) = body_opt {
-                                        request_builder = request_builder.body(b.to_string());
-                                    }
-
-                                    match request_builder.send().await {
-                                        Ok(resp) => {
-                                            let status_code = resp.status().as_u16();
-                                            let body_text = resp.text().await.unwrap_or_default();
-
-                                            let res_json = serde_json::json!({
-                                                "status": "success",
-                                                "data": {
-                                                    "status_code": status_code,
-                                                    "body": body_text
-                                                }
-                                            });
-                                            res_json.to_string()
-                                        },
-                                        Err(e) => {
-                                            let res_json = serde_json::json!({
-                                                "status": "error",
-                                                "message": e.to_string()
-                                            });
-                                            res_json.to_string()
-                                        }
-                                    }
-                                }
+                                // 2. Die geklonten Variablen typsicher übergeben
+                                crate::radar::network::handle_network_request(
+                                    &req,
+                                    &allowed_perms,
+                                    tx_inner,
+                                    sockets_inner
+                                ).await
+                            }
+                            // --- ROUTE: DISPLAY MODULE ---
+                            else if module == "display" {
+                                crate::radar::display::handle_display_request(
+                                    &req,
+                                    &allowed_perms,
+                                    &owner_id.replace("radar_", ""),
+                                    ui_inner
+                                ).await
                             }
                             else {
                                 r#"{"status": "error", "message": "Unknown IPC module"}"#.to_string()
@@ -254,6 +248,7 @@ impl RadarEngine {
         self.active_daemons.insert(plugin_name.to_string(), DaemonContext {
             monitor_task,
             tx,
+            mem_fs: mem_fs_context,
         });
         Ok(())
     }
@@ -278,6 +273,24 @@ impl RadarEngine {
 
     pub fn list_daemons(&self) -> Vec<String> {
         self.active_daemons.keys().cloned().collect()
+    }
+
+    pub async fn get_daemon_logs(&self, plugin_name: &str) -> Result<String> {
+        if let Some(ctx) = self.active_daemons.get(plugin_name) {
+            let mut content = String::new();
+            // Liest die versteckte Log-Datei aus dem RAM des Daemons
+            if let Ok(mut file) = ctx.mem_fs.new_open_options().read(true).open(std::path::Path::new("/workspace/daemon.log")) {
+                use tokio::io::AsyncReadExt;
+                let _ = file.read_to_string(&mut content).await;
+            }
+            if content.is_empty() {
+                Ok("[No logs generated by this daemon yet]".to_string())
+            } else {
+                Ok(content)
+            }
+        } else {
+            anyhow::bail!("Daemon '{}' is not currently running.", plugin_name);
+        }
     }
 
     // --- STANDARD PLUGIN MANAGEMENT ---

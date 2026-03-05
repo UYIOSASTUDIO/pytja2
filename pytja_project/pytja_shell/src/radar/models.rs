@@ -12,6 +12,8 @@ pub enum RadarPermission {
     RadarIpc,
     #[serde(rename = "admin")]
     Admin,
+    #[serde(rename = "display_ui")]
+    DisplayUi, // Das neue UI-Recht
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
