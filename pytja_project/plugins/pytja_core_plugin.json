@@ -1,0 +1,10 @@
+{
+  "name": "pytja_core_plugin",
+  "version": "1.0.0",
+  "description": "Autonomous SOAR Agent",
+  "permissions": [
+    "fs_read",
+    "network_tcp"
+  ],
+  "autostart": true
+}

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use anyhow::Context;
 use tokio::sync::Mutex;
 use colored::*;
 use std::fs;
@@ -11,12 +12,12 @@ use pytja_core::crypto::CryptoService;
 
 mod terminal;
 mod vfs;
-mod plugins;
+mod radar;
 mod network_client;
 
 use crate::terminal::Terminal;
 use crate::vfs::VirtualFileSystem;
-use crate::plugins::PluginManager;
+use crate::radar::RadarEngine;
 use crate::network_client::PytjaClient;
 use pytja_core::identity::Identity;
 
@@ -142,30 +143,26 @@ pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
         "pytja_local_cache.db".to_string() // Fallback
     };
 
-    // --- 6. OS BOOT SEQUENCE (PLUGINS) ---
-    let mut plugin_manager = PluginManager::new("./plugins", "data");
+    // --- 6. OS BOOT SEQUENCE (RADAR ENGINE) ---
+    let mut radar_engine = RadarEngine::new().context("Failed to boot Radar Micro-Runtime")?;
 
-    if let Err(e) = plugin_manager.load_and_verify_plugins() {
-        eprintln!("{} Plugin system error: {}", "[WARNING]".yellow(), e);
+    // Plugins auslesen und in den RAM laden!
+    if let Err(e) = radar_engine.load_plugins("./plugins") {
+        eprintln!("{} Radar Engine Loading Error: {}", "[WARNING]".yellow(), e);
     }
 
-    let active_plugins = plugin_manager.list_plugins();
-    if !active_plugins.is_empty() {
-        println!("\n{}", "--- PLUGINS LOADED ---".cyan().bold());
-        for (manifest, _) in active_plugins {
-            // Zeigt an, dass das WASM Modul im RAM gecached wurde
-            println!("{} Loaded '{}' (v{}) into memory cache.",
-                     "[OK]".green(), manifest.name.bold(), manifest.version);
-        }
-        println!("{}", "----------------------".cyan().bold());
-    }
+    println!("\n{}", "--- RADAR ENGINE ONLINE ---".cyan().bold());
+    println!("{} In-Memory WASIX executor active.", "[OK]".green());
+    println!("{} {} Enterprise Plugins loaded.", "[OK]".green(), radar_engine.get_manifests().len());
+    println!("{}", "---------------------------".cyan().bold());
 
     // --- 7. FILE SYSTEM & TERMINAL START ---
     let vfs = VirtualFileSystem::new(username.clone(), &db_path).await;
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
     println!("\nStarting Shell Session...");
-    let mut term = Terminal::new(vfs_shared, username.clone(), plugin_manager, client);
+    // ACHTUNG: Hier übergeben wir jetzt radar_engine statt plugin_manager
+    let mut term = Terminal::new(vfs_shared, username.clone(), radar_engine, client);
     let _ = term.start().await;
 
     println!("Session terminated.");

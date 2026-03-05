@@ -12,7 +12,7 @@ members = [
     "pytja_shell",
     "pytja_admin",
     "pytja_registrar"
-]
+, "pytja_core_plugin"]
 
 [dependencies]
 # Wir binden die Server- und Shell-Logik als Bibliotheken ein

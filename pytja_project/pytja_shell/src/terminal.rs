@@ -1,5 +1,5 @@
 use crate::vfs::VirtualFileSystem;
-use crate::plugins::PluginManager;
+use crate::radar::RadarEngine;
 use crate::network_client::PytjaClient;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -19,23 +19,18 @@ use tracing::{info, warn, error};
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
     user_id: String,
-    plugin_manager: PluginManager,
+    radar_engine: RadarEngine,
     client: PytjaClient,
     current_path: String, // Cache für CWD um DB-Locks zu minimieren
 }
 
 impl Terminal {
-    pub fn new(
-        vfs: Arc<Mutex<VirtualFileSystem>>,
-        user: String,
-        pm: PluginManager,
-        client: PytjaClient
-    ) -> Self {
+    pub fn new(vfs: Arc<Mutex<VirtualFileSystem>>, username: String, radar_engine: RadarEngine, network_client: PytjaClient) -> Self {
         Self {
             vfs,
-            user_id: user,
-            plugin_manager: pm,
-            client,
+            user_id: username, // FIX: Heißt im Struct user_id
+            radar_engine,
+            client: network_client, // FIX: Heißt im Struct client
             current_path: "/".to_string(),
         }
     }
@@ -59,6 +54,26 @@ impl Terminal {
 
         // Init CWD from VFS
         self.current_path = self.vfs.lock().await.get_cwd().to_string();
+
+        // --- ENTERPRISE AUTOSTART SEQUENCE ---
+        let manifests = self.radar_engine.get_manifests();
+        let mut autostart_count = 0;
+
+        for manifest in manifests {
+            if manifest.autostart {
+                println!("[RADAR] Auto-booting background service: {}", manifest.name.cyan());
+                let client_clone = self.client.clone();
+                // Wir starten den Daemon ohne zusätzliche Argumente
+                if let Err(e) = self.radar_engine.start_daemon(&manifest.name, vec![], client_clone) {
+                    println!("{} Failed to autostart daemon '{}': {}", "[ERROR]".red().bold(), manifest.name, e);
+                } else {
+                    autostart_count += 1;
+                }
+            }
+        }
+        if autostart_count > 0 {
+            println!("{} {} autonomous agent(s) booted successfully.\n", "[OK]".green().bold(), autostart_count);
+        }
 
         loop {
             let prompt = format!("┌──({}㉿pytja)-[{}]\n└─$ ", self.user_id.red(), self.current_path.blue());
@@ -128,15 +143,13 @@ impl Terminal {
             "query" => self.handle_query(args).await,
             "plugins" => self.handle_plugins(),
             "mounts" => self.handle_mounts(args).await,
+            "daemon" => self.handle_daemon(args).await,
             _ => {
-                // Plugin Check
-                if self.plugin_manager.has_command(cmd) {
-                    println!("🚀 Launching Plugin: {}", cmd.cyan());
-
-                    // FIX: Wir übergeben den Netzwerk-Client und den aktuellen Pfad (statt des lokalen VFS)
-                    if let Err(e) = self.plugin_manager.execute(cmd, args, &mut self.client, &self.current_path).await {
-                        self.handle_error("Plugin Crash", e);
-                    }
+                if self.radar_engine.has_plugin(cmd) {
+                    println!("{} Radar Enclave: {}", "🚀 Launching".cyan(), cmd.bold());
+                    self.execute_radar_plugin(cmd, args).await;
+                } else {
+                    println!("Command not found: {}", cmd);
                 }
             }
         }
@@ -732,62 +745,147 @@ impl Terminal {
     }
 
     fn handle_plugins(&self) {
-        let plugins = self.plugin_manager.list_plugins();
+        let manifests = self.radar_engine.get_manifests();
 
-        if plugins.is_empty() {
-            println!("\n{} Keine Plugins geladen.\n", "ℹ️".cyan());
+        if manifests.is_empty() {
+            println!("\n{} Keine Radar-Plugins geladen.\n", "ℹ️".cyan());
             return;
         }
 
-        // 1. Tabellen-Kopf (Header) ausgeben
-        println!("\n{:<20} {:<10} {:<30} DESCRIPTION", "NAME", "VERSION", "PERMISSIONS");
-        println!("{}", "-".repeat(90));
+        println!("\n{:<20} {:<10} DESCRIPTION", "NAME", "VERSION");
+        println!("{}", "-".repeat(60));
 
-        // 2. Plugins als Zeilen ausgeben
-        for (manifest, granted) in plugins.iter() {
-            // Namen und Version auf eine feste Breite bringen (bevor die Farbe dazu kommt!)
+        for manifest in manifests.iter() {
             let name_padded = format!("{:<20}", manifest.name);
             let version_padded = format!("{:<10}", manifest.version);
 
-            // Berechtigungen formatieren
-            let perms: Vec<String> = granted.iter().map(|p| format!("{:?}", p)).collect();
-            let mut raw_perms = if perms.is_empty() {
-                "Keine".to_string()
-            } else {
-                perms.join(", ")
-            };
+            println!("{} {} {}", name_padded.green().bold(), version_padded.yellow(), manifest.description.dimmed());
+        }
+        println!("\n[TOTAL: {} RADAR PLUGINS]\n", manifests.len());
+    }
 
-            let is_high_risk = raw_perms.contains("Admin")
-                || raw_perms.contains("FsWrite")
-                || raw_perms.contains("Network");
+    async fn execute_radar_plugin(&mut self, cmd: &str, args: Vec<&str>) {
+        let mut input_data = None;
+        let mut filename = String::new();
 
-            // Falls ein Plugin absurd viele Rechte hat, schneiden wir den String für die Tabelle ab
-            if raw_perms.len() > 28 {
-                raw_perms.truncate(25);
-                raw_perms.push_str("...");
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--input" && i + 1 < args.len() {
+                let remote_path = self.resolve_path(args[i+1]).await;
+                println!("[RADAR] Streaming '{}' directly into MemFS...", remote_path);
+
+                match self.client.read_file(&remote_path, None).await {
+                    Ok((bytes, _meta)) => {
+                        filename = std::path::Path::new(&remote_path).file_name().unwrap_or_default().to_string_lossy().to_string();
+                        input_data = Some(bytes);
+                    },
+                    Err(e) => {
+                        self.handle_error("Radar MemFS Stream", e);
+                        return;
+                    }
+                }
+                break;
             }
-
-            let perms_padded = format!("{:<30}", raw_perms);
-
-            // JETZT erst die Farben anwenden!
-            let name_colored = name_padded.green().bold();
-            let version_colored = version_padded.yellow();
-            let perms_colored = if perms.is_empty() {
-                perms_padded.dimmed()
-            } else if is_high_risk {
-                perms_padded.red()
-            } else {
-                perms_padded.cyan()
-            };
-
-            let desc_colored = manifest.description.dimmed();
-
-            // Zeile drucken
-            println!("{} {} {} {}", name_colored, version_colored, perms_colored, desc_colored);
+            i += 1;
         }
 
-        // Footer wie beim ls-Befehl
-        println!("\n[TOTAL: {} PLUGINS]\n", plugins.len());
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let input_tuple = if let Some(bytes) = input_data {
+            Some((filename, bytes))
+        } else {
+            None
+        };
+
+        match self.radar_engine.execute_ephemeral(cmd, args_owned, input_tuple).await {
+            Ok((msg, output_files)) => {
+                println!("[OK] {}", msg);
+
+                // ENTERPRISE OUTPUT SYNC
+                if !output_files.is_empty() {
+                    let mut synced = 0;
+                    for (name, bytes) in output_files {
+                        let remote_path = if self.current_path == "/" {
+                            format!("/{}", name)
+                        } else {
+                            format!("{}/{}", self.current_path, name)
+                        };
+
+                        // Wir laden die Datei direkt vom RAM auf den Server hoch!
+                        match self.client.create_node(&remote_path, false, bytes, None, &self.user_id).await {
+                            Ok(_) => {
+                                println!("[SYNC] Uploaded output '{}' to Pytja Server.", name);
+                                synced += 1;
+                            },
+                            Err(e) => self.handle_error(&format!("Sync failed for {}", name), e),
+                        }
+                    }
+                    if synced > 0 {
+                        println!("[OK] {} Output files successfully exported.", synced);
+                    }
+                }
+            },
+            Err(e) => self.handle_error("Radar Enclave Crash", e),
+        }
+    }
+
+    async fn handle_daemon(&mut self, args: Vec<&str>) {
+        if args.is_empty() {
+            println!("Usage: daemon <start|stop|ls> [plugin_name]");
+            return;
+        }
+
+        match args[0] {
+            "start" => {
+                if args.len() < 2 {
+                    println!("Usage: daemon start <plugin_name>");
+                    return;
+                }
+                let plugin = args[1];
+                let p_args = args[2..].iter().map(|s| s.to_string()).collect();
+
+                match self.radar_engine.start_daemon(plugin, p_args, self.client.clone()) {
+                    Ok(_) => println!("[OK] Daemon '{}' launched in background.", plugin),
+                    Err(e) => self.handle_error("Daemon Boot Failure", e),
+                }
+            },
+            "stop" => {
+                if args.len() < 2 {
+                    println!("Usage: daemon stop <plugin_name>");
+                    return;
+                }
+                match self.radar_engine.stop_daemon(args[1]) {
+                    Ok(_) => println!("[OK] Daemon '{}' successfully terminated.", args[1]),
+                    Err(e) => self.handle_error("Daemon Termination", e),
+                }
+            },
+            "ls" => {
+                let daemons = self.radar_engine.list_daemons();
+                if daemons.is_empty() {
+                    println!("No active daemons running.");
+                    return;
+                }
+                println!("\n{:<25} STATUS", "DAEMON NAME");
+                println!("{}", "-".repeat(40));
+                for d in daemons {
+                    println!("{:<25} RUNNING", d);
+                }
+                println!();
+            },
+            "send" => {
+                if args.len() < 3 {
+                    println!("Usage: daemon send <plugin_name> <payload>");
+                    return;
+                }
+                let plugin = args[1];
+                let payload = args[2..].join(" ");
+
+                match self.radar_engine.send_to_daemon(plugin, payload).await {
+                    Ok(_) => println!("[OK] Message dispatched to daemon '{}'.", plugin),
+                    Err(e) => self.handle_error("Daemon C2 Bus", e),
+                }
+            },
+            _ => println!("Invalid daemon command. Use start, stop, or ls."),
+        }
     }
 
     async fn handle_mounts(&self, args: Vec<&str>) {

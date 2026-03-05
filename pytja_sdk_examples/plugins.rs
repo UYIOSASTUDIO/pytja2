@@ -223,20 +223,17 @@ impl PluginManager {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let cmd_string = cmd.to_string();
 
-        // --- 1. ENTERPRISE SANDBOX SETUP ---
         let mut sandbox_path = None;
 
         if permissions.contains(&Permission::FsRead) || permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
 
-            // DIE ULTIMATIVE ISOLATION: Ein versteckter Ordner im Projekt-Root.
-            // Immun gegen das Pytja VFS (da nicht im "data" Ordner).
-            // Immun gegen macOS Path-Traversal (da echte lokale Pfade ohne Symlinks).
             let current_dir = std::env::current_dir().context("Failed to get current directory")?;
             let session_id = uuid::Uuid::new_v4().to_string();
             let temp_path = current_dir.join(".wasi_enclaves").join(session_id);
 
             std::fs::create_dir_all(&temp_path).context("Failed to create secure sandbox directory")?;
-            let temp_path = std::fs::canonicalize(&temp_path).unwrap_or(temp_path);
+
+            // CLAUDES FIX: Kein canonicalize() Aufruf mehr!
             sandbox_path = Some(temp_path.clone());
 
             let mut i = 0;
@@ -255,7 +252,7 @@ impl PluginManager {
                     let file_name = std::path::Path::new(&absolute_remote).file_name().unwrap_or_default();
                     let local_dest = temp_path.join(file_name);
 
-                    println!("[INFO] Mounting input file '{}' into Sandbox...", absolute_remote);
+                    println!("[INFO] Downloading input file '{}' into Sandbox...", absolute_remote);
                     if let Err(e) = client.download_file(&absolute_remote, local_dest.to_str().unwrap(), None).await {
                         eprintln!("[ERROR] Failed to mount {}: {}", absolute_remote, e);
                         let _ = std::fs::remove_dir_all(&temp_path);
@@ -266,7 +263,6 @@ impl PluginManager {
             }
         }
 
-        // --- 2. JIT EXECUTION (Micro-Runtime Pattern) ---
         let pb = ProgressBar::new_spinner();
         pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
         pb.set_message(format!("Executing {} in secure enclave...", cmd.cyan()));
@@ -277,38 +273,40 @@ impl PluginManager {
 
         let execution_task = tokio::task::spawn_blocking(move || -> Result<String> {
 
-            // THE ENTERPRISE FIX: Die dedizierte Micro-Runtime.
-            // Wir entkoppeln Wasmer vollständig vom Pytja-Hauptprozess und geben ihm
-            // eine eigene, makellose Asynchron-Umgebung für seine macOS Systemaufrufe.
-            let enclave_rt = tokio::runtime::Builder::new_current_thread()
+            // THE ENTERPRISE FIX: Multi-Thread Runtime + block_on
+            // Wir müssen die Runtime zwingen zu arbeiten, damit Wasmers asynchrones Dateisystem
+            // (tokio::fs) nicht in einen Deadlock gerät und "entry not found" wirft.
+            let enclave_rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("Failed to build enclave micro-runtime")?;
 
-            let _guard = enclave_rt.enter();
+            enclave_rt.block_on(async {
+                let mut store = Store::default();
+                let mut builder = WasiEnv::builder(&cmd_string);
+                builder = builder.args(&args_owned);
 
-            let mut store = Store::default();
-            let mut builder = WasiEnv::builder(&cmd_string);
-            builder = builder.args(&args_owned);
+                if let Some(ref sp) = sp_clone {
+                    let absolute_sp = sp.to_string_lossy().to_string();
+                    builder = builder.map_dir("/workspace", &absolute_sp).context("Sandbox mapping failed")?;
+                    builder = builder.current_dir("/workspace");
+                }
 
-            if let Some(ref sp) = sp_clone {
-                let absolute_sp = sp.to_string_lossy().to_string();
-                builder = builder.map_dir("/workspace", &absolute_sp).context("Sandbox mapping failed")?;
-                builder = builder.current_dir("/workspace");
-            }
+                if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
+                    for (k, v) in std::env::vars() { builder = builder.env(k, v); }
+                } else {
+                    builder = builder.env("SANDBOXED", "true");
+                }
 
-            if thread_permissions.contains(&Permission::Env) || thread_permissions.contains(&Permission::Admin) {
-                for (k, v) in std::env::vars() { builder = builder.env(k, v); }
-            } else {
-                builder = builder.env("SANDBOXED", "true");
-            }
+                let (instance, _env) = builder.instantiate(module, &mut store).context("WASI instantiation failed")?;
 
-            let (instance, _env) = builder.instantiate(module, &mut store).context("WASI instantiation failed")?;
-            let start = instance.exports.get_function("_start").context("Missing _start")?;
+                let start = instance.exports.get_function("_start")
+                    .context("Invalid WASM: Missing _start function. Module not compiled for wasm32-wasi!")?;
 
-            start.call(&mut store, &[]).context("Plugin crashed")?;
+                start.call(&mut store, &[]).context("Plugin crashed during execution")?;
 
-            Ok(format!("Execution of {} completed.", cmd_string))
+                Ok(format!("Execution of {} completed.", cmd_string))
+            })
         });
 
         let execution_successful = match execution_task.await {
@@ -317,7 +315,6 @@ impl PluginManager {
             Err(e) => { pb.finish_and_clear(); eprintln!("{} {:?}", "[FATAL] Thread panic:".red(), e); false }
         };
 
-        // --- 3. SERVER SYNC (UPLOAD) ---
         if execution_successful {
             if let Some(ref tp) = sandbox_path {
                 if permissions.contains(&Permission::FsWrite) || permissions.contains(&Permission::Admin) {
@@ -342,7 +339,6 @@ impl PluginManager {
             }
         }
 
-        // --- 4. ENTERPRISE CLEANUP ---
         if let Some(tp) = sandbox_path {
             let _ = std::fs::remove_dir_all(tp);
         }
