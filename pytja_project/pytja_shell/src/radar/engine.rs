@@ -89,6 +89,10 @@ impl RadarEngine {
 
         // --- ENTERPRISE FIX: EINHEITLICHES DATEISYSTEM ---
         let mem_fs = TmpFileSystem::new();
+
+        // ENTERPRISE FIX: Wir müssen den Workspace-Ordner im RAM physisch erstellen!
+        let _ = mem_fs.create_dir(std::path::Path::new("/workspace"));
+
         let mem_fs_inbox = mem_fs.clone();
         let mem_fs_sandbox = mem_fs.clone();
         let mem_fs_context = mem_fs.clone(); // Für den DaemonContext (Logs abrufen)
@@ -134,9 +138,12 @@ impl RadarEngine {
             builder = builder.current_dir("/workspace");
 
             // --- ENTERPRISE FIX: SILENT DAEMON ---
-            // Leitet alle println! Ausgaben des Daemons in eine versteckte Log-Datei um!
-            if let Ok(log_out) = mem_fs_abi.new_open_options().write(true).create(true).open(std::path::Path::new("/workspace/daemon.log")) {
+            // Leitet alle Ausgaben (stdout & stderr) des Daemons in die versteckte Log-Datei um.
+            if let Ok(log_out) = mem_fs_abi.new_open_options().write(true).create(true).append(true).open(std::path::Path::new("/workspace/daemon.log")) {
                 builder = builder.stdout(log_out);
+            }
+            if let Ok(log_err) = mem_fs_abi.new_open_options().write(true).create(true).append(true).open(std::path::Path::new("/workspace/daemon.log")) {
+                builder = builder.stderr(log_err);
             }
 
             let mut wasi_env = builder.finalize(&mut store)?;
