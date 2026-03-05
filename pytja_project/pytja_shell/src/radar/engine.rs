@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use tracing::{info, instrument};
-use wasmer::{Engine, Module, Store, Function, Instance, Exports};
+use wasmer::{Engine, Module, Store, Function, Instance, Exports, FunctionEnv, FunctionEnvMut};
 use wasmer_wasix::WasiEnv;
 use wasmer_wasix::virtual_fs::{FileSystem, TmpFileSystem};
 use tokio::io::AsyncWriteExt;
@@ -23,13 +23,13 @@ pub struct RadarEngine {
     manifests: HashMap<String, PluginManifest>,
     active_daemons: HashMap<String, DaemonContext>,
     pub ui_registry: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pub alarm_tx: tokio::sync::mpsc::Sender<String>, // NEU: Der Alarm-Kanal
 }
 
 impl RadarEngine {
-    pub fn new() -> Result<Self> {
+    pub fn new(alarm_tx: tokio::sync::mpsc::Sender<String>) -> Result<Self> {
         let ui_registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        // --- ENTERPRISE FIX: Hintergrund UI Server booten ---
         let ui_reg_clone = ui_registry.clone();
         tokio::spawn(async move {
             crate::radar::display::run_ui_server(ui_reg_clone).await;
@@ -41,6 +41,7 @@ impl RadarEngine {
             manifests: HashMap::new(),
             active_daemons: HashMap::new(),
             ui_registry,
+            alarm_tx, // NEU
         })
     }
 
@@ -71,7 +72,6 @@ impl RadarEngine {
         let plugin_name_owned = plugin_name.to_string();
         let handle = tokio::runtime::Handle::current();
 
-        // --- ZERO TRUST: Berechtigungen für diesen Prozess isolieren ---
         let manifest = self.manifests.get(plugin_name).cloned().unwrap_or_else(|| PluginManifest {
             name: plugin_name.to_string(),
             version: "UNKNOWN".into(),
@@ -81,23 +81,16 @@ impl RadarEngine {
         });
         let process_permissions = manifest.permissions;
 
-        // --- THE C2 EVENT BUS ---
         let (tx, mut rx) = mpsc::channel::<String>(32);
-
-        // --- THE SOCKET MAP (Verwaltet aktive Verbindungen des Daemons) ---
         let active_sockets: Arc<tokio::sync::Mutex<std::collections::HashMap<String, mpsc::Sender<String>>>> = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        // --- ENTERPRISE FIX: EINHEITLICHES DATEISYSTEM ---
         let mem_fs = TmpFileSystem::new();
-
-        // ENTERPRISE FIX: Wir müssen den Workspace-Ordner im RAM physisch erstellen!
         let _ = mem_fs.create_dir(std::path::Path::new("/workspace"));
 
         let mem_fs_inbox = mem_fs.clone();
         let mem_fs_sandbox = mem_fs.clone();
-        let mem_fs_context = mem_fs.clone(); // Für den DaemonContext (Logs abrufen)
+        let mem_fs_context = mem_fs.clone();
 
-        // Hintergrund-Relay: Leitet asynchrone Channel-Nachrichten in den RAM des Plugins
         let inbox_handle = handle.clone();
         inbox_handle.spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -115,19 +108,19 @@ impl RadarEngine {
             }
         });
 
-        // Wir klonen tx für die WebAssembly-Sandbox, damit die Host-Engine das Original behalten kann.
         let tx_for_daemon = tx.clone();
-        // Wir klonen das UI-Registry VOR dem Hintergrund-Thread
         let ui_registry_for_daemon = self.ui_registry.clone();
+        let alarm_tx_for_daemon = self.alarm_tx.clone();
 
-        // 1. Die Sandbox im Hintergrund aufbauen
         let daemon_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let _guard = handle.enter();
-
             let mut store = Store::default();
-
-            // WICHTIG: Das vereinheitlichte FS nutzen!
             let mem_fs_abi = mem_fs_sandbox.clone();
+
+            // --- ENTERPRISE FIX: DIRECT MEMORY ACCESS (DMA) ENVIRONMENT ---
+            #[derive(Clone)]
+            struct RadarEnv { memory: Option<wasmer::Memory> }
+            let radar_env = FunctionEnv::new(&mut store, RadarEnv { memory: None });
 
             let mut builder = WasiEnv::builder(&plugin_name_owned)
                 .args(&args)
@@ -137,8 +130,6 @@ impl RadarEngine {
             builder = builder.preopen_dir("/workspace")?;
             builder = builder.current_dir("/workspace");
 
-            // --- ENTERPRISE FIX: SILENT DAEMON ---
-            // Leitet alle Ausgaben (stdout & stderr) des Daemons in die versteckte Log-Datei um.
             if let Ok(log_out) = mem_fs_abi.new_open_options().write(true).create(true).append(true).open(std::path::Path::new("/workspace/daemon.log")) {
                 builder = builder.stdout(log_out);
             }
@@ -149,7 +140,6 @@ impl RadarEngine {
             let mut wasi_env = builder.finalize(&mut store)?;
             let mut import_object = wasi_env.import_object(&mut store, &module)?;
 
-            // Radar ABI aufbauen
             let mut radar_exports = Exports::new();
 
             radar_exports.insert("host_log_status", Function::new_typed(&mut store, |code: i32| {
@@ -163,78 +153,91 @@ impl RadarEngine {
             let ui_registry_abi = ui_registry_for_daemon;
             let plugin_tx_abi = tx_for_daemon.clone();
             let sockets_abi = active_sockets.clone();
+            let alarm_tx_for_daemon_inner = alarm_tx_for_daemon.clone();
 
-            // THE ENTERPRISE FIX: Unified IPC Router (JSON-RPC)
-            radar_exports.insert("host_ipc_request", Function::new_typed(&mut store, move || -> i32 {
-                // 1. Für JEDEN Aufruf frische Klone erzeugen
-                let fs = mem_fs_abi.clone();
+            // --- THE ENTERPRISE FIX: POINTER ABI (ZERO-COPY) ---
+            radar_exports.insert("host_ipc_request", Function::new_typed_with_env(&mut store, &radar_env, move |mut env: FunctionEnvMut<RadarEnv>, req_ptr: i32, req_len: i32, res_ptr: i32, res_cap: i32| -> i32 {
+
+                // 1. Memory abrufen
+                let memory = env.data().memory.as_ref().unwrap().clone();
+
+                // 2. Request direkt über Pointers aus dem Plugin-RAM lesen
+                let mut req_bytes = vec![0u8; req_len as usize];
+                {
+                    let view = memory.view(&env);
+                    if view.read(req_ptr as u64, &mut req_bytes).is_err() {
+                        return -1;
+                    }
+                }
+
+                let req_content = String::from_utf8_lossy(&req_bytes).to_string();
+
                 let client_req = client_abi.clone();
                 let allowed_perms = perms_abi.clone();
                 let owner_id = plugin_owner_id.clone();
-
-                // HIER IST DER FIX: Wir klonen die Sender für den inneren async-Block
                 let ui_inner = ui_registry_abi.clone();
                 let tx_inner = plugin_tx_abi.clone();
                 let sockets_inner = sockets_abi.clone();
+                let alarm_inner = alarm_tx_for_daemon_inner.clone();
 
-                handle_abi.block_on(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-                    let mut req_content = String::new();
-                    if let Ok(mut file) = fs.new_open_options().read(true).open(std::path::Path::new("/workspace/.radar_req")) {
-                        let _ = file.read_to_string(&mut req_content).await;
-                    }
-
-                    let response_json = match serde_json::from_str::<serde_json::Value>(&req_content) {
+                // 3. Routing (synchrones Warten blockiert nur diesen einen Thread)
+                let response_json = handle_abi.block_on(async move {
+                    match serde_json::from_str::<serde_json::Value>(&req_content) {
                         Ok(req) => {
                             let module = req["module"].as_str().unwrap_or("");
+                            let method = req["method"].as_str().unwrap_or("");
 
-                            // --- ROUTE: VFS MODULE ---
                             if module == "vfs" {
-                                crate::radar::vfs::handle_vfs_request(
-                                    &req,
-                                    &client_req,
-                                    &allowed_perms,
-                                    &owner_id
-                                ).await
-                            }
-                            // --- ROUTE: NETWORK MODULE ---
-                            else if module == "network" {
-                                // 2. Die geklonten Variablen typsicher übergeben
-                                crate::radar::network::handle_network_request(
-                                    &req,
-                                    &allowed_perms,
-                                    tx_inner,
-                                    sockets_inner
-                                ).await
-                            }
-                            // --- ROUTE: DISPLAY MODULE ---
-                            else if module == "display" {
-                                crate::radar::display::handle_display_request(
-                                    &req,
-                                    &allowed_perms,
-                                    &owner_id.replace("radar_", ""),
-                                    ui_inner
-                                ).await
-                            }
-                            else {
+                                crate::radar::vfs::handle_vfs_request(&req, &client_req, &allowed_perms, &owner_id).await
+                            } else if module == "network" {
+                                crate::radar::network::handle_network_request(&req, &allowed_perms, tx_inner, sockets_inner).await
+                            } else if module == "display" {
+                                crate::radar::display::handle_display_request(&req, &allowed_perms, &owner_id.replace("radar_", ""), ui_inner).await
+                            } else if module == "host" {
+                                if method == "alarm" {
+                                    if let Some(msg) = req["params"]["message"].as_str() {
+                                        let plugin_id = owner_id.replace("radar_", "").to_uppercase();
+                                        let _ = alarm_inner.try_send(format!("[{}] {}", plugin_id, msg));
+                                    }
+                                    r#"{"status": "success"}"#.to_string()
+                                } else {
+                                    r#"{"status": "error", "message": "Unknown host method"}"#.to_string()
+                                }
+                            } else {
                                 r#"{"status": "error", "message": "Unknown IPC module"}"#.to_string()
                             }
                         },
                         Err(_) => r#"{"status": "error", "message": "Invalid IPC JSON payload"}"#.to_string()
-                    };
-
-                    if let Ok(mut file) = fs.new_open_options().write(true).create(true).truncate(true).open(std::path::Path::new("/workspace/.radar_res")) {
-                        let _ = file.write_all(response_json.as_bytes()).await;
                     }
                 });
 
-                200
+                // 4. Response prüfen und direkt in den Plugin-RAM zurückschreiben
+                let res_bytes = response_json.as_bytes();
+                let res_len = res_bytes.len() as i32;
+
+                if res_len > res_cap {
+                    return -res_len; // Puffer im Plugin ist zu klein!
+                }
+
+                {
+                    let view = memory.view(&env);
+                    if view.write(res_ptr as u64, res_bytes).is_err() {
+                        return -1;
+                    }
+                }
+
+                res_len // Erfolgreich: Wir geben die echte Länge zurück
             }));
 
             import_object.register_namespace("radar_abi", radar_exports);
 
             let instance = Instance::new(&mut store, &module, &import_object)?;
+
+            // --- ENTERPRISE FIX: Memory an das RadarEnv binden! ---
+            if let Ok(memory) = instance.exports.get_memory("memory") {
+                radar_env.as_mut(&mut store).memory = Some(memory.clone());
+            }
+
             wasi_env.initialize(&mut store, instance.clone())?;
 
             let start = instance.exports.get_function("_start")?;

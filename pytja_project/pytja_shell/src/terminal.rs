@@ -10,6 +10,7 @@ use rustyline::Helper;
 use rustyline::history::DefaultHistory;
 use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
+use rustyline::ExternalPrinter;
 use colored::*;
 use std::io::{self, Write};
 use std::str;
@@ -80,19 +81,27 @@ impl Helper for PytjaHelper {}
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
     user_id: String,
-    radar_engine: RadarEngine,
+    pub radar_engine: RadarEngine,
     client: PytjaClient,
     current_path: String, // Cache für CWD um DB-Locks zu minimieren
+    alarm_rx: Option<tokio::sync::mpsc::Receiver<String>>, // NEU: Der Empfänger für Daemons
 }
 
 impl Terminal {
-    pub fn new(vfs: Arc<Mutex<VirtualFileSystem>>, username: String, radar_engine: RadarEngine, network_client: PytjaClient) -> Self {
+    pub fn new(
+        vfs: Arc<Mutex<VirtualFileSystem>>,
+        username: String,
+        radar_engine: RadarEngine,
+        network_client: PytjaClient,
+        alarm_rx: tokio::sync::mpsc::Receiver<String> // NEU: Wird von außen übergeben
+    ) -> Self {
         Self {
             vfs,
-            user_id: username, // FIX: Heißt im Struct user_id
+            user_id: username,
             radar_engine,
-            client: network_client, // FIX: Heißt im Struct client
+            client: network_client,
             current_path: "/".to_string(),
+            alarm_rx: Some(alarm_rx), // NEU
         }
     }
 
@@ -117,6 +126,17 @@ impl Terminal {
         let mut rl = Editor::<PytjaHelper, DefaultHistory>::new()?;
         rl.set_helper(Some(helper));
         rl.set_completion_type(rustyline::CompletionType::List);
+
+        // --- ENTERPRISE FIX: THE ASYNC ALARM PRINTER ---
+        let mut printer = rl.create_external_printer()?;
+        if let Some(mut rx) = self.alarm_rx.take() {
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    let alarm_str = format!("\n{} {}\n", "[CRITICAL ALARM]".red().bold(), msg.yellow());
+                    let _ = printer.print(alarm_str);
+                }
+            });
+        }
 
         // 1. History laden
         let history_path = if let Some(proj_dirs) = ProjectDirs::from("com", "pytja", "shell") {

@@ -144,7 +144,12 @@ pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
     };
 
     // --- 6. OS BOOT SEQUENCE (RADAR ENGINE) ---
-    let mut radar_engine = RadarEngine::new().context("Failed to boot Radar Micro-Runtime")?;
+
+    // ENTERPRISE FIX: Wir erschaffen den globalen Alarm-Kanal für die gesamte Pytja-Plattform
+    let (alarm_tx, alarm_rx) = tokio::sync::mpsc::channel::<String>(100);
+
+    // Wir übergeben den Sender (tx) an die Engine, damit Plugins Alarme feuern können
+    let mut radar_engine = RadarEngine::new(alarm_tx).context("Failed to boot Radar Micro-Runtime")?;
 
     // Plugins auslesen und in den RAM laden!
     if let Err(e) = radar_engine.load_plugins("./plugins") {
@@ -161,8 +166,9 @@ pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
     let vfs_shared = Arc::new(Mutex::new(vfs));
 
     println!("\nStarting Shell Session...");
-    // ACHTUNG: Hier übergeben wir jetzt radar_engine statt plugin_manager
-    let mut term = Terminal::new(vfs_shared, username.clone(), radar_engine, client);
+
+    // Wir übergeben den Empfänger (rx) an das Terminal, damit es sie auf den Bildschirm malen kann
+    let mut term = Terminal::new(vfs_shared, username.clone(), radar_engine, client, alarm_rx);
     let _ = term.start().await;
 
     println!("Session terminated.");
