@@ -83,7 +83,11 @@ pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
     let server_url = "https://localhost:50051".to_string();
     let key_bytes = signing_key.to_bytes().to_vec();
 
-    let client = match PytjaClient::connect(server_url, key_bytes, username.clone(), ca_cert).await {
+    // ENTERPRISE FIX: AES-256-GCM Schlüssel aus der Identität ableiten
+    let e2e_key = CryptoService::derive_e2e_key(&key_bytes);
+
+    // Den E2EE-Schlüssel sicher in den isolierten Client-Speicher injizieren
+    let client = match PytjaClient::connect(server_url, key_bytes, username.clone(), ca_cert, e2e_key).await {
         Ok(c) => c,
         Err(e) => {
             pb.finish_and_clear();

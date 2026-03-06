@@ -57,5 +57,3 @@ wasmer-wasix = "0.28.0"
 
 reqwest = { version = "0.11", features = ["json"] }
 tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
-wasmer-middlewares = "7.0.1"
-wasmer-compiler-cranelift = "7.0.1"

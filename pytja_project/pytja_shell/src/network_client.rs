@@ -20,11 +20,12 @@ pub struct PytjaClient {
     pub signing_key: Vec<u8>,
     #[allow(dead_code)]
     pub username: String,
+    pub e2e_key: [u8; 32],
 }
 
 impl PytjaClient {
     /// Baut eine TLS-gesicherte Verbindung zum Enterprise Server auf.
-    pub async fn connect(server_url: String, signing_key: Vec<u8>, username: String, ca_cert_pem: Option<String>) -> Result<Self> {
+    pub async fn connect(server_url: String, signing_key: Vec<u8>, username: String, ca_cert_pem: Option<String>, e2e_key: [u8; 32]) -> Result<Self> {
         let mut endpoint = Channel::from_shared(server_url.clone())
             .context("Invalid Server URL")?;
 
@@ -46,6 +47,7 @@ impl PytjaClient {
             token: Arc::new(Mutex::new(None)),
             signing_key,
             username,
+            e2e_key,
         })
     }
 
@@ -117,11 +119,20 @@ impl PytjaClient {
 
     pub async fn create_node(&self, path: &str, is_folder: bool, content: Vec<u8>, lock_pass: Option<String>, owner: &str) -> Result<String> {
         let mut client = self.client.lock().await;
+
+        // ENTERPRISE E2EE: Inhalt vor dem Senden verschlüsseln
+        let final_content = if !is_folder && !content.is_empty() {
+            pytja_core::crypto::CryptoService::encrypt_e2e(&self.e2e_key, &content)
+                .map_err(|e| anyhow!("E2EE Encryption failed: {}", e))?
+        } else {
+            content
+        };
+
         let req = self.auth_req(CreateNodeRequest {
             path: path.to_string(),
             is_folder,
             owner: owner.to_string(),
-            content,
+            content: final_content,
             lock_password: lock_pass.unwrap_or_default(),
         }).await;
         let resp = client.create_node(req).await?.into_inner();
@@ -135,7 +146,19 @@ impl PytjaClient {
             password: password.unwrap_or_default()
         }).await;
         let resp = client.read_file(req).await?.into_inner();
-        if resp.success { Ok((resp.content, resp.message)) } else { Err(anyhow!(resp.message)) }
+
+        if resp.success {
+            // ENTERPRISE E2EE: Inhalt nach dem Empfangen entschlüsseln
+            let decrypted_content = if !resp.content.is_empty() {
+                pytja_core::crypto::CryptoService::decrypt_e2e(&self.e2e_key, &resp.content)
+                    .map_err(|e| anyhow!("E2EE Decryption failed (Integrity breach): {}", e))?
+            } else {
+                resp.content
+            };
+            Ok((decrypted_content, resp.message))
+        } else {
+            Err(anyhow!(resp.message))
+        }
     }
 
     pub async fn delete_node(&self, path: &str) -> Result<String> {
@@ -217,49 +240,42 @@ impl PytjaClient {
 
     // --- STREAMING UPLOAD ---
 
-    // NEU: metadata_json am Ende hinzugefügt
     pub async fn upload_file(&self, local_path: &str, remote_path: &str, lock: Option<String>, owner: &str, metadata_json: Option<String>) -> Result<String> {
         let path = Path::new(local_path);
         if !path.exists() { return Err(anyhow!("File not found")); }
 
-        // NEU: Das JSON-Feld an FileMetadata übergeben
         let file_meta = pytja_proto::pytja::FileMetadata {
             path: remote_path.to_string(),
             owner: owner.to_string(),
             lock_password: lock.unwrap_or_default(),
             is_folder: false,
-            metadata: metadata_json, // Hier greift die neue Proto-Definition!
+            metadata: metadata_json,
         };
 
         let file_path = local_path.to_string();
+        let e2e_key = self.e2e_key; // Kopie für den async_stream Block
 
         let outbound = async_stream::stream! {
             yield UploadRequest { data: Some(Data::Metadata(file_meta)) };
 
-            // ECHTES ASYNCHRONES STREAMING (Enterprise Memory Management)
-            // Die Datei wird in 64 KB Blöcken gelesen. RAM-Verbrauch bleibt konstant bei ~64 KB!
+            // ENTERPRISE E2EE: Datei komplett laden, verschlüsseln und asynchron streamen
             if let Ok(mut file) = tokio::fs::File::open(&file_path).await {
-                let mut buffer = vec![0u8; 64 * 1024]; // 64 KB Chunk Buffer
-
-                loop {
-                    match file.read(&mut buffer).await {
-                        Ok(0) => break, // EOF (End of File) erreicht
-                        Ok(n) => {
-                            // Wir senden nur die exakt gelesenen Bytes (n) ans Netzwerk
-                            yield UploadRequest { data: Some(Data::Chunk(buffer[..n].to_vec())) };
+                let mut raw_content = Vec::new();
+                if file.read_to_end(&mut raw_content).await.is_ok() {
+                    match pytja_core::crypto::CryptoService::encrypt_e2e(&e2e_key, &raw_content) {
+                        Ok(encrypted_bytes) => {
+                            for chunk in encrypted_bytes.chunks(64 * 1024) {
+                                yield UploadRequest { data: Some(Data::Chunk(chunk.to_vec())) };
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("{} Error reading local file chunk: {}", "❌".red(), e);
-                            break;
-                        }
+                        Err(e) => eprintln!("[ERROR] E2EE Encryption failed: {}", e),
                     }
                 }
             } else {
-                eprintln!("{} Failed to open local file for streaming.", "❌".red());
+                eprintln!("[ERROR] Failed to open local file for streaming.");
             }
         };
 
-        // Streaming Request manuell bauen (auth_req geht nicht für Streams direkt)
         let mut request = Request::new(outbound);
         let lock_token = self.token.lock().await;
         if let Some(token) = &*lock_token {
@@ -285,18 +301,25 @@ impl PytjaClient {
 
         let mut stream = client.download_file(req).await?.into_inner();
 
+        // ENTERPRISE E2EE: Alle verschlüsselten Chunks vom Server sammeln
+        let mut encrypted_buffer = Vec::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.context("Stream error")?;
+            encrypted_buffer.extend_from_slice(&chunk.content);
+        }
+
+        // AES-GCM Entschlüsselung und Integritätsprüfung
+        let decrypted_bytes = pytja_core::crypto::CryptoService::decrypt_e2e(&self.e2e_key, &encrypted_buffer)
+            .context("E2EE Decryption failed (File manipulated or wrong key!)")?;
+
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::File::create(local_path).await
             .context("Failed to create local file")?;
 
-        let mut total_bytes = 0;
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.context("Stream error")?;
-            file.write_all(&chunk.content).await?;
-            total_bytes += chunk.content.len();
-        }
+        file.write_all(&decrypted_bytes).await?;
         file.flush().await?;
-        Ok(format!("Downloaded {} bytes to {}", total_bytes, local_path))
+
+        Ok(format!("Downloaded and decrypted {} bytes to {}", decrypted_bytes.len(), local_path))
     }
 
     // --- EXEC ---

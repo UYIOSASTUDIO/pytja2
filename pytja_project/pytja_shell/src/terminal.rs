@@ -956,9 +956,10 @@ impl Terminal {
                     println!("Usage: daemon stop <plugin_name>");
                     return;
                 }
-                match self.radar_engine.stop_daemon(args[1]) {
-                    Ok(_) => println!("[OK] Daemon '{}' successfully terminated.", args[1]),
-                    Err(e) => self.handle_error("Daemon Termination", e),
+                // ENTERPRISE FIX: Die neue thread-sichere Methode aufrufen
+                match self.radar_engine.kill_daemon(args[1]) {
+                    Ok(_) => println!("Daemon '{}' stopped.", args[1]),
+                    Err(e) => self.handle_error("Daemon Stop", e),
                 }
             },
             "ls" => {
@@ -998,6 +999,16 @@ impl Terminal {
                 match self.radar_engine.send_to_daemon(plugin, payload).await {
                     Ok(_) => println!("[OK] Message dispatched to daemon '{}'.", plugin),
                     Err(e) => self.handle_error("Daemon C2 Bus", e),
+                }
+            },
+            "kill" => {
+                if args.len() < 2 {
+                    println!("Usage: daemon kill <plugin_name>");
+                    return;
+                }
+                match self.radar_engine.kill_daemon(args[1]) {
+                    Ok(_) => println!("{} Daemon '{}' was forcefully terminated.", "[OK]".green().bold(), args[1]),
+                    Err(e) => self.handle_error("Daemon Kill", e),
                 }
             },
             _ => println!("Invalid daemon command. Use start, stop, or ls."),

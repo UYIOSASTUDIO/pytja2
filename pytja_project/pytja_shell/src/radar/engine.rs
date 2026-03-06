@@ -4,60 +4,75 @@ use tracing::{info, instrument};
 use wasmer::{Engine, Module, Store, Function, Instance, Exports, FunctionEnv, FunctionEnvMut};
 use wasmer_wasix::WasiEnv;
 use wasmer_wasix::virtual_fs::{FileSystem, TmpFileSystem};
-use wasmer::CompilerConfig;
-use wasmer_compiler_cranelift::Cranelift;
-use wasmer_middlewares::Metering;
 use tokio::io::AsyncWriteExt;
 use crate::network_client::PytjaClient;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use super::models::PluginManifest;
 
 pub struct DaemonContext {
     pub monitor_task: tokio::task::JoinHandle<()>,
     pub tx: mpsc::Sender<String>,
-    pub mem_fs: TmpFileSystem, // NEU: Referenz auf das RAM-Laufwerk des Daemons
+    pub mem_fs: TmpFileSystem,
+    pub last_heartbeat: Arc<Mutex<std::time::Instant>>, // NEU: Der Pulsschlag
 }
 
 pub struct RadarEngine {
     wasm_engine: Engine,
     module_cache: HashMap<String, Module>,
     manifests: HashMap<String, PluginManifest>,
-    active_daemons: HashMap<String, DaemonContext>,
+    pub active_daemons: Arc<Mutex<HashMap<String, DaemonContext>>>, // NEU: Thread-Safe für den Reaper
     pub ui_registry: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
-    pub alarm_tx: tokio::sync::mpsc::Sender<String>, // NEU: Der Alarm-Kanal
+    pub alarm_tx: tokio::sync::mpsc::Sender<String>,
 }
 
 impl RadarEngine {
     pub fn new(alarm_tx: tokio::sync::mpsc::Sender<String>) -> Result<Self> {
         let ui_registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let active_daemons: Arc<Mutex<HashMap<String, DaemonContext>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let ui_reg_clone = ui_registry.clone();
         tokio::spawn(async move {
             crate::radar::display::run_ui_server(ui_reg_clone).await;
         });
 
-        // --- ENTERPRISE FIX: CPU METERING (GAS QUOTAS) ---
-        // Kostenfunktion: Jede WASM-Instruktion (Basic Block) kostet exakt 1 Punkt.
-        let cost_function = |_: &wasmer::wasmparser::Operator| -> u64 { 1 };
+        // --- ENTERPRISE FIX: THE REAPER (Automated Watchdog) ---
+        let daemons_clone = active_daemons.clone();
+        let alarm_tx_clone = alarm_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let mut dead_plugins = Vec::new();
 
-        // Wir geben jedem Plugin ein Startguthaben von 100 Milliarden Operationen.
-        // Das reicht fuer tage- bis wochenlange Hintergrundaufgaben.
-        // Sobald das Plugin in einer fehlerhaften while(true) Schleife haengt und das Gas aufbraucht,
-        // terminiert die Sandbox das Plugin rigoros.
-        let metering = Arc::new(Metering::new(100_000_000_000, cost_function));
-
-        let mut compiler = Cranelift::default();
-        compiler.push_middleware(metering);
-
-        let wasm_engine = wasmer::EngineBuilder::new(compiler).engine();
+                // 1. Prüfen, wer sich nicht gemeldet hat
+                if let Ok(daemons) = daemons_clone.lock() {
+                    for (name, ctx) in daemons.iter() {
+                        let last = *ctx.last_heartbeat.lock().unwrap();
+                        if last.elapsed().as_secs() > 15 {
+                            dead_plugins.push(name.clone());
+                        }
+                    }
+                }
+                // 2. Gnadenlos terminieren
+                if !dead_plugins.is_empty() {
+                    if let Ok(mut daemons) = daemons_clone.lock() {
+                        for name in dead_plugins {
+                            if let Some(ctx) = daemons.remove(&name) {
+                                ctx.monitor_task.abort();
+                                let _ = alarm_tx_clone.try_send(format!("[WATCHDOG] CPU Freeze detected! Plugin '{}' automatically assassinated.", name));
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         Ok(Self {
-            wasm_engine: wasm_engine.into(),
+            wasm_engine: Engine::default(), // Keine künstlichen Limits mehr!
             module_cache: HashMap::new(),
             manifests: HashMap::new(),
-            active_daemons: HashMap::new(),
+            active_daemons,
             ui_registry,
             alarm_tx,
         })
@@ -79,7 +94,7 @@ impl RadarEngine {
     // --- DAEMON LIFECYCLE MANAGEMENT ---
 
     pub fn start_daemon(&mut self, plugin_name: &str, args: Vec<String>, client: PytjaClient) -> Result<()> {
-        if self.active_daemons.contains_key(plugin_name) {
+        if self.active_daemons.lock().unwrap().contains_key(plugin_name) {
             anyhow::bail!("Daemon '{}' is already running.", plugin_name);
         }
 
@@ -130,6 +145,10 @@ impl RadarEngine {
         let ui_registry_for_daemon = self.ui_registry.clone();
         let alarm_tx_for_daemon = self.alarm_tx.clone();
 
+        // ENTERPRISE FIX: Heartbeat HIER erstellen, VOR dem Thread!
+        let heartbeat = Arc::new(Mutex::new(std::time::Instant::now()));
+        let heartbeat_for_abi = heartbeat.clone();
+
         let daemon_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let _guard = handle.enter();
             let mut store = Store::default();
@@ -172,6 +191,13 @@ impl RadarEngine {
             let plugin_tx_abi = tx_for_daemon.clone();
             let sockets_abi = active_sockets.clone();
             let alarm_tx_for_daemon_inner = alarm_tx_for_daemon.clone();
+
+            // NEU: Das Watchdog ABI
+            radar_exports.insert("host_heartbeat", Function::new_typed(&mut store, move || {
+                if let Ok(mut hb) = heartbeat_for_abi.lock() {
+                    *hb = std::time::Instant::now();
+                }
+            }));
 
             // --- THE ENTERPRISE FIX: POINTER ABI (ZERO-COPY) ---
             radar_exports.insert("host_ipc_request", Function::new_typed_with_env(&mut store, &radar_env, move |env: FunctionEnvMut<RadarEnv>, req_ptr: i32, req_len: i32, res_ptr: i32, res_cap: i32| -> i32 {
@@ -273,49 +299,68 @@ impl RadarEngine {
             }
         });
 
-        self.active_daemons.insert(plugin_name.to_string(), DaemonContext {
+        self.active_daemons.lock().unwrap().insert(plugin_name.to_string(), DaemonContext {
             monitor_task,
             tx,
             mem_fs: mem_fs_context,
+            last_heartbeat: heartbeat, // Den Puls eintragen
         });
         Ok(())
     }
 
-    pub fn stop_daemon(&mut self, plugin_name: &str) -> Result<()> {
-        if let Some(ctx) = self.active_daemons.remove(plugin_name) {
+    // --- ENTERPRISE FIX: THREAD-SAFE DAEMON HELPER METHODS ---
+
+    pub fn kill_daemon(&self, plugin_name: &str) -> Result<()> {
+        let mut daemons = self.active_daemons.lock().unwrap();
+        if let Some(ctx) = daemons.remove(plugin_name) {
             ctx.monitor_task.abort();
             Ok(())
         } else {
-            anyhow::bail!("Daemon '{}' is not currently running.", plugin_name);
+            anyhow::bail!("Daemon '{}' is not running.", plugin_name)
         }
     }
 
     pub async fn send_to_daemon(&self, plugin_name: &str, message: String) -> Result<()> {
-        if let Some(ctx) = self.active_daemons.get(plugin_name) {
-            ctx.tx.send(message).await.context("Failed to dispatch IPC message")?;
+        // WICHTIG: Wir dürfen den Mutex NICHT halten, während wir asynchron (await) auf den Channel warten.
+        // Deshalb holen wir uns nur eine Kopie des Transmitters (tx) in einem winzigen synchronen Block.
+        let tx = {
+            let daemons = self.active_daemons.lock().unwrap();
+            if let Some(ctx) = daemons.get(plugin_name) {
+                Some(ctx.tx.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(tx) = tx {
+            tx.send(message).await.context("Failed to dispatch IPC message")?;
             Ok(())
         } else {
-            anyhow::bail!("Daemon '{}' is not currently running.", plugin_name);
+            anyhow::bail!("Daemon '{}' is not currently running.", plugin_name)
         }
     }
 
     pub fn list_daemons(&self) -> Vec<String> {
-        self.active_daemons.keys().cloned().collect()
+        if let Ok(daemons) = self.active_daemons.lock() {
+            daemons.keys().cloned().collect()
+        } else {
+            vec![]
+        }
     }
 
     pub async fn get_daemon_logs(&self, plugin_name: &str) -> Result<String> {
-        if let Some(ctx) = self.active_daemons.get(plugin_name) {
+        let mem_fs = {
+            let daemons = self.active_daemons.lock().unwrap();
+            daemons.get(plugin_name).map(|ctx| ctx.mem_fs.clone())
+        };
+
+        if let Some(fs) = mem_fs {
             let mut content = String::new();
-            // Liest die versteckte Log-Datei aus dem RAM des Daemons
-            if let Ok(mut file) = ctx.mem_fs.new_open_options().read(true).open(std::path::Path::new("/workspace/daemon.log")) {
+            if let Ok(mut file) = fs.new_open_options().read(true).open(std::path::Path::new("/workspace/daemon.log")) {
                 use tokio::io::AsyncReadExt;
                 let _ = file.read_to_string(&mut content).await;
             }
-            if content.is_empty() {
-                Ok("[No logs generated by this daemon yet]".to_string())
-            } else {
-                Ok(content)
-            }
+            Ok(if content.is_empty() { "[No logs generated yet]".to_string() } else { content })
         } else {
             anyhow::bail!("Daemon '{}' is not currently running.", plugin_name);
         }
