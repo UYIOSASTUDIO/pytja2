@@ -24,6 +24,26 @@ use pytja_core::identity::Identity;
 // Die hartcodierten Konstanten (DB_PATH und IDENTITY_DIR) wurden restlos entfernt!
 
 pub async fn start_shell(identity_path: Option<String>) -> anyhow::Result<()> {
+    // --- ENTERPRISE FIX: Global Panic Hook Suppression ---
+    // Wir kapern die Rust-Fehlerbehandlung auf Kernel-Ebene, BEVOR irgendetwas anderes startet.
+    std::panic::set_hook(Box::new(|panic_info| {
+        let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "Unknown System Panic"
+        };
+
+        // Wenn es unser eigener ABI-Poisoning-Kill ist, sterben wir absolut lautlos.
+        if msg == "DAEMON_TERMINATED_BY_HOST" {
+            return;
+        }
+
+        // Bei echten Bugs schreiben wir in ein Logfile, um das Terminal nicht zu zerstören
+        let _ = std::fs::write("pytja_crash.log", format!("CRITICAL ERROR: {}\n", msg));
+    }));
+
     // 1. Logging Setup (File only)
     let file_appender = tracing_appender::rolling::daily("logs", "pytja_shell.log");
     let (_non_blocking, _guard) = tracing_appender::non_blocking(file_appender);

@@ -153,6 +153,10 @@ impl RadarEngine {
         let heartbeat = Arc::new(Mutex::new(std::time::Instant::now()));
         let heartbeat_for_abi = heartbeat.clone();
 
+        // ENTERPRISE FIX: Den Daemons-Mutex klonen, BEVOR der Thread startet!
+        // So verhindern wir, dass `self` in die Closure "gemoved" wird.
+        let active_daemons_for_thread = self.active_daemons.clone();
+
         let daemon_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let _guard = handle.enter();
             let mut store = Store::default();
@@ -196,9 +200,10 @@ impl RadarEngine {
             let sockets_abi = active_sockets.clone();
             let alarm_tx_for_daemon_inner = alarm_tx_for_daemon.clone();
 
-            let active_for_heartbeat = self.active_daemons.clone();
-            let active_for_ipc = self.active_daemons.clone();
-            let plugin_name_for_abi = plugin_name.to_string();
+            // ENTERPRISE FIX: Wir nutzen den äußeren Klon und den bereits besessenen String (plugin_name_owned)
+            let active_for_heartbeat = active_daemons_for_thread.clone();
+            let active_for_ipc = active_daemons_for_thread.clone();
+            let plugin_name_for_abi = plugin_name_owned.clone();
 
             radar_exports.insert("host_heartbeat", Function::new_typed(&mut store, move || {
                 // ENTERPRISE FIX: ABI Poisoning. Wenn der Daemon gekillt wurde,
@@ -211,7 +216,7 @@ impl RadarEngine {
                 }
             }));
 
-            let plugin_name_for_ipc = plugin_name.to_string();
+            let plugin_name_for_ipc = plugin_name_owned.clone();
             radar_exports.insert("host_ipc_request", Function::new_typed_with_env(&mut store, &radar_env, move |env: FunctionEnvMut<RadarEnv>, req_ptr: i32, req_len: i32, res_ptr: i32, res_cap: i32| -> i32 {
                 if !active_for_ipc.lock().unwrap().contains_key(&plugin_name_for_ipc) {
                     panic!("DAEMON_TERMINATED_BY_HOST");

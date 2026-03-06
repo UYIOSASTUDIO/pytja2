@@ -80,28 +80,30 @@ impl Helper for PytjaHelper {}
 
 pub struct Terminal {
     vfs: Arc<Mutex<VirtualFileSystem>>,
-    user_id: String,
+    username: String, // Vorher: user_id
     pub radar_engine: RadarEngine,
     client: PytjaClient,
-    current_path: String, // Cache für CWD um DB-Locks zu minimieren
-    alarm_rx: Option<tokio::sync::mpsc::Receiver<String>>, // NEU: Der Empfänger für Daemons
+    alarm_rx: mpsc::Receiver<String>,
+    alerts: Vec<String>,      // Hinzufügen
+    unread_alerts: usize,     // Hinzufügen
 }
 
 impl Terminal {
     pub fn new(
-        vfs: Arc<Mutex<VirtualFileSystem>>,
+        vfs: Arc<tokio::sync::Mutex<VirtualFileSystem>>,
         username: String,
         radar_engine: RadarEngine,
-        network_client: PytjaClient,
-        alarm_rx: tokio::sync::mpsc::Receiver<String> // NEU: Wird von außen übergeben
+        client: PytjaClient,
+        alarm_rx: tokio::sync::mpsc::Receiver<String>
     ) -> Self {
         Self {
             vfs,
-            user_id: username,
+            username,
             radar_engine,
-            client: network_client,
-            current_path: "/".to_string(),
-            alarm_rx: Some(alarm_rx), // NEU
+            client,
+            alarm_rx,
+            alerts: Vec::new(),   // NEU
+            unread_alerts: 0,     // NEU
         }
     }
 
@@ -131,9 +133,9 @@ impl Terminal {
         let mut printer = rl.create_external_printer()?;
         if let Some(mut rx) = self.alarm_rx.take() {
             tokio::spawn(async move {
-                while let Some(msg) = rx.recv().await {
-                    let alarm_str = format!("\n{} {}\n", "[CRITICAL ALARM]".red().bold(), msg.yellow());
-                    let _ = printer.print(alarm_str);
+                // Korrekte Prüfung auf initiale Alarme
+                while let Ok(msg) = self.alarm_rx.try_recv() {
+                    println!("{} {}", "[CRITICAL ALARM]".red().bold(), msg.yellow());
                 }
             });
         }
@@ -179,7 +181,28 @@ impl Terminal {
         self.current_path = self.vfs.lock().await.get_cwd().to_string();
 
         loop {
-            let prompt = format!("┌──({}㉿pytja)-[{}]\n└─$ ", self.user_id.red(), self.current_path.blue());
+            while let Ok(msg) = self.alarm_rx.try_recv() {
+                self.alerts.push(msg);
+                self.unread_alerts += 1;
+            }
+
+            // Wir holen den aktuellen Pfad direkt aus dem VFS
+            let current_path = self.vfs.lock().await.get_cwd().to_string();
+
+            let prompt = if self.unread_alerts > 0 {
+                format!(
+                    "┌──({}㉿pytja)-[{}]-[\x1b[31m!\x1b[0m {} ALERTS]\n└─$ ",
+                    self.username.red(),
+                    current_path.blue(),
+                    self.unread_alerts
+                )
+            } else {
+                format!(
+                    "┌──({}㉿pytja)-[{}]\n└─$ ",
+                    self.username.red(),
+                    current_path.blue()
+                )
+            };
 
             let readline = rl.readline(&prompt);
             match readline {
@@ -191,7 +214,24 @@ impl Terminal {
                     // Support für verkettete Befehle
                     let commands: Vec<&str> = line.split("&&").collect();
                     for cmd_str in commands {
-                        if !self.dispatch_command(cmd_str.trim()).await {
+                        let cmd_trimmed = cmd_str.trim();
+
+                        // SPEZIAL-BEFEHL: dmesg/alerts zum Auslesen der Inbox
+                        if cmd_trimmed == "dmesg" || cmd_trimmed == "alerts" {
+                            println!("\n\x1b[36m--- SYSTEM EVENT LOG (UNREAD: {}) ---\x1b[0m", self.unread_alerts);
+                            if self.alerts.is_empty() {
+                                println!("No system events recorded.");
+                            } else {
+                                for (i, alert) in self.alerts.iter().enumerate() {
+                                    println!("[{:03}] {}", i + 1, alert);
+                                }
+                            }
+                            println!("\x1b[36m--------------------------------------\x1b[0m\n");
+                            self.unread_alerts = 0; // Zähler nach dem Lesen zurücksetzen
+                            continue;
+                        }
+
+                        if !self.dispatch_command(cmd_trimmed).await {
                             // Exit signal received
                             if let Some(ref path) = history_path {
                                 let _ = rl.save_history(path);
@@ -200,9 +240,18 @@ impl Terminal {
                         }
                     }
                 },
-                Err(ReadlineError::Interrupted) => { println!("CTRL-C"); break; },
-                Err(ReadlineError::Eof) => { println!("CTRL-D"); break; },
-                Err(err) => { println!("Error: {:?}", err); break; }
+                Err(ReadlineError::Interrupted) => {
+                    println!("CTRL-C");
+                    break;
+                },
+                Err(ReadlineError::Eof) => {
+                    println!("CTRL-D");
+                    break;
+                },
+                Err(err) => {
+                    println!("Error: {:?}", err);
+                    break;
+                }
             }
         }
 
@@ -224,7 +273,12 @@ impl Terminal {
             "clear" => self.print_banner(),
             "whoami" => println!("{}", self.user_id.green().bold()),
             "ls" | "ll" => self.handle_ls(args).await,
-            "cd" => self.handle_cd(args).await,
+            "cd" => {
+                let target = args.get(1).map(|s| s.to_string()).unwrap_or("/".to_string());
+                if let Err(e) = self.vfs.lock().await.change_dir(&target) {
+                    println!("cd: {}", e);
+                }
+            },
             "mkdir" => self.handle_mkdir(args).await,
             "touch" => self.handle_touch(args).await,
             "cp" => self.handle_cp(args).await,
