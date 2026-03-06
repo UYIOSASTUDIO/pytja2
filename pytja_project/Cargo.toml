@@ -13,8 +13,9 @@ members = [
     "pytja_admin",
     "pytja_registrar",
     "pytja_window",
-    "pytja_sdk"
-, "pytja_core_plugin", "pytja_window", "pytja_sdk"]
+    "pytja_sdk",
+    "pytja_storage_commander"
+]
 
 [dependencies]
 # Wir binden die Server- und Shell-Logik als Bibliotheken ein

@@ -22,7 +22,8 @@ pub struct RadarEngine {
     wasm_engine: Engine,
     module_cache: HashMap<String, Module>,
     manifests: HashMap<String, PluginManifest>,
-    pub active_daemons: Arc<Mutex<HashMap<String, DaemonContext>>>, // NEU: Thread-Safe für den Reaper
+    pub active_daemons: Arc<std::sync::Mutex<HashMap<String, DaemonContext>>>,
+    pub window_pipes: Arc<tokio::sync::Mutex<HashMap<String, tokio::process::ChildStdin>>>, // NEU
     pub ui_registry: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
     pub alarm_tx: tokio::sync::mpsc::Sender<String>,
 }
@@ -69,10 +70,11 @@ impl RadarEngine {
         });
 
         Ok(Self {
-            wasm_engine: Engine::default(), // Keine künstlichen Limits mehr!
+            wasm_engine: Engine::default(),
             module_cache: HashMap::new(),
             manifests: HashMap::new(),
             active_daemons,
+            window_pipes: Arc::new(tokio::sync::Mutex::new(HashMap::new())), // NEU
             ui_registry,
             alarm_tx,
         })
@@ -145,6 +147,8 @@ impl RadarEngine {
         let ui_registry_for_daemon = self.ui_registry.clone();
         let alarm_tx_for_daemon = self.alarm_tx.clone();
 
+        let window_pipes_for_daemon = self.window_pipes.clone();
+
         // ENTERPRISE FIX: Heartbeat HIER erstellen, VOR dem Thread!
         let heartbeat = Arc::new(Mutex::new(std::time::Instant::now()));
         let heartbeat_for_abi = heartbeat.clone();
@@ -192,16 +196,26 @@ impl RadarEngine {
             let sockets_abi = active_sockets.clone();
             let alarm_tx_for_daemon_inner = alarm_tx_for_daemon.clone();
 
-            // NEU: Das Watchdog ABI
+            let active_for_heartbeat = self.active_daemons.clone();
+            let active_for_ipc = self.active_daemons.clone();
+            let plugin_name_for_abi = plugin_name.to_string();
+
             radar_exports.insert("host_heartbeat", Function::new_typed(&mut store, move || {
+                // ENTERPRISE FIX: ABI Poisoning. Wenn der Daemon gekillt wurde,
+                // reißt der Host den WASM-Thread gnadenlos in eine Trap!
+                if !active_for_heartbeat.lock().unwrap().contains_key(&plugin_name_for_abi) {
+                    panic!("DAEMON_TERMINATED_BY_HOST");
+                }
                 if let Ok(mut hb) = heartbeat_for_abi.lock() {
                     *hb = std::time::Instant::now();
                 }
             }));
 
-            // --- THE ENTERPRISE FIX: POINTER ABI (ZERO-COPY) ---
+            let plugin_name_for_ipc = plugin_name.to_string();
             radar_exports.insert("host_ipc_request", Function::new_typed_with_env(&mut store, &radar_env, move |env: FunctionEnvMut<RadarEnv>, req_ptr: i32, req_len: i32, res_ptr: i32, res_cap: i32| -> i32 {
-
+                if !active_for_ipc.lock().unwrap().contains_key(&plugin_name_for_ipc) {
+                    panic!("DAEMON_TERMINATED_BY_HOST");
+                }
                 // 1. Memory abrufen
                 let memory = env.data().memory.as_ref().unwrap().clone();
 
@@ -223,6 +237,12 @@ impl RadarEngine {
                 let tx_inner = plugin_tx_abi.clone();
                 let sockets_inner = sockets_abi.clone();
                 let alarm_inner = alarm_tx_for_daemon_inner.clone();
+
+                // ENTERPRISE FIX: Clone the outer variable INSIDE the closure so it doesn't consume the outer variable
+                let window_pipes_inner = window_pipes_for_daemon.clone();
+
+                // --- NEU: Wir klonen die Daemons VOR dem asynchronen Block! ---
+                let active_for_ipc_inner = active_for_ipc.clone();
 
                 // 3. Routing (synchrones Warten blockiert nur diesen einen Thread)
                 let response_json = handle_abi.block_on(async move {
@@ -247,9 +267,8 @@ impl RadarEngine {
                                 } else {
                                     r#"{"status": "error", "message": "Unknown host method"}"#.to_string()
                                 }
-                            }
-                            // --- ROUTE: NATIVE WINDOW (SIDECAR PROCESS) ---
-                            else if module == "window" {
+                            } else if module == "window" {
+                                // --- ROUTE: NATIVE WINDOW (SIDECAR PROCESS) ---
                                 if method == "create" {
                                     let title = req["params"]["title"].as_str().unwrap_or("Pytja App").to_string();
                                     let html = req["params"]["html"].as_str().unwrap_or("").to_string();
@@ -268,41 +287,61 @@ impl RadarEngine {
                                         "height": height
                                     });
 
-                                    // Ermitteln, welches Binary wir aufrufen müssen (.exe auf Windows)
                                     let exe_name = if cfg!(target_os = "windows") { "pytja_window.exe" } else { "pytja_window" };
 
-                                    // Wir suchen das Helper-Binary im selben Ordner wie die laufende Pytja-Shell
                                     let mut exe_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(exe_name));
-                                    exe_path.pop(); // Dateiname entfernen, um das Verzeichnis zu bekommen
+                                    exe_path.pop();
                                     exe_path.push(exe_name);
 
-                                    // Den Sidecar-Prozess asynchron im Hintergrund starten
                                     let tx_for_window = tx_inner.clone();
                                     let alarm_for_window = alarm_inner.clone();
 
+                                    use tokio::process::Command;
+                                    use std::process::Stdio;
+
+                                    let mut child = match Command::new(&exe_path)
+                                        .arg(config_json.to_string())
+                                        .stdout(Stdio::piped())
+                                        .stdin(Stdio::piped()) // ENTERPRISE FIX: Die Pipe öffnen!
+                                        .spawn()
+                                    {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            let _ = alarm_for_window.try_send(format!("[WINDOW MODULE] Failed to spawn native window helper: {}", e));
+                                            return r#"{"status": "error", "message": "Failed to spawn"}"#.to_string();
+                                        }
+                                    };
+
+                                    // Den stdin-Kanal im Engine-Speicher verankern
+                                    if let Some(stdin) = child.stdin.take() {
+                                        window_pipes_inner.lock().await.insert(plugin_id.clone(), stdin);
+                                    }
+
+                                    // ENTERPRISE FIX: Wir nutzen den inneren Klon,
+                                    // um die äußere Closure nicht zu konsumieren!
+                                    let active_daemons_for_window = active_for_ipc_inner.clone();
+                                    let pipes_for_window = window_pipes_inner.clone();
+                                    let plugin_id_for_window = plugin_id.clone();
+
                                     tokio::spawn(async move {
-                                        use tokio::process::Command;
-                                        use std::process::Stdio;
                                         use tokio::io::{AsyncBufReadExt, BufReader};
-
-                                        let mut child = match Command::new(&exe_path)
-                                            .arg(config_json.to_string())
-                                            .stdout(Stdio::piped())
-                                            .spawn()
-                                        {
-                                            Ok(c) => c,
-                                            Err(e) => {
-                                                let _ = alarm_for_window.try_send(format!("[WINDOW MODULE] Failed to spawn native window helper: {}", e));
-                                                return;
-                                            }
-                                        };
-
                                         if let Some(stdout) = child.stdout.take() {
                                             let mut reader = BufReader::new(stdout).lines();
                                             while let Ok(Some(line)) = reader.next_line().await {
-                                                // Events vom Fenster abfangen und direkt per IPC ins Plugin schießen!
                                                 if line.starts_with("PYTJA_IPC_EVENT:") {
                                                     let payload = line.replace("PYTJA_IPC_EVENT:", "");
+
+                                                    // ENTERPRISE FIX: Auto-Kill bei Fenster-Schließung
+                                                    if payload.contains("WINDOW_CLOSED") {
+                                                        let _ = alarm_for_window.try_send(format!("[SYSTEM] UI closed. Terminating agent '{}'.", plugin_id_for_window));
+                                                        if let Ok(mut daemons) = active_daemons_for_window.lock() {
+                                                            if let Some(ctx) = daemons.remove(&plugin_id_for_window) {
+                                                                ctx.monitor_task.abort();
+                                                            }
+                                                        }
+                                                        pipes_for_window.lock().await.remove(&plugin_id_for_window);
+                                                    }
+
                                                     let _ = tx_for_window.send(format!("WINDOW_EVENT:{}", payload)).await;
                                                 }
                                             }
@@ -311,6 +350,20 @@ impl RadarEngine {
                                     });
 
                                     r#"{"status": "success", "message": "Window spawned natively via helper process"}"#.to_string()
+
+                                // ENTERPRISE FIX: Die Data Push Route
+                                } else if method == "emit" {
+                                    let plugin_id = owner_id.replace("radar_", "");
+                                    let mut pipes = window_pipes_inner.lock().await;
+                                    if let Some(stdin) = pipes.get_mut(&plugin_id) {
+                                        use tokio::io::AsyncWriteExt;
+                                        let payload = req["params"]["payload"].to_string();
+                                        let _ = stdin.write_all(format!("{}\n", payload).as_bytes()).await;
+                                        let _ = stdin.flush().await;
+                                        r#"{"status": "success"}"#.to_string()
+                                    } else {
+                                        r#"{"status": "error", "message": "Window pipe not found"}"#.to_string()
+                                    }
                                 } else {
                                     r#"{"status": "error", "message": "Unknown window method"}"#.to_string()
                                 }
@@ -381,6 +434,15 @@ impl RadarEngine {
         let mut daemons = self.active_daemons.lock().unwrap();
         if let Some(ctx) = daemons.remove(plugin_name) {
             ctx.monitor_task.abort();
+
+            // ENTERPRISE FIX: Wir löschen die Pipe.
+            // Das sendet ein EOF an das native Fenster und schließt es synchron!
+            let pipes = self.window_pipes.clone();
+            let name = plugin_name.to_string();
+            tokio::spawn(async move {
+                pipes.lock().await.remove(&name);
+            });
+
             Ok(())
         } else {
             anyhow::bail!("Daemon '{}' is not running.", plugin_name)

@@ -1,0 +1,6 @@
+{
+  "name": "Storage Commander",
+  "version": "1.0.0",
+  "entrypoint": "pytja_storage_commander.wasm",
+  "permissions": ["vfs_read", "vfs_write", "network_outbound"]
+}
