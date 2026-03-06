@@ -4,6 +4,9 @@ use tracing::{info, instrument};
 use wasmer::{Engine, Module, Store, Function, Instance, Exports, FunctionEnv, FunctionEnvMut};
 use wasmer_wasix::WasiEnv;
 use wasmer_wasix::virtual_fs::{FileSystem, TmpFileSystem};
+use wasmer::CompilerConfig;
+use wasmer_compiler_cranelift::Cranelift;
+use wasmer_middlewares::Metering;
 use tokio::io::AsyncWriteExt;
 use crate::network_client::PytjaClient;
 
@@ -35,13 +38,28 @@ impl RadarEngine {
             crate::radar::display::run_ui_server(ui_reg_clone).await;
         });
 
+        // --- ENTERPRISE FIX: CPU METERING (GAS QUOTAS) ---
+        // Kostenfunktion: Jede WASM-Instruktion (Basic Block) kostet exakt 1 Punkt.
+        let cost_function = |_: &wasmer::wasmparser::Operator| -> u64 { 1 };
+
+        // Wir geben jedem Plugin ein Startguthaben von 100 Milliarden Operationen.
+        // Das reicht fuer tage- bis wochenlange Hintergrundaufgaben.
+        // Sobald das Plugin in einer fehlerhaften while(true) Schleife haengt und das Gas aufbraucht,
+        // terminiert die Sandbox das Plugin rigoros.
+        let metering = Arc::new(Metering::new(100_000_000_000, cost_function));
+
+        let mut compiler = Cranelift::default();
+        compiler.push_middleware(metering);
+
+        let wasm_engine = wasmer::EngineBuilder::new(compiler).engine();
+
         Ok(Self {
-            wasm_engine: Engine::default(),
+            wasm_engine: wasm_engine.into(),
             module_cache: HashMap::new(),
             manifests: HashMap::new(),
             active_daemons: HashMap::new(),
             ui_registry,
-            alarm_tx, // NEU
+            alarm_tx,
         })
     }
 
@@ -156,7 +174,7 @@ impl RadarEngine {
             let alarm_tx_for_daemon_inner = alarm_tx_for_daemon.clone();
 
             // --- THE ENTERPRISE FIX: POINTER ABI (ZERO-COPY) ---
-            radar_exports.insert("host_ipc_request", Function::new_typed_with_env(&mut store, &radar_env, move |mut env: FunctionEnvMut<RadarEnv>, req_ptr: i32, req_len: i32, res_ptr: i32, res_cap: i32| -> i32 {
+            radar_exports.insert("host_ipc_request", Function::new_typed_with_env(&mut store, &radar_env, move |env: FunctionEnvMut<RadarEnv>, req_ptr: i32, req_len: i32, res_ptr: i32, res_cap: i32| -> i32 {
 
                 // 1. Memory abrufen
                 let memory = env.data().memory.as_ref().unwrap().clone();
