@@ -247,6 +247,73 @@ impl RadarEngine {
                                 } else {
                                     r#"{"status": "error", "message": "Unknown host method"}"#.to_string()
                                 }
+                            }
+                            // --- ROUTE: NATIVE WINDOW (SIDECAR PROCESS) ---
+                            else if module == "window" {
+                                if method == "create" {
+                                    let title = req["params"]["title"].as_str().unwrap_or("Pytja App").to_string();
+                                    let html = req["params"]["html"].as_str().unwrap_or("").to_string();
+                                    let width = req["params"]["width"].as_f64().unwrap_or(800.0);
+                                    let height = req["params"]["height"].as_f64().unwrap_or(600.0);
+                                    let plugin_id = owner_id.replace("radar_", "");
+
+                                    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+                                    let html_b64 = BASE64.encode(html);
+
+                                    let config_json = serde_json::json!({
+                                        "plugin_id": plugin_id,
+                                        "title": title,
+                                        "html_b64": html_b64,
+                                        "width": width,
+                                        "height": height
+                                    });
+
+                                    // Ermitteln, welches Binary wir aufrufen müssen (.exe auf Windows)
+                                    let exe_name = if cfg!(target_os = "windows") { "pytja_window.exe" } else { "pytja_window" };
+
+                                    // Wir suchen das Helper-Binary im selben Ordner wie die laufende Pytja-Shell
+                                    let mut exe_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(exe_name));
+                                    exe_path.pop(); // Dateiname entfernen, um das Verzeichnis zu bekommen
+                                    exe_path.push(exe_name);
+
+                                    // Den Sidecar-Prozess asynchron im Hintergrund starten
+                                    let tx_for_window = tx_inner.clone();
+                                    let alarm_for_window = alarm_inner.clone();
+
+                                    tokio::spawn(async move {
+                                        use tokio::process::Command;
+                                        use std::process::Stdio;
+                                        use tokio::io::{AsyncBufReadExt, BufReader};
+
+                                        let mut child = match Command::new(&exe_path)
+                                            .arg(config_json.to_string())
+                                            .stdout(Stdio::piped())
+                                            .spawn()
+                                        {
+                                            Ok(c) => c,
+                                            Err(e) => {
+                                                let _ = alarm_for_window.try_send(format!("[WINDOW MODULE] Failed to spawn native window helper: {}", e));
+                                                return;
+                                            }
+                                        };
+
+                                        if let Some(stdout) = child.stdout.take() {
+                                            let mut reader = BufReader::new(stdout).lines();
+                                            while let Ok(Some(line)) = reader.next_line().await {
+                                                // Events vom Fenster abfangen und direkt per IPC ins Plugin schießen!
+                                                if line.starts_with("PYTJA_IPC_EVENT:") {
+                                                    let payload = line.replace("PYTJA_IPC_EVENT:", "");
+                                                    let _ = tx_for_window.send(format!("WINDOW_EVENT:{}", payload)).await;
+                                                }
+                                            }
+                                        }
+                                        let _ = child.wait().await;
+                                    });
+
+                                    r#"{"status": "success", "message": "Window spawned natively via helper process"}"#.to_string()
+                                } else {
+                                    r#"{"status": "error", "message": "Unknown window method"}"#.to_string()
+                                }
                             } else {
                                 r#"{"status": "error", "message": "Unknown IPC module"}"#.to_string()
                             }
